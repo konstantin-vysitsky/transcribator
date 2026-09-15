@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 from faster_whisper import WhisperModel
 
-DEFAULT_MODEL = "v3_e2e_ctc"
+DEFAULT_MODEL = "v3_e2e_rnnt"
 _LEGACY_GIGAAM_CACHE = Path("C:/gigaam-cache")
 GIGAAM_PREFIXES = ("v1_", "v2_", "v3_", "multilingual_")
 
