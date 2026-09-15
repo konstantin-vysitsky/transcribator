@@ -1,0 +1,14 @@
+{
+  "hotkey": "f10",
+  "hotkey_mode": "toggle",
+  "language": "ru",
+  "model": "v3_e2e_ctc",
+  "cpu_threads": 6,
+  "beam_size": 5,
+  "vad_filter": true,
+  "paste_append_space": true,
+  "paste_auto_enter": true,
+  "sound_feedback": true,
+  "min_utterance_s": 0.3,
+  "autostart": false
+}
