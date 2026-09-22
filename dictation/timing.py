@@ -68,7 +68,7 @@ def estimate_transcribe_seconds(
     audio_duration: float,
     device: str,
     *,
-    vad_filter: bool,
+    vad_filter: bool = True,
     speed_factor: float | None = None,
 ) -> float:
     factor = speed_factor if speed_factor is not None else get_speed_factor(device)

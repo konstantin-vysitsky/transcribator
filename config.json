@@ -1,12 +1,9 @@
 {
   "hotkey": "f10",
   "hotkey_mode": "toggle",
-  "language": "ru",
   "model": "v3_e2e_rnnt",
   "remove_fillers": true,
   "cpu_threads": 6,
-  "beam_size": 5,
-  "vad_filter": true,
   "paste_append_space": true,
   "paste_auto_enter": true,
   "sound_feedback": true,

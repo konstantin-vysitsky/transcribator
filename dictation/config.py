@@ -9,12 +9,9 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 DEFAULTS: dict[str, Any] = {
     "hotkey": "f10",
     "hotkey_mode": "hold",
-    "language": "ru",
     "model": "v3_e2e_rnnt",
     "remove_fillers": True,
     "cpu_threads": 6,
-    "beam_size": 5,
-    "vad_filter": True,
     "paste_append_space": True,
     "paste_auto_enter": True,
     "sound_feedback": True,

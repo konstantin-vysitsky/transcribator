@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Speech model helpers: GigaAM (Sber) and faster-whisper."""
+"""Speech model helpers: GigaAM (Sber)."""
 
 from __future__ import annotations
 
@@ -9,11 +9,25 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from faster_whisper import WhisperModel
 
 DEFAULT_MODEL = "v3_e2e_rnnt"
 _LEGACY_GIGAAM_CACHE = Path("C:/gigaam-cache")
 GIGAAM_PREFIXES = ("v1_", "v2_", "v3_", "multilingual_")
+
+# Доступные модели GigaAM (Сбер). Whisper полностью удалён.
+GIGAAM_MODELS = (
+    "v3_e2e_rnnt",
+    "v3_e2e_ctc",
+    "v3_ctc",
+    "v3_rnnt",
+    "v2_rnnt",
+    "v2_ctc",
+    "v1_rnnt",
+    "v1_ctc",
+    "multilingual_ctc",
+    "multilingual_rnnt",
+    "emo",
+)
 
 
 def is_gigaam_model(model_name: str) -> bool:
@@ -105,25 +119,6 @@ def write_txt(segments: list[dict], path: Path) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
 
 
-def _probe_model(model: WhisperModel) -> None:
-    import struct
-    import wave
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        wav_path = Path(tmp.name)
-    try:
-        with wave.open(str(wav_path), "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(struct.pack("<" + "h" * 1600, *([0] * 1600)))
-        segments, _ = model.transcribe(str(wav_path), beam_size=1)
-        for _ in segments:
-            break
-    finally:
-        wav_path.unlink(missing_ok=True)
-
-
 def _audio_to_wav_path(audio: np.ndarray, sample_rate: int = 16000) -> Path:
     import wave
 
@@ -199,25 +194,9 @@ def load_model(
     model_size: str = DEFAULT_MODEL,
     cpu_threads: int = 0,
 ) -> tuple[Any, str, str]:
-    if is_gigaam_model(model_size):
-        return _load_gigaam_model(model_size, cpu_threads)
-
-    attempts = [
-        ("cuda", "int8_float16"),
-        ("cuda", "int8"),
-        ("cpu", "int8"),
-    ]
-    last_error: Exception | None = None
-    for device, compute_type in attempts:
-        try:
-            model = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=compute_type,
-                cpu_threads=cpu_threads,
-            )
-            _probe_model(model)
-            return model, device, compute_type
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-    raise RuntimeError(f"Could not load Whisper model '{model_size}': {last_error}")
+    if not is_gigaam_model(model_size):
+        raise RuntimeError(
+            f"Неизвестная модель: {model_size!r}. Поддерживаются только модели "
+            f"GigaAM (Сбер): {', '.join(sorted(GIGAAM_MODELS))}."
+        )
+    return _load_gigaam_model(model_size, cpu_threads)
