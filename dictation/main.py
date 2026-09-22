@@ -103,9 +103,6 @@ def main() -> None:
     transcriber = Transcriber(
         model=cfg["model"],
         cpu_threads=cfg["cpu_threads"],
-        language=cfg["language"],
-        beam_size=cfg["beam_size"],
-        vad_filter=cfg["vad_filter"],
         remove_fillers_enabled=cfg.get("remove_fillers", True),
     )
     print(f"Модель загружена ({transcriber.runtime_label()})")
@@ -158,7 +155,6 @@ def main() -> None:
             estimate = estimate_transcribe_seconds(
                 audio_duration,
                 transcriber.device,
-                vad_filter=cfg["vad_filter"],
             )
             timer = TranscribeTimer(estimate)
             if tray_app is not None:

@@ -54,7 +54,7 @@
 
 Модель сама расставляет пунктуацию и пишет числа цифрами. Кэш весов: `~/.cache/gigaam` (или `C:/gigaam-cache` при кириллице в профиле Windows).
 
-Альтернатива: в `config.json` можно указать `large-v3-turbo` — тогда используется **faster-whisper** (int8 на CPU).
+Другие модели GigaAM задаются полем `model` в `config.json` (например `v3_e2e_ctc`, `v2_rnnt`, `multilingual_ctc`). Whisper не поддерживается.
 
 ## Очистка слов-паразитов
 
@@ -80,5 +80,8 @@ C:\Users\ВАШЕ_ИМЯ\.transcribator\fillers.json
 ```
 run\ahk\AutoHotkey64.exe run\remap-mini-keyboard.ahk
 ```
+или просто `ЗАПУСК.bat`.
 
-**Внимание:** в восстановленной копии отсутствует `Lib\AutoHotInterception.ahk` (есть только DLL). Его нужно скачать с [AutoHotInterception](https://github.com/evilC/AutoHotInterception) или взять из бэкапа.
+**Комплект восстановлен:** `run\ahk\AutoHotkey64.exe` (AutoHotkey v2.0.28),
+`run\Lib\AutoHotInterception.ahk` + `.dll` и `run\Lib\x64\interception.dll`.
+Драйвер Interception установлен, но активируется **после перезагрузки Windows**.
