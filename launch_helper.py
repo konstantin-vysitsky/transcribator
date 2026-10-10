@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -11,19 +10,20 @@ def project_root() -> Path:
 
 
 def resolve_pythonw(root: Path | None = None) -> Path:
-    """Return pythonw.exe that runs this venv as a single process on Windows."""
+    """Return pythonw.exe that runs this project's venv.
+
+    Важно: в pyvenv.cfg строка ``executable`` указывает на базовый Python
+    (например ``C:\\Program Files\\Python312\\python.exe``), а не на venv.
+    Запуск такого pythonw.exe идёт без пакетов проекта (gigaam, pystray)
+    и приложение молча падает. Поэтому берём pythonw.exe самого venv.
+    """
     base = (root or project_root()).resolve()
-    cfg = base / ".venv" / "pyvenv.cfg"
-    if cfg.is_file():
-        for line in cfg.read_text(encoding="utf-8").splitlines():
-            match = re.match(r"^executable\s*=\s*(.+)$", line.strip())
-            if match:
-                pythonw = Path(match.group(1).strip()).with_name("pythonw.exe")
-                if pythonw.is_file():
-                    return pythonw.resolve()
-    fallback = base / ".venv" / "Scripts" / "pythonw.exe"
-    if fallback.is_file():
-        return fallback.resolve()
+    venv_pythonw = base / ".venv" / "Scripts" / "pythonw.exe"
+    if venv_pythonw.is_file():
+        return venv_pythonw.resolve()
+    venv_python = base / ".venv" / "Scripts" / "python.exe"
+    if venv_python.is_file():
+        return venv_python.resolve()
     return Path(sys.executable).with_name("pythonw.exe").resolve()
 
 
