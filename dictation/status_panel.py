@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import threading
 import tkinter as tk
 from collections.abc import Callable
@@ -29,6 +30,33 @@ _TOP_ROW_H = 40
 _ABORT_SIZE = 40
 _STOP_W = 72
 _PANEL_W = 320
+_DRAG_BORDER = 3
+_DRAG_THRESHOLD = 3
+
+
+def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
+    """Клик по пустому фону панели, а не по кнопке.
+
+    У Canvas и Frame нет своего окна в Windows, поэтому клик по фону
+    приходит Canvas панели. Кнопки — тоже Canvas, но их нужно отсеять:
+    у них есть свой обработчик <Button-1>.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        if str(widget.winfo_class()).lower() not in {"tk", "toplevel", "canvas"}:
+            return False
+    except tk.TclError:
+        return False
+    for button in (panel._auto_enter_btn, panel._stop_btn, panel._abort_btn):
+        if button is None:
+            continue
+        try:
+            if widget is button or str(widget).startswith(str(button)):
+                return False
+        except tk.TclError:
+            continue
+    return True
 
 
 def _round_rect(
@@ -177,6 +205,12 @@ class StatusPanel:
         self._auto_enter_btn: _RoundButton | None = None
         self._stop_btn: _RoundButton | None = None
         self._abort_btn: _RoundButton | None = None
+        self._drag_active = False
+        self._drag_press: tuple[int, int] | None = None
+        self._drag_offset = (0, 0)
+        self._drag_moved = False
+        self._drag_flash_job: str | None = None
+        self._resizing = False
         self._skip_auto_enter = threading.Event()
         self._ready = threading.Event()
         self._pulse_job: str | None = None
@@ -194,6 +228,9 @@ class StatusPanel:
         window.overrideredirect(True)
         window.attributes("-topmost", True)
         window.configure(bg=_BG)
+        window.bind("<Button-1>", self._on_drag_press, add="+")
+        window.bind("<B1-Motion>", self._on_drag_move, add="+")
+        window.bind("<ButtonRelease-1>", self._on_drag_release, add="+")
         self._window = window
 
         canvas = tk.Canvas(window, highlightthickness=0, bd=0, bg=_BG)
@@ -213,24 +250,32 @@ class StatusPanel:
         def _resize_canvas(_event: tk.Event | None = None) -> None:
             if self._canvas is None or self._content is None:
                 return
-            self._content.update_idletasks()
-            w = _PANEL_W + _PANEL_PAD_X * 2
-            h = self._content.winfo_reqheight() + _PANEL_PAD_Y * 2
-            self._canvas.configure(width=w, height=h)
-            self._canvas.delete("panel_bg")
-            _round_rect(
-                self._canvas,
-                0,
-                0,
-                w,
-                h,
-                _RADIUS,
-                fill=_BG,
-                outline="#3a3a3a",
-                tags="panel_bg",
-            )
-            self._canvas.coords(content_window, _PANEL_PAD_X, _PANEL_PAD_Y)
-            self._canvas.itemconfigure(content_window, width=_PANEL_W)
+            if self._resizing:
+                # <Configure> приходит и от наших же правок геометрии:
+                # без защиты вызов уходит в рекурсию и цикл окна встаёт.
+                return
+            self._resizing = True
+            try:
+                self._content.update_idletasks()
+                w = _PANEL_W + _PANEL_PAD_X * 2
+                h = self._content.winfo_reqheight() + _PANEL_PAD_Y * 2
+                self._canvas.configure(width=w, height=h)
+                self._canvas.delete("panel_bg")
+                _round_rect(
+                    self._canvas,
+                    0,
+                    0,
+                    w,
+                    h,
+                    _RADIUS,
+                    fill=_BG,
+                    outline="#3a3a3a",
+                    tags="panel_bg",
+                )
+                self._canvas.coords(content_window, _PANEL_PAD_X, _PANEL_PAD_Y)
+                self._canvas.itemconfigure(content_window, width=_PANEL_W)
+            finally:
+                self._resizing = False
 
         frame = tk.Frame(content, bg=_BG)
         frame.pack(fill="x")
@@ -417,11 +462,122 @@ class StatusPanel:
     def _reposition(self) -> None:
         if self._root is None or self._window is None:
             return
+        if self._drag_active:
+            return
         self._window.update_idletasks()
         width = self._window.winfo_width()
         height = self._window.winfo_height()
         x = self._root.winfo_screenwidth() - width - _MARGIN_X
         y = self._root.winfo_screenheight() - height - _MARGIN_Y
+        self._window.geometry(f"+{x}+{y}")
+
+    def _begin_local_grab(self) -> None:
+        """Локальный захват: панель остаётся перетаскиваемой, другие окна не блокируются.
+
+        grab_set() здесь не годится — он захватывает мышь глобально и при
+        потере кнопки может упереться в проверку Tk «grab failed: window
+        not viewable».
+        """
+        if self._window is None:
+            return
+        try:
+            self._window.tk.call("grab", "current", self._window._w)
+        except tk.TclError:
+            pass
+
+    def _end_local_grab(self) -> None:
+        if self._window is None:
+            return
+        try:
+            self._window.tk.call("grab", "release", self._window._w)
+        except tk.TclError:
+            pass
+
+    def _cancel_drag_flash(self) -> None:
+        if self._root is None or self._drag_flash_job is None:
+            self._drag_flash_job = None
+            return
+        try:
+            self._root.after_cancel(self._drag_flash_job)
+        except Exception:
+            pass
+        self._drag_flash_job = None
+
+    def _restore_panel_outline(self) -> None:
+        self._drag_flash_job = None
+        if self._canvas is None:
+            return
+        try:
+            self._canvas.itemconfigure("panel_bg", outline="#3a3a3a")
+        except tk.TclError:
+            pass
+
+    def _flash_panel_outline(self) -> None:
+        """Короткая подсветка рамки — видно, что панель поймана."""
+        self._cancel_drag_flash()
+        if self._canvas is None or self._root is None:
+            return
+        try:
+            self._canvas.itemconfigure("panel_bg", outline=_ACCENT_TRANSCRIBE)
+        except tk.TclError:
+            return
+        self._drag_flash_job = self._root.after(350, self._restore_panel_outline)
+
+    def _on_drag_press(self, event: tk.Event) -> None:
+        if self._window is None or not _is_panel_background(event.widget, self):
+            return
+        self._cancel_drag_flash()
+        self._window.update_idletasks()
+        self._drag_active = True
+        self._drag_moved = False
+        self._drag_press = (int(event.x_root), int(event.y_root))
+        self._drag_offset = (
+            self._window.winfo_x() - int(event.x_root),
+            self._window.winfo_y() - int(event.y_root),
+        )
+        self._begin_local_grab()
+
+    def _on_drag_move(self, event: tk.Event) -> None:
+        if not self._drag_active or self._window is None or self._drag_press is None:
+            return
+        x_root = int(event.x_root)
+        y_root = int(event.y_root)
+        if not self._drag_moved:
+            dx = abs(x_root - self._drag_press[0])
+            dy = abs(y_root - self._drag_press[1])
+            if max(dx, dy) < _DRAG_THRESHOLD:
+                return
+            self._drag_moved = True
+            self._flash_panel_outline()
+        self._window.geometry(f"+{x_root + self._drag_offset[0]}+{y_root + self._drag_offset[1]}")
+
+    def _on_drag_release(self, _event: tk.Event) -> None:
+        if not self._drag_active or self._window is None:
+            return
+        self._drag_active = False
+        self._drag_press = None
+        self._end_local_grab()
+        if self._drag_moved:
+            self._clamp_to_screen()
+        self._drag_moved = False
+
+    def _clamp_to_screen(self) -> None:
+        """Не даём утащить панель за пределы экрана."""
+        if self._root is None or self._window is None:
+            return
+        self._window.update_idletasks()
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+        width = self._window.winfo_width()
+        height = self._window.winfo_height()
+        x = min(
+            max(self._window.winfo_x(), _DRAG_BORDER),
+            max(_DRAG_BORDER, screen_w - width - _DRAG_BORDER),
+        )
+        y = min(
+            max(self._window.winfo_y(), _DRAG_BORDER),
+            max(_DRAG_BORDER, screen_h - height - _DRAG_BORDER),
+        )
         self._window.geometry(f"+{x}+{y}")
 
     def _refresh_canvas_bg(self) -> None:
