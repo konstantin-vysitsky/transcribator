@@ -12,9 +12,11 @@ import pystray
 from PIL import Image, ImageDraw
 
 from dictation import autostart, config
+from dictation.prompt import load_prompt, save_prompt
+from dictation.prompt_editor import PromptEditor
 from dictation.status_panel import StatusPanel
 
-ActivityState = Literal["idle", "recording", "transcribing"]
+ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 _HISTORY_SIZE = 3
 _PREVIEW_LEN = 48
 
@@ -117,6 +119,8 @@ class TrayApp:
         on_restart: Callable[[], None] | None = None,
         on_abort: Callable[[], None] | None = None,
         on_stop_recording: Callable[[], None] | None = None,
+        on_toggle_ai: Callable[[bool], None] | None = None,
+        on_open_prompt: Callable[[], None] | None = None,
     ) -> None:
         self._project_root = project_root
         self._idle_tooltip = status_text
@@ -127,6 +131,10 @@ class TrayApp:
         self._on_restart = on_restart
         self._on_abort = on_abort
         self._on_stop_recording = on_stop_recording
+        # Имена с «notify»: обработчик, названный как метод класса, затирает
+        # этот метод собой, и вызвать его становится нечем.
+        self._notify_toggle_ai = on_toggle_ai
+        self._notify_open_prompt = on_open_prompt
         self._on_hotkey_mode_change: Callable[[str], None] | None = None
         self._icon: pystray.Icon | None = None
         self._ready = threading.Event()
@@ -135,17 +143,25 @@ class TrayApp:
         cfg = config.load_config()
         self._hotkey_mode = cfg.get("hotkey_mode", "hold")
         self._cpu_threads = int(cfg.get("cpu_threads", 6))
+        self._ai_enabled = bool(cfg.get("ai_enabled", False))
         self._autostart_enabled = autostart.is_autostart_enabled()
         self._status_panel = StatusPanel(
             on_abort=self._handle_abort,
             on_stop_recording=self._handle_stop_recording,
+            on_toggle_ai=self._handle_toggle_ai,
+            on_open_prompt=self._handle_open_prompt,
+            ai_enabled=self._ai_enabled,
         )
+        self._prompt_editor: PromptEditor | None = None
 
     def reset_session(self) -> None:
         self._status_panel.reset_session()
 
     def should_skip_auto_enter(self) -> bool:
         return self._status_panel.skip_auto_enter()
+
+    def ai_enabled(self) -> bool:
+        return self._status_panel.ai_enabled()
 
     def _handle_abort(self) -> None:
         if self._on_abort is not None:
@@ -154,6 +170,26 @@ class TrayApp:
     def _handle_stop_recording(self) -> None:
         if self._on_stop_recording is not None:
             self._on_stop_recording()
+
+    def _handle_toggle_ai(self, enabled: bool) -> None:
+        self._ai_enabled = enabled
+        self._refresh_menu()
+        if self._notify_toggle_ai is not None:
+            self._notify_toggle_ai(enabled)
+
+    def _handle_open_prompt(self) -> None:
+        if self._prompt_editor is not None:
+            self._prompt_editor.open()
+        if self._notify_open_prompt is not None:
+            self._notify_open_prompt()
+
+    def open_prompt_editor(self) -> None:
+        if self._prompt_editor is None:
+            self._prompt_editor = PromptEditor(
+                load=lambda: load_prompt(self._project_root),
+                save=lambda text: save_prompt(self._project_root, text),
+            )
+        self._prompt_editor.open()
 
     def set_hotkey_mode_handler(self, handler: Callable[[str], None]) -> None:
         self._on_hotkey_mode_change = handler
@@ -208,6 +244,20 @@ class TrayApp:
         if len(one_line) <= _PREVIEW_LEN:
             return one_line
         return one_line[: _PREVIEW_LEN - 1] + "…"
+
+    def notify_ai_error(self, reason: str) -> None:
+        """Сказать, что обработка через ИИ не удалась.
+
+        Молчать об этом нельзя: человек увидит в поле ввода необработанный
+        текст и решит, что промпт плохой или модель не работает, — а причина
+        в ключе, связи или балансе.
+        """
+        if self._icon is None:
+            return
+        try:
+            self._icon.notify("Обработка через ИИ не удалась", reason)
+        except Exception:
+            pass
 
     def add_transcription(self, text: str) -> None:
         if not text.strip():
@@ -294,6 +344,12 @@ class TrayApp:
                 pystray.Menu(*cpu_items),
             ),
             pystray.MenuItem(
+                "Обработка через ИИ",
+                self._toggle_ai,
+                checked=lambda _item: self._ai_enabled,
+            ),
+            pystray.MenuItem("Промпт обработки…", self._edit_prompt),
+            pystray.MenuItem(
                 "Запуск с Windows",
                 self._toggle_autostart,
                 checked=lambda _item: self._autostart_enabled,
@@ -336,6 +392,25 @@ class TrayApp:
 
         return _handler
 
+    def _toggle_ai(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        """Меню трея переключает обработку насовсем, кнопка панели — на раз.
+
+        Разница намеренная: в меню человек заходит редко и осознанно, там
+        решение сохраняется в `config.json`. Кнопка на панели нажимается на
+        ходу, и запоминать её нажатие было бы неожиданно.
+        """
+        self._ai_enabled = not self._ai_enabled
+        cfg = config.load_config()
+        cfg["ai_enabled"] = self._ai_enabled
+        config.save_config(cfg)
+        self._status_panel.set_ai_default(self._ai_enabled)
+        self._refresh_menu()
+        if self._notify_toggle_ai is not None:
+            self._notify_toggle_ai(self._ai_enabled)
+
+    def _edit_prompt(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self.open_prompt_editor()
+
     def _toggle_autostart(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         if self._autostart_enabled:
             autostart.disable_autostart()
@@ -372,6 +447,8 @@ class TrayApp:
         self._ready.wait()
 
     def stop(self) -> None:
+        if self._prompt_editor is not None:
+            self._prompt_editor.stop()
         self._status_panel.stop()
         if self._icon is not None:
             self._icon.stop()

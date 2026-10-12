@@ -5,3 +5,8 @@ __pycache__/
 *.err
 .pytest_cache/
 .mypy_cache/
+
+# Ключ доступа к сервису обработки текста. В config.json лежат только адрес и
+# модель: сам ключ в репозиторий не попадает.
+config.local.json
+tests/снимки/
