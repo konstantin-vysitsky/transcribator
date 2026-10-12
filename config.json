@@ -1,5 +1,5 @@
 {
-  "hotkey": "f10",
+  "hotkey": "f7",
   "hotkey_mode": "toggle",
   "model": "v3_e2e_rnnt",
   "remove_fillers": true,
@@ -8,5 +8,5 @@
   "paste_auto_enter": true,
   "sound_feedback": true,
   "min_utterance_s": 0.3,
-  "autostart": false
+  "autostart": true
 }

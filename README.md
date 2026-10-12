@@ -10,7 +10,7 @@
 
 ## Горячая клавиша
 
-По умолчанию: **F10**, режим **hold** (зажал — говоришь, отпустил — распознавание).
+По умолчанию: **F7**, режим **hold** (зажал — говоришь, отпустил — распознавание).
 
 Настройки в `config.json` или через меню трея.
 
@@ -72,7 +72,7 @@ C:\Users\ВАШЕ_ИМЯ\.transcribator\fillers.json
 
 Папка `c:\по восстановлению\прочее\usb-keyboard-remap\` — ремап Keychron mini (VID 8808 / PID 6601):
 
-- `run\remap-mini-keyboard.ahk` — клавиша 1 → F9, клавиша 2 → F10
+- `run\remap-mini-keyboard.ahk` — клавиша 1 → F9, клавиша 2 → F7
 - `run\trigger-dictation.ps1` — UDP-сигнал `toggle` на порт 38721 (запасной путь)
 - `dictation/remote_trigger.py` — слушает UDP в транскрибаторе
 

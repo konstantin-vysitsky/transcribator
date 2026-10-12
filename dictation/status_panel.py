@@ -35,18 +35,14 @@ _DRAG_THRESHOLD = 3
 
 
 def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
-    """Клик по пустому фону панели, а не по кнопке.
+    """Можно ли тащить панель, схватившись за этот виджет.
 
-    У Canvas и Frame нет своего окна в Windows, поэтому клик по фону
-    приходит Canvas панели. Кнопки — тоже Canvas, но их нужно отсеять:
-    у них есть свой обработчик <Button-1>.
+    Панель таскается за любое место, кроме кнопок. Перечислять классы
+    виджетов нельзя: в живом приложении клик приходит то в Canvas, то в
+    Frame, то в Label — набор зависит от того, что нарисовано под курсором.
+    Поэтому проверяем обратное: виджет не принадлежит ни одной кнопке.
     """
     if sys.platform != "win32":
-        return False
-    try:
-        if str(widget.winfo_class()).lower() not in {"tk", "toplevel", "canvas"}:
-            return False
-    except tk.TclError:
         return False
     for button in (panel._auto_enter_btn, panel._stop_btn, panel._abort_btn):
         if button is None:
