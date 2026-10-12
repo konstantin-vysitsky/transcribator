@@ -152,6 +152,28 @@ class HotkeyListener:
         )
         self._listener.start()
 
+    def is_listening(self) -> bool:
+        """Идёт ли прослушивание на самом деле.
+
+        `Listener.start()` запускает поток, но поток может умереть сразу —
+        например, когда ввод перехватывает приложение с правами выше. Проверяем
+        живой поток, а не наличие объекта: иначе поломка выглядит как рабочее
+        приложение, которое не отвечает на клавишу.
+        """
+        listener = self._listener
+        if listener is None:
+            return False
+        try:
+            # pynput останавливает поток при ошибке и помечает это флагом.
+            if getattr(listener, "running", True) is False:
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        thread = getattr(listener, "_thread", None)
+        if thread is not None and not thread.is_alive():
+            return False
+        return True
+
     def stop(self) -> None:
         if self._listener is not None:
             self._listener.stop()

@@ -23,6 +23,23 @@ from dictation.timing import (
 )
 from dictation.transcriber import Transcriber
 
+LOG_NAME = "dictation.log"
+
+
+def _log_line(project_root: Path, message: str) -> None:
+    """Записать строку в журнал приложения.
+
+    Приложение запускается без консоли, и без журнала у него нет ни одного
+    способа сказать, что оно не поднялось. Нажатие горячей клавиши при этом
+    выглядит как «ничего не произошло», и причину искать негде.
+    """
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with (project_root / LOG_NAME).open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp}  {message}\n")
+    except OSError:
+        pass
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Голосовой ввод (диктовка)")
@@ -37,12 +54,16 @@ def main() -> None:
         config.CONFIG_PATH = args.config.resolve()
 
     if not acquire_single_instance():
+        # Второй экземпляр молча выходит — а снаружи это выглядит как
+        # «приложение не отвечает». Пишем причину в журнал.
+        _log_line(config.CONFIG_PATH.parent, "второй экземпляр уже запущен, выход")
         return
 
     cfg = config.load_config()
     project_root = config.CONFIG_PATH.parent
     use_tray = args.tray
     busy = threading.Event()
+    _log_line(project_root, "запуск приложения")
 
     # Промпт создаётся сразу при запуске, а не при первом обращении: иначе
     # файл появляется только после первой диктовки с обработкой, и найти его
@@ -106,12 +127,14 @@ def main() -> None:
 
     print("Загрузка модели распознавания речи...")
     print(f"Потоки CPU в настройках: {cfg['cpu_threads']} (применяются при запуске)")
+    _log_line(project_root, "загрузка модели распознавания речи")
     transcriber = Transcriber(
         model=cfg["model"],
         cpu_threads=cfg["cpu_threads"],
         remove_fillers_enabled=cfg.get("remove_fillers", True),
     )
     print(f"Модель загружена ({transcriber.runtime_label()})")
+    _log_line(project_root, f"модель загружена: {transcriber.runtime_label()}")
     if tray_app is not None:
         tray_app.set_runtime_info(transcriber.runtime_label())
 
@@ -133,11 +156,13 @@ def main() -> None:
                 tray_app.reset_session()
                 tray_app.set_activity("recording")
             recorder.start()
+            _log_line(project_root, "запись начата")
             return True
         except Exception as exc:
             busy.clear()
             reset_tray_idle()
             print(f"Ошибка записи: {exc}")
+            _log_line(project_root, f"ошибка записи: {exc}")
             return False
 
     def process_audio(audio: np.ndarray) -> None:
@@ -230,8 +255,11 @@ def main() -> None:
                 print(f"Вставлено{suffix}: {text}")
             else:
                 print("Не удалось вставить текст")
+                _log_line(project_root, "не удалось вставить текст")
                 if ai_error is None and text != raw_text:
                     print(f"Было распознано: {raw_text}")
+
+            _log_line(project_root, f"вставлено ({len(text)} знаков)")
 
             if timer is not None:
                 record_speed_sample(
@@ -312,6 +340,21 @@ def main() -> None:
 
     hotkey.start()
     remote_trigger.start()
+    if hotkey.is_listening():
+        _log_line(project_root, f"слушатель клавиш запущен: {cfg['hotkey']} ({cfg['hotkey_mode']})")
+    else:
+        # Слушатель клавиш может не подняться, если приложение с большими
+        # правами перехватывает ввод. Без этой записи поломка выглядит как
+        # «нажимаю — ничего», и связи с правами не видно.
+        message = (
+            "слушатель клавиш НЕ запустился: горячая клавиша не сработает. "
+            "Причина обычно в другом приложении, запущенном от администратора, "
+            "либо в перехвате ввода."
+        )
+        print(message)
+        _log_line(project_root, message)
+        if tray_app is not None:
+            tray_app.notify_hotkey_failed()
     try:
         while not stop_event.wait(timeout=0.5):
             pass

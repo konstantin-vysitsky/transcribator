@@ -259,6 +259,25 @@ class TrayApp:
         except Exception:
             pass
 
+    def notify_hotkey_failed(self) -> None:
+        """Сказать, что горячая клавиша не работает.
+
+        Молчать нельзя: человек нажимает клавишу, ничего не происходит, и
+        выглядит это как поломка приложения, а не как перехват ввода чужим
+        процессом.
+        """
+        self.set_tooltip("Диктовка: горячая клавиша НЕ работает")
+        if self._icon is None:
+            return
+        try:
+            self._icon.notify(
+                "Горячая клавиша не работает",
+                "Нажатия не доходят до диктовки. Обычно мешает приложение, "
+                "запущенное от администратора.",
+            )
+        except Exception:
+            pass
+
     def add_transcription(self, text: str) -> None:
         if not text.strip():
             return
