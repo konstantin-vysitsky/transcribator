@@ -174,8 +174,35 @@ def test_default_prompt_content() -> None:
         "отвечать на сказанное" in lowered,
     )
     check("промпт требует чёткости", "чётк" in lowered)
-    check("промпт не длиннее 2000 знаков", len(DEFAULT_PROMPT) < 2000, str(len(DEFAULT_PROMPT)))
+    check("промпт не длиннее 3000 знаков", len(DEFAULT_PROMPT) < 3000, str(len(DEFAULT_PROMPT)))
     print(f"       длина промпта: {len(DEFAULT_PROMPT)} знаков")
+
+    print("исправление чужих слов:")
+    check(
+        "про иностранные слова сказано",
+        "иностранные слова и названия" in lowered,
+    )
+    check("есть примеры латиницы", "docker" in lowered and "python" in lowered)
+    check(
+        "латиница ставится в правильном написании",
+        "латиницей" in lowered and "общепринятом написании" in lowered,
+    )
+    check(
+        "про разорванные слова сказано",
+        "разорванные или слитые" in lowered,
+    )
+    check(
+        "перевод запрещён",
+        "не переводи иностранные слова" in lowered,
+    )
+    check(
+        "угадывание запрещено",
+        "не угадывай" in lowered,
+    )
+    check(
+        "русское слово не заменяется иностранным",
+        "не заменяй русские слова иностранными" in lowered,
+    )
 
 
 def main() -> int:
