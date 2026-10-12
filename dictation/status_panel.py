@@ -7,7 +7,7 @@ from collections.abc import Callable
 from tkinter import ttk
 from typing import Literal
 
-ActivityState = Literal["idle", "recording", "transcribing"]
+ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 
 _BG = "#1e1e1e"
 _FG = "#e8e8e8"
@@ -21,15 +21,19 @@ _ABORT_BG = "#3a3a3a"
 _ABORT_ACTIVE_BG = "#c62828"
 _STOP_BG = "#1565c0"
 _STOP_ACTIVE_BG = "#0d47a1"
+_AI_BG = "#6a1b9a"
+_AI_ACTIVE_BG = "#4a148c"
+_PROMPT_BG = "#37474f"
+_PROMPT_ACTIVE_BG = "#263238"
 _MARGIN_X = 16
 _MARGIN_Y = 48
 _PANEL_PAD_X = 14
 _PANEL_PAD_Y = 10
 _RADIUS = 10
-_TOP_ROW_H = 40
-_ABORT_SIZE = 40
-_STOP_W = 72
-_PANEL_W = 320
+_TOP_ROW_H = 36
+_ABORT_SIZE = 36
+_STOP_W = 64
+_PANEL_W = 340
 _DRAG_BORDER = 3
 _DRAG_THRESHOLD = 3
 
@@ -44,7 +48,13 @@ def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
     """
     if sys.platform != "win32":
         return False
-    for button in (panel._auto_enter_btn, panel._stop_btn, panel._abort_btn):
+    for button in (
+        panel._auto_enter_btn,
+        panel._stop_btn,
+        panel._abort_btn,
+        panel._ai_btn,
+        panel._prompt_btn,
+    ):
         if button is None:
             continue
         try:
@@ -185,9 +195,17 @@ class StatusPanel:
         self,
         on_abort: Callable[[], None] | None = None,
         on_stop_recording: Callable[[], None] | None = None,
+        on_toggle_ai: Callable[[bool], None] | None = None,
+        on_open_prompt: Callable[[], None] | None = None,
+        ai_enabled: bool = False,
     ) -> None:
         self._on_abort = on_abort
         self._on_stop_recording = on_stop_recording
+        # Имена с «notify» намеренно: обработчики, названные как методы класса
+        # (`_on_toggle_ai`), затирают эти методы собой, и кнопка начинает звать
+        # не панель, а внешний код — с чужими аргументами.
+        self._notify_toggle_ai = on_toggle_ai
+        self._notify_open_prompt = on_open_prompt
         self._root: tk.Tk | None = None
         self._window: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
@@ -201,6 +219,8 @@ class StatusPanel:
         self._auto_enter_btn: _RoundButton | None = None
         self._stop_btn: _RoundButton | None = None
         self._abort_btn: _RoundButton | None = None
+        self._ai_btn: _RoundButton | None = None
+        self._prompt_btn: _RoundButton | None = None
         self._drag_active = False
         self._drag_press: tuple[int, int] | None = None
         self._drag_offset = (0, 0)
@@ -208,6 +228,14 @@ class StatusPanel:
         self._drag_flash_job: str | None = None
         self._resizing = False
         self._skip_auto_enter = threading.Event()
+        # `_skip_ai` — это «выключено на эту сессию». Он заведён отдельно от
+        # настройки, чтобы кнопка не писала в config.json; в исходном состоянии
+        # он повторяет настройку.
+        self._skip_ai = threading.Event()
+        if not ai_enabled:
+            self._skip_ai.set()
+        self._ai_enabled = ai_enabled
+        self._ai_default_enabled = ai_enabled
         self._ready = threading.Event()
         self._pulse_job: str | None = None
         self._pulse_on = True
@@ -279,7 +307,7 @@ class StatusPanel:
         frame.columnconfigure(0, weight=1)
 
         top_row = tk.Frame(frame, bg=_BG, height=_TOP_ROW_H)
-        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         top_row.grid_propagate(False)
         top_row.columnconfigure(0, weight=1)
         top_row.columnconfigure(1, weight=0)
@@ -323,8 +351,44 @@ class StatusPanel:
         )
         self._abort_btn.grid(row=0, column=2, sticky="ns")
 
+        # Вторая строка кнопок: обработка через ИИ. «Автоотправка» управляет
+        # клавишей Enter, «Обработка ИИ» — тем, идёт ли текст перед вставкой
+        # через модель. Это разные решения, и смешивать их в одной кнопке
+        # нельзя: отключив Enter, человек не должен терять обработку.
+        ai_row = tk.Frame(frame, bg=_BG, height=_TOP_ROW_H)
+        ai_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ai_row.grid_propagate(False)
+        ai_row.columnconfigure(0, weight=1)
+        ai_row.columnconfigure(1, weight=0)
+        ai_row.columnconfigure(2, weight=0)
+
+        self._ai_btn = _RoundButton(
+            ai_row,
+            text="Обработка ИИ вкл",
+            command=self._on_toggle_ai,
+            height=_TOP_ROW_H,
+            bg=_AI_BG,
+            active_bg=_AI_ACTIVE_BG,
+            font=("Segoe UI", 9, "bold"),
+            expand=True,
+        )
+        self._ai_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+
+        self._prompt_btn = _RoundButton(
+            ai_row,
+            text="Промпт",
+            command=self._on_open_prompt,
+            width=_STOP_W,
+            height=_TOP_ROW_H,
+            bg=_PROMPT_BG,
+            active_bg=_PROMPT_ACTIVE_BG,
+            font=("Segoe UI", 9, "bold"),
+            radius=8,
+        )
+        self._prompt_btn.grid(row=0, column=1, sticky="ns")
+
         bottom_col = tk.Frame(frame, bg=_BG)
-        bottom_col.grid(row=1, column=0, sticky="ew")
+        bottom_col.grid(row=2, column=0, sticky="ew")
         bottom_col.columnconfigure(0, weight=1)
         self._bottom_col = bottom_col
 
@@ -410,6 +474,64 @@ class StatusPanel:
         if self._on_stop_recording is not None:
             self._on_stop_recording()
 
+    # --- обработка через ИИ ------------------------------------------------
+
+    def _apply_ai_on(self) -> None:
+        if self._ai_btn is not None:
+            self._ai_btn.configure_button(
+                text="Обработка ИИ вкл",
+                bg=_AI_BG,
+                active_bg=_AI_ACTIVE_BG,
+            )
+
+    def _apply_ai_off(self) -> None:
+        if self._ai_btn is not None:
+            self._ai_btn.configure_button(
+                text="Обработка ИИ выкл",
+                bg=_BTN_OFF_BG,
+                active_bg=_BTN_OFF_ACTIVE_BG,
+            )
+
+    def _on_toggle_ai(self) -> None:
+        """Кнопка переключает обработку до конца сессии.
+
+        В `config.json` это не пишется: там лежит решение по умолчанию, а кнопка
+        нужна для разового «здесь и сейчас». Иначе случайное нажатие меняло бы
+        поведение диктовки навсегда.
+        """
+        if self._skip_ai.is_set():
+            self._skip_ai.clear()
+            self._ai_enabled = True
+            self._apply_ai_on()
+        else:
+            self._skip_ai.set()
+            self._ai_enabled = False
+            self._apply_ai_off()
+        if self._notify_toggle_ai is not None:
+            self._notify_toggle_ai(self._ai_enabled)
+
+    def _on_open_prompt(self) -> None:
+        if self._notify_open_prompt is not None:
+            self._notify_open_prompt()
+
+    def _apply_reset_session_ai(self) -> None:
+        self._skip_ai.clear()
+        self._ai_enabled = self._ai_default_enabled
+        if self._ai_default_enabled:
+            self._apply_ai_on()
+        else:
+            self._apply_ai_off()
+
+    def ai_enabled(self) -> bool:
+        return self._ai_enabled and not self._skip_ai.is_set()
+
+    def set_ai_default(self, enabled: bool) -> None:
+        """Запомнить решение из настроек и показать его на кнопке."""
+        self._ai_default_enabled = enabled
+        if self._root is None:
+            return
+        self._root.after(0, self._apply_reset_session_ai)
+
     def _on_abort_click(self) -> None:
         self._skip_auto_enter.set()
         self._apply_auto_enter_off()
@@ -420,6 +542,7 @@ class StatusPanel:
     def _apply_reset_session(self) -> None:
         self._skip_auto_enter.clear()
         self._apply_auto_enter_on()
+        self._apply_reset_session_ai()
 
     def reset_session(self) -> None:
         if self._root is None:
@@ -638,6 +761,20 @@ class StatusPanel:
                 self._detail_label.configure(text=detail_text)
                 if detail_text:
                     self._detail_label.grid(row=2, column=0, sticky="ew")
+        elif state == "processing":
+            # Обработка через ИИ: распознавание уже закончено, но текст ещё не
+            # вставлен. Ждать молча нельзя — пауза тут длиннее, чем при
+            # распознавании, и без надписи это выглядит как зависание.
+            if self._stop_btn is not None:
+                self._stop_btn.grid_remove()
+            if self._record_dot is not None:
+                self._record_dot.grid_remove()
+            self._status_label.configure(text="Обрабатываю через ИИ…")
+            if self._detail_label is not None:
+                detail_text = detail.strip()
+                self._detail_label.configure(text=detail_text)
+                if detail_text:
+                    self._detail_label.grid(row=1, column=0, sticky="ew")
 
         self._refresh_canvas_bg()
         self._window.deiconify()

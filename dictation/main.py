@@ -8,11 +8,12 @@ from pathlib import Path
 
 import numpy as np
 
-from dictation import autostart, config
+from dictation import ai, autostart, config
 from dictation.hotkey import HotkeyListener, format_hotkey_label
 from dictation.single_instance import acquire_single_instance
 from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
+from dictation.prompt import load_prompt
 from dictation.recorder import SAMPLE_RATE, Recorder
 from dictation.sounds import quiet_beep_start, quiet_beep_stop
 from dictation.timing import (
@@ -42,6 +43,11 @@ def main() -> None:
     project_root = config.CONFIG_PATH.parent
     use_tray = args.tray
     busy = threading.Event()
+
+    # Промпт создаётся сразу при запуске, а не при первом обращении: иначе
+    # файл появляется только после первой диктовки с обработкой, и найти его
+    # заранее нечем.
+    load_prompt(project_root)
 
     if cfg.get("autostart") and not autostart.is_autostart_enabled():
         autostart.enable_autostart(project_root)
@@ -177,6 +183,33 @@ def main() -> None:
                 print("Слишком короткая фраза, пропуск")
                 return
 
+            raw_text = text
+            ai_error: str | None = None
+            # Кнопка на панели важнее настройки: она переключает обработку на
+            # текущую сессию, а `ai_enabled` задаёт поведение по умолчанию.
+            use_ai = cfg.get("ai_enabled", False)
+            if tray_app is not None:
+                use_ai = tray_app.ai_enabled()
+            if use_ai and not transcribe_cancel.is_set():
+                if tray_app is not None:
+                    tray_app.set_activity("processing", "отправляю текст модели…")
+                text, ai_error = ai.process_text(
+                    text,
+                    prompt=load_prompt(project_root),
+                    api_key=str(cfg.get("ai_api_key", "")),
+                    base_url=str(cfg.get("ai_base_url", ai.DEFAULT_BASE_URL)),
+                    model=str(cfg.get("ai_model", ai.DEFAULT_MODEL)),
+                    timeout_s=float(cfg.get("ai_timeout_s", ai.DEFAULT_TIMEOUT_S)),
+                )
+                if transcribe_cancel.is_set():
+                    return
+                if ai_error is not None:
+                    # Обработка не удалась — вставляем то, что распознали.
+                    # Потерять диктовку из-за чужого сбоя нельзя.
+                    print(f"Обработка через ИИ не удалась ({ai_error}), вставляю как есть")
+                else:
+                    print("Текст обработан через ИИ")
+
             auto_enter = cfg.get("paste_auto_enter", False)
             if tray_app is not None and tray_app.should_skip_auto_enter():
                 auto_enter = False
@@ -189,12 +222,16 @@ def main() -> None:
             )
             if tray_app is not None:
                 tray_app.add_transcription(text)
+                if ai_error is not None:
+                    tray_app.notify_ai_error(ai_error)
 
             if pasted:
                 suffix = " + Enter" if enter_sent else ""
                 print(f"Вставлено{suffix}: {text}")
             else:
                 print("Не удалось вставить текст")
+                if ai_error is None and text != raw_text:
+                    print(f"Было распознано: {raw_text}")
 
             if timer is not None:
                 record_speed_sample(
