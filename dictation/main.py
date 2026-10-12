@@ -216,17 +216,29 @@ def main() -> None:
             if transcribe_cancel.is_set():
                 return
 
-            text = transcriber.transcribe(audio)
+            def on_chunk(done: int, total: int) -> None:
+                # На длинной записи это единственный признак движения: без
+                # него видно только «Распознаю…» и решается, что всё встало.
+                if tray_app is not None:
+                    tray_app.set_activity(
+                        "transcribing",
+                        f"часть {done} из {total}",
+                        done / total,
+                    )
+
+            _log_line(project_root, f"распознаю {audio_duration:.1f} с")
+            text = transcriber.transcribe(audio, on_progress=on_chunk)
             if transcribe_cancel.is_set():
                 return
 
             if not text or not text.strip():
                 print("Слишком короткая фраза, пропуск")
-                _log_line(project_root, "распознан пустой текст, запись оставлена в папке «записи»")
+                _log_line(project_root, "распознан пустой текст, запись оставлена")
                 return
-            # Текст получен — запись свою роль выполнила. Файл удаляем здесь,
-            # а не раньше: до этой строки аудио было единственной копией.
-            store.discard(saved_path)
+            # Записи остаются на диске: папка «записи» нужна ещё и как собрание
+            # своей речи. Текст кладём рядом, чтобы было понятно, что за звук.
+            store.save_text(saved_path, text)
+            store.keep(saved_path)
             saved_path = None
 
             raw_text = text

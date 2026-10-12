@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 
 import numpy as np
 
+from dictation.chunking import join_texts, split
 from dictation.cleanup import load_fillers, remove_fillers
+from dictation.recorder import SAMPLE_RATE
 from transcribe import load_model, transcribe_gigaam
 
 
@@ -34,7 +37,32 @@ class Transcriber:
             text = remove_fillers(text, self._fillers)
         return text
 
-    def transcribe(self, audio: np.ndarray) -> str:
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> str:
+        """Распознать запись.
+
+        Длинная запись режется на куски: поданная целиком, она не даёт текста
+        вовсе — модель обучена на коротких фразах, и обработка на этом встаёт.
+        `on_progress` получает (готово кусков, всего кусков): на длинной
+        диктовке это единственный признак, что работа идёт, а не зависла.
+        """
         with self._lock:
-            text = transcribe_gigaam(self._model, audio)
-            return self._postprocess(text)
+            pieces = split(audio, SAMPLE_RATE)
+            if not pieces:
+                return ""
+            if len(pieces) == 1:
+                return self._postprocess(transcribe_gigaam(self._model, pieces[0]))
+
+            parts: list[str] = []
+            total = len(pieces)
+            for index, piece in enumerate(pieces, start=1):
+                parts.append(transcribe_gigaam(self._model, piece))
+                if on_progress is not None:
+                    try:
+                        on_progress(index, total)
+                    except Exception:
+                        pass
+            return self._postprocess(join_texts(parts))

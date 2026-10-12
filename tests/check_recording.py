@@ -78,12 +78,16 @@ def test_audio_survives_crash() -> None:
                 check("моно", handle.getnchannels() == 1)
                 check("16 бит", handle.getsampwidth() == 2)
 
-        check("незавершённая запись видна в списке", len(store.pending()) == 1)
+        check("запись видна в списке", len(store.pending()) == 1)
 
-        # Успешное распознавание убирает файл.
-        store.discard(path)
-        check("после распознавания файл удалён", not (path and path.exists()))
-        check("список опустел", store.pending() == [])
+        # Запись остаётся и после расшифровки: папка «записи» служит ещё и
+        # собранием своей речи, откуда достают примеры. Рядом кладётся текст,
+        # иначе непонятно, что за звук лежит в файле.
+        store.save_text(path, "расшифровка для проверки")
+        check("расшифровка легла рядом", path is not None and path.with_suffix(".txt").is_file())
+        store.keep(path)
+        check("после распознавания запись осталась", path is not None and path.exists())
+        check("список не опустел", len(store.pending()) == 1)
 
 
 def test_pending_and_trim() -> None:
@@ -97,6 +101,18 @@ def test_pending_and_trim() -> None:
 
         store.trim(limit=3)
         check("лишние удалены", len(store.pending()) == 3, str(len(store.pending())))
+
+        # Вместе с записью уходит и её расшифровка: текст без звука сбивает.
+        kept = store.pending()[0]
+        assert kept is not None
+        store.save_text(kept, "текст")
+        store.trim(limit=1)
+        remaining = store.pending()
+        check("осталась одна запись", len(remaining) == 1, str(len(remaining)))
+        check(
+            "расшифровка удалённых тоже убрана",
+            all(not p.with_suffix(".txt").exists() for p in remaining if p != kept),
+        )
 
         check("пустая папка не роняет список", RecordingStore(Path(tmp) / "нет").pending() == [])
 
