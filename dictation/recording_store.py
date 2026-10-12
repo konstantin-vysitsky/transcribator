@@ -20,9 +20,10 @@ from pathlib import Path
 import numpy as np
 
 SAMPLE_RATE = 16000
-# Сколько записей держим, если распознавание не удалось. Больше — росла бы
-# папка; меньше — можно потерять то, что ещё не разобрали руками.
-KEEP_LIMIT = 20
+# Сколько записей держим. Запас намеренно большой: записи нужны не только как
+# страховка от сбоя, но и как примеры своей речи, которые достают руками.
+# Вытесняются по одной, самые старые — папка не пустеет скачком.
+KEEP_LIMIT = 40
 
 
 class RecordingStore:
@@ -61,17 +62,33 @@ class RecordingStore:
             return None
         return path
 
-    def discard(self, path: Path | None) -> None:
-        """Удалить запись: распознавание прошло, файл больше не нужен."""
-        if path is None:
+    def save_text(self, path: Path | None, text: str) -> None:
+        """Положить расшифровку рядом с записью.
+
+        Запись остаётся и после удачной расшифровки, поэтому текст нужен в
+        папке: иначе непонятно, что в ней за звук, и достать пример речи
+        становится тяжело.
+        """
+        if path is None or not text.strip():
             return
         try:
-            path.unlink(missing_ok=True)
+            path.with_suffix(".txt").write_text(text.rstrip() + "\n", encoding="utf-8")
         except OSError:
             pass
 
+    def keep(self, path: Path | None) -> None:
+        """Оставить запись на диске и подрезать папку до предела.
+
+        Записи не удаляются после распознавания: папка «записи» нужна ещё и как
+        собрание своей речи — примеров, надиктовок, удачных формулировок. Место
+        на диске ограничено, поэтому лишнее вытесняется по одной, самые старые.
+        """
+        if path is None:
+            return
+        self.trim()
+
     def pending(self) -> list[Path]:
-        """Записи, оставшиеся от неудачных попыток. Новые — первыми."""
+        """Все сохранённые записи. Новые — первыми."""
         if not self._dir.is_dir():
             return []
         try:
@@ -83,15 +100,20 @@ class RecordingStore:
     def trim(self, limit: int = KEEP_LIMIT) -> None:
         """Не дать папке расти без предела.
 
-        Удаляются самые старые записи. Это осознанный компромисс: держать всё
-        нельзя, а место на диске кончится молча и в самый неподходящий момент.
+        Удаляются самые старые записи — по одной за вызов, а не партией.
+        Скачком папка не пустеет, и уже ненужное уходит постепенно: если
+        человек что-то искал, у него есть время заметить потерю.
+
+        Вместе с записью убирается и её расшифровка: файл текста без звука
+        только сбивает с толку.
         """
         files = self.pending()
         for old in files[limit:]:
-            try:
-                old.unlink(missing_ok=True)
-            except OSError:
-                pass
+            for target in (old, old.with_suffix(".txt")):
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def load(path: Path) -> np.ndarray | None:
