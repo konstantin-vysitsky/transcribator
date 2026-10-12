@@ -7,8 +7,10 @@ from pynput import keyboard
 from pynput.keyboard import Key, KeyCode
 
 HOTKEY_MAP: dict[str, Key | KeyCode] = {
+    "f8": Key.f8,
     "f9": Key.f9,
     "f10": Key.f10,
+    "f11": Key.f11,
     "f7": Key.f7,
     "ctrl_r": Key.ctrl_r,
 }
@@ -16,8 +18,10 @@ HOTKEY_MAP: dict[str, Key | KeyCode] = {
 # Windows virtual-key codes for function keys (pynput may deliver Key or KeyCode).
 _VK_TO_KEY: dict[int, Key] = {
     0x70: Key.f7,
+    0x77: Key.f8,
     0x78: Key.f9,
     0x79: Key.f10,
+    0x7A: Key.f11,
     0xA3: Key.ctrl_r,
 }
 
