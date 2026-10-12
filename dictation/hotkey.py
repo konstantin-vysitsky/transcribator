@@ -104,13 +104,17 @@ class HotkeyListener:
         self._combo_triggered = True
         if self._mode == "hold":
             if not self._recording and self._on_record_start:
-                if self._on_record_start():
-                    self._recording = True
+                self._recording = bool(self._on_record_start())
         elif self._mode == "toggle":
             if not self._recording:
-                if self._on_record_start and self._on_record_start():
-                    self._recording = True
-            elif self._on_record_stop and self._on_record_stop():
+                self._recording = bool(self._on_record_start and self._on_record_start())
+            else:
+                # Флаг снимается в любом случае, даже если остановка отказала.
+                # Иначе он расходится с настоящим состоянием записи, и горячая
+                # клавиша залипает: следующее нажатие снова пытается
+                # остановить, вместо того чтобы начать.
+                if self._on_record_stop:
+                    self._on_record_stop()
                 self._recording = False
 
     def _on_release(self, key: Key | KeyCode | None) -> None:

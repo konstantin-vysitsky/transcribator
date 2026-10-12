@@ -15,6 +15,7 @@ from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
 from dictation.prompt import load_prompt
 from dictation.recorder import SAMPLE_RATE, Recorder
+from dictation.recording_store import RecordingStore
 from dictation.sounds import quiet_beep_start, quiet_beep_stop
 from dictation.timing import (
     TranscribeTimer,
@@ -79,6 +80,7 @@ def main() -> None:
     tray_app = None
     hotkey: HotkeyListener | None = None
     recorder = Recorder(min_duration_s=cfg["min_utterance_s"])
+    store = RecordingStore(project_root)
     record_target_hwnd: int | None = None
 
     def request_restart() -> None:
@@ -140,7 +142,12 @@ def main() -> None:
 
     def on_record_start() -> bool:
         nonlocal record_target_hwnd
+        if recorder.is_recording():
+            # Уже пишем: второе нажатие не должно начинать заново и стирать
+            # записанное. Пусть решает обработчик остановки.
+            return False
         if busy.is_set():
+            _log_line(project_root, "предыдущая диктовка ещё обрабатывается, запись не начата")
             return False
         record_target_hwnd = capture_foreground_window()
         busy.set()
@@ -155,7 +162,16 @@ def main() -> None:
             if tray_app is not None:
                 tray_app.reset_session()
                 tray_app.set_activity("recording")
-            recorder.start()
+            if not recorder.start():
+                # Запись уже идёт: второе нажатие не должно её стирать.
+                # Показываем это человеку, чтобы не выглядело как зависание.
+                message = "запись уже идёт, повторный запуск пропущен"
+                print(message)
+                _log_line(project_root, message)
+                busy.clear()
+                if tray_app is not None:
+                    tray_app.set_activity("recording")
+                return False
             _log_line(project_root, "запись начата")
             return True
         except Exception as exc:
@@ -165,7 +181,7 @@ def main() -> None:
             _log_line(project_root, f"ошибка записи: {exc}")
             return False
 
-    def process_audio(audio: np.ndarray) -> None:
+    def process_audio(audio: np.ndarray, saved_path: Path | None = None) -> None:
         timer: TranscribeTimer | None = None
         progress_thread: threading.Thread | None = None
         stop_progress = threading.Event()
@@ -206,7 +222,12 @@ def main() -> None:
 
             if not text or not text.strip():
                 print("Слишком короткая фраза, пропуск")
+                _log_line(project_root, "распознан пустой текст, запись оставлена в папке «записи»")
                 return
+            # Текст получен — запись свою роль выполнила. Файл удаляем здесь,
+            # а не раньше: до этой строки аудио было единственной копией.
+            store.discard(saved_path)
+            saved_path = None
 
             raw_text = text
             ai_error: str | None = None
@@ -273,6 +294,13 @@ def main() -> None:
                 progress_thread.join(timeout=1.0)
             if hotkey is not None:
                 hotkey.reset_state()
+            # Файл дожил до этого места — значит, распознавание не довели до
+            # текста. Говорим об этом прямо: иначе запись лежит в папке, а
+            # человек считает её потерянной.
+            if saved_path is not None:
+                message = f"распознавание не завершилось, запись сохранена: {saved_path.name}"
+                print(message)
+                _log_line(project_root, message)
             busy.clear()
             reset_tray_idle()
 
@@ -289,9 +317,15 @@ def main() -> None:
             busy.clear()
             reset_tray_idle()
             return True
+        # Сначала на диск, потом распознавание. До этого шага запись жила
+        # только в памяти, и любой сбой стирал её без следа.
+        saved = store.save(audio, time.strftime("%Y-%m-%d_%H-%M-%S"))
+        if saved is not None:
+            _log_line(project_root, f"запись сохранена: {saved.name}")
+            store.trim()
         threading.Thread(
             target=process_audio,
-            args=(audio,),
+            args=(audio, saved),
             daemon=True,
             name="process-audio",
         ).start()

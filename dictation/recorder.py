@@ -33,8 +33,20 @@ class Recorder:
             elif self._preroll:
                 self._ring.append(chunk)
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        """Начать запись. False — запись уже идёт, начинать заново нельзя.
+
+        Повторный вызов раньше молча обнулял буфер (`self._chunks = []`) и
+        стирал уже записанное. Именно так пропала длинная диктовка: второе
+        нажатие горячей клавиши вместо остановки начало запись заново и
+        уничтожило аудио, которое ещё не успели распознать.
+
+        Возврат False вместо исключения: вызывающий код решает, что делать, а
+        падать на повторном нажатии приложение не должно.
+        """
         with self._lock:
+            if self._recording:
+                return False
             self._chunks = []
             if self._preroll and self._ring:
                 preroll = np.concatenate(list(self._ring))
@@ -52,6 +64,7 @@ class Recorder:
                 self._stream.start()
             elif not self._stream.active:
                 self._stream.start()
+        return True
 
     def is_recording(self) -> bool:
         with self._lock:
