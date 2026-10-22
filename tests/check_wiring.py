@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -125,6 +126,65 @@ def test_decision_matrix() -> None:
     check("панель без окна отвечает", FakePanel(True).ai_enabled() is True)
 
 
+def test_panel_click_is_saved() -> None:
+    """Нажатие кнопки пишется в настройки и переживает перезапуск.
+
+    Кнопка раньше переключала обработку до конца сессии: после перезапуска
+    она возвращалась к старому значению, и включать приходилось в меню.
+    """
+    print("нажатие кнопки запоминается:")
+    from dictation.status_panel import StatusPanel
+
+    cfg = config.load_config()
+    original = cfg.get("ai_enabled", False)
+    original_path = config.CONFIG_PATH
+    original_local = config.LOCAL_CONFIG_PATH
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        # В настоящий config.json не пишем: проверка не должна менять
+        # поведение диктовки у человека.
+        config.CONFIG_PATH = Path(tmp.name) / "config.json"
+        config.LOCAL_CONFIG_PATH = Path(tmp.name) / "config.local.json"
+        config.save_config({**cfg, "ai_enabled": False})
+
+        def on_toggle(enabled: bool) -> None:
+            cfg_now = config.load_config()
+            cfg_now["ai_enabled"] = enabled
+            config.save_config(cfg_now)
+
+        saved: list[bool] = []
+
+        def on_toggle_and_record(enabled: bool) -> None:
+            on_toggle(enabled)
+            saved.append(enabled)
+
+        panel = StatusPanel(on_toggle_ai=on_toggle_and_record, ai_enabled=False)
+        # Нажатие в потоке Tk: при закрытом окне `after(0, ...)` не выполнится,
+        # и проверка прочитала бы старое состояние.
+        root = panel._root
+        assert root is not None
+        root.after(0, panel._on_toggle_ai)
+        for _ in range(50):
+            if saved:
+                break
+            time.sleep(0.05)
+        check("кнопка включила", panel.ai_enabled())
+        check("наружу сказано о включении", saved == [True], repr(saved))
+        check("в настройках включено", config.load_config()["ai_enabled"] is True)
+        panel.stop()
+
+        again = StatusPanel(ai_enabled=config.load_config()["ai_enabled"])
+        check("после перезапуска обработка включена", again.ai_enabled())
+        again._on_toggle_ai()
+        check("кнопка выключила", not again.ai_enabled())
+        again.stop()
+    finally:
+        config.CONFIG_PATH = original_path
+        config.LOCAL_CONFIG_PATH = original_local
+        tmp.cleanup()
+        cfg["ai_enabled"] = original
+
+
 def test_tray_menu() -> None:
     print("меню трея:")
     import pystray
@@ -208,6 +268,7 @@ def test_default_prompt_content() -> None:
 def main() -> int:
     test_config_roundtrip()
     test_decision_matrix()
+    test_panel_click_is_saved()
     test_default_prompt_content()
     test_tray_menu()
     print()

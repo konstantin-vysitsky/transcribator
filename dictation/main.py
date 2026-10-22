@@ -256,8 +256,8 @@ def main() -> None:
 
             raw_text = text
             ai_error: str | None = None
-            # Кнопка на панели важнее настройки: она переключает обработку на
-            # текущую сессию, а `ai_enabled` задаёт поведение по умолчанию.
+            # Кнопка панели и настройка говорят одно и то же: нажатие пишется
+            # в config.json, поэтому `cfg` видит его уже в этом процессе.
             use_ai = cfg.get("ai_enabled", False)
             if tray_app is not None:
                 use_ai = tray_app.ai_enabled()

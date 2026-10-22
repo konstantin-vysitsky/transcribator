@@ -231,12 +231,9 @@ class StatusPanel:
         self._drag_flash_job: str | None = None
         self._resizing = False
         self._skip_auto_enter = threading.Event()
-        # `_skip_ai` — это «выключено на эту сессию». Он заведён отдельно от
-        # настройки, чтобы кнопка не писала в config.json; в исходном состоянии
-        # он повторяет настройку.
-        self._skip_ai = threading.Event()
-        if not ai_enabled:
-            self._skip_ai.set()
+        # Одно состояние на кнопку и на решение в main.py. Отдельного «пропуска
+        # на сессию» нет: кнопка и настройка трея пишут одно и то же значение,
+        # и разойтись им негде.
         self._ai_enabled = ai_enabled
         self._ai_default_enabled = ai_enabled
         self._ready = threading.Event()
@@ -512,40 +509,37 @@ class StatusPanel:
             )
 
     def _on_toggle_ai(self) -> None:
-        """Кнопка переключает обработку до конца сессии.
+        """Кнопка переключает обработку и запоминает решение.
 
-        В `config.json` это не пишется: там лежит решение по умолчанию, а кнопка
-        нужна для разового «здесь и сейчас». Иначе случайное нажатие меняло бы
-        поведение диктовки навсегда.
+        Нажатие уходит наружу (`_notify_toggle_ai`), а там оно пишется в
+        `config.json`. Так состояние кнопки переживает перезапуск, и в меню
+        трея ничего переключать не нужно.
 
         Состояние берётся из `ai_state()`, а не из второго флага: флагов два, и
         расхождение между ними и превращало каждое второе нажатие в холостое.
         """
         enabled = not self.ai_state()
         self._ai_enabled = enabled
-        if enabled:
-            self._skip_ai.clear()
-        else:
-            self._skip_ai.set()
+        self._ai_default_enabled = enabled
         self._render_ai()
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(enabled)
 
     def _apply_reset_session_ai(self) -> None:
-        self._skip_ai.clear()
         self._ai_enabled = self._ai_default_enabled
         self._render_ai()
 
     def ai_state(self) -> bool:
         """Включена ли обработка сейчас. Это и есть состояние кнопки."""
-        return self._ai_enabled and not self._skip_ai.is_set()
+        return self._ai_enabled
 
     def ai_enabled(self) -> bool:
         return self.ai_state()
 
     def set_ai_default(self, enabled: bool) -> None:
-        """Запомнить решение из настроек и показать его на кнопке."""
+        """Применить решение, сохранённое в настройках, и показать его на кнопке."""
         self._ai_default_enabled = enabled
+        self._ai_enabled = enabled
         if self._root is None:
             return
         self._root.after(0, self._apply_reset_session_ai)
