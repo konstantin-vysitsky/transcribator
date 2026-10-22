@@ -116,17 +116,15 @@ def test_prompt_editor() -> None:
 def test_status_panel() -> None:
     print("панель статуса:")
     toggles: list[bool] = []
-    opened: list[bool] = []
 
     panel = StatusPanel(
         on_toggle_ai=lambda enabled: toggles.append(enabled),
-        on_open_prompt=lambda: opened.append(True),
         ai_enabled=False,
     )
     root_widget = panel._root
     check("панель построена", root_widget is not None)
     check("кнопка ИИ создана", panel._ai_btn is not None)
-    check("кнопка промпта создана", panel._prompt_btn is not None)
+    check("кнопки промпта на панели нет", not hasattr(panel, "_prompt_btn"))
     check("кнопка автоотправки на месте", panel._auto_enter_btn is not None)
     check("кнопка Готово на месте", panel._stop_btn is not None)
     check("кнопка отмены на месте", panel._abort_btn is not None)
@@ -197,9 +195,6 @@ def test_status_panel() -> None:
     run_on_ui(panel._on_toggle_ai)
     check("третье нажатие снова включает", panel.ai_enabled(), "переключатель залип")
     check("наружу сказано о включении снова", toggles == [True, False, True], repr(toggles))
-
-    run_on_ui(panel._on_open_prompt)
-    check("кнопка промпта зовёт обработчик", opened == [True], repr(opened))
 
     panel.set_ai_default(True)
     time.sleep(0.4)
