@@ -246,6 +246,14 @@ def main() -> None:
             store.keep(saved_path)
             saved_path = None
 
+            # Распознавание закончено — гасим счётчик сразу. Его поток иначе
+            # продолжает каждые полсекунды ставить статус «Распознаю…» и
+            # затирает «Обрабатываю через ИИ…», пока ждём ответ модели.
+            stop_progress.set()
+            if progress_thread is not None:
+                progress_thread.join(timeout=1.0)
+                progress_thread = None
+
             raw_text = text
             ai_error: str | None = None
             # Кнопка на панели важнее настройки: она переключает обработку на
