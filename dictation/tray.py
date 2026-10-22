@@ -120,7 +120,6 @@ class TrayApp:
         on_abort: Callable[[], None] | None = None,
         on_stop_recording: Callable[[], None] | None = None,
         on_toggle_ai: Callable[[bool], None] | None = None,
-        on_open_prompt: Callable[[], None] | None = None,
     ) -> None:
         self._project_root = project_root
         self._idle_tooltip = status_text
@@ -134,7 +133,6 @@ class TrayApp:
         # Имена с «notify»: обработчик, названный как метод класса, затирает
         # этот метод собой, и вызвать его становится нечем.
         self._notify_toggle_ai = on_toggle_ai
-        self._notify_open_prompt = on_open_prompt
         self._on_hotkey_mode_change: Callable[[str], None] | None = None
         self._icon: pystray.Icon | None = None
         self._ready = threading.Event()
@@ -149,7 +147,6 @@ class TrayApp:
             on_abort=self._handle_abort,
             on_stop_recording=self._handle_stop_recording,
             on_toggle_ai=self._handle_toggle_ai,
-            on_open_prompt=self._handle_open_prompt,
             ai_enabled=self._ai_enabled,
         )
         self._prompt_editor: PromptEditor | None = None
@@ -176,12 +173,6 @@ class TrayApp:
         self._refresh_menu()
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(enabled)
-
-    def _handle_open_prompt(self) -> None:
-        if self._prompt_editor is not None:
-            self._prompt_editor.open()
-        if self._notify_open_prompt is not None:
-            self._notify_open_prompt()
 
     def open_prompt_editor(self) -> None:
         if self._prompt_editor is None:

@@ -23,8 +23,6 @@ _STOP_BG = "#1565c0"
 _STOP_ACTIVE_BG = "#0d47a1"
 _AI_BG = "#6a1b9a"
 _AI_ACTIVE_BG = "#4a148c"
-_PROMPT_BG = "#37474f"
-_PROMPT_ACTIVE_BG = "#263238"
 _MARGIN_X = 16
 _MARGIN_Y = 48
 _PANEL_PAD_X = 14
@@ -53,7 +51,6 @@ def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
         panel._stop_btn,
         panel._abort_btn,
         panel._ai_btn,
-        panel._prompt_btn,
     ):
         if button is None:
             continue
@@ -196,7 +193,6 @@ class StatusPanel:
         on_abort: Callable[[], None] | None = None,
         on_stop_recording: Callable[[], None] | None = None,
         on_toggle_ai: Callable[[bool], None] | None = None,
-        on_open_prompt: Callable[[], None] | None = None,
         ai_enabled: bool = False,
     ) -> None:
         self._on_abort = on_abort
@@ -205,7 +201,6 @@ class StatusPanel:
         # (`_on_toggle_ai`), затирают эти методы собой, и кнопка начинает звать
         # не панель, а внешний код — с чужими аргументами.
         self._notify_toggle_ai = on_toggle_ai
-        self._notify_open_prompt = on_open_prompt
         self._root: tk.Tk | None = None
         self._window: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
@@ -220,7 +215,6 @@ class StatusPanel:
         self._stop_btn: _RoundButton | None = None
         self._abort_btn: _RoundButton | None = None
         self._ai_btn: _RoundButton | None = None
-        self._prompt_btn: _RoundButton | None = None
         self._drag_active = False
         self._drag_press: tuple[int, int] | None = None
         self._drag_offset = (0, 0)
@@ -355,12 +349,12 @@ class StatusPanel:
         # клавишей Enter, «Обработка ИИ» — тем, идёт ли текст перед вставкой
         # через модель. Это разные решения, и смешивать их в одной кнопке
         # нельзя: отключив Enter, человек не должен терять обработку.
+        # Промпт на панели не нужен: он правится из меню трея, и писать
+        # инструкцию на ходу диктовки никто не станет.
         ai_row = tk.Frame(frame, bg=_BG, height=_TOP_ROW_H)
         ai_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         ai_row.grid_propagate(False)
         ai_row.columnconfigure(0, weight=1)
-        ai_row.columnconfigure(1, weight=0)
-        ai_row.columnconfigure(2, weight=0)
 
         self._ai_btn = _RoundButton(
             ai_row,
@@ -373,19 +367,6 @@ class StatusPanel:
             expand=True,
         )
         self._ai_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-
-        self._prompt_btn = _RoundButton(
-            ai_row,
-            text="Промпт",
-            command=self._on_open_prompt,
-            width=_STOP_W,
-            height=_TOP_ROW_H,
-            bg=_PROMPT_BG,
-            active_bg=_PROMPT_ACTIVE_BG,
-            font=("Segoe UI", 9, "bold"),
-            radius=8,
-        )
-        self._prompt_btn.grid(row=0, column=1, sticky="ns")
 
         bottom_col = tk.Frame(frame, bg=_BG)
         bottom_col.grid(row=2, column=0, sticky="ew")
@@ -509,10 +490,6 @@ class StatusPanel:
             self._apply_ai_off()
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(self._ai_enabled)
-
-    def _on_open_prompt(self) -> None:
-        if self._notify_open_prompt is not None:
-            self._notify_open_prompt()
 
     def _apply_reset_session_ai(self) -> None:
         self._skip_ai.clear()
