@@ -22,7 +22,7 @@ import urllib.request
 # текстом без служебных украшений. Своё «не могу» модель тоже вернёт текстом,
 # и он попадёт в поле ввода — это заметно и правится одним нажатием.
 DEFAULT_BASE_URL = "https://xn--80ahc1bui.xn--p1ai/v1"
-DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_TIMEOUT_S = 30.0
 # Служебный запас поверх текста: промпт и ответ по токенам считаются отдельно.
 _MAX_TOKENS_FLOOR = 512
@@ -60,6 +60,18 @@ def _error_text(exc: Exception) -> str:
     if isinstance(exc, TimeoutError):
         return "сервис не ответил вовремя"
     return f"ошибка обработки: {exc.__class__.__name__}"
+
+
+def _without_thinking(payload: dict[str, object], model: str) -> dict[str, object]:
+    """Выключить режим размышлений у моделей DeepSeek.
+
+    У DeepSeek он включён по умолчанию, а чистке диктовки рассуждать не о чем:
+    размышления только тратят время и токены. Поле понимают лишь модели
+    DeepSeek, поэтому чужому совместимому сервису его не отправляем.
+    """
+    if model.strip().lower().startswith("deepseek"):
+        payload["thinking"] = {"type": "disabled"}
+    return payload
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -115,6 +127,7 @@ def process_text(
         "max_tokens": _max_tokens_for(text),
         "stream": False,
     }
+    payload = _without_thinking(payload, model)
     request = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -156,6 +169,7 @@ def check_connection(
         "max_tokens": 8,
         "stream": False,
     }
+    payload = _without_thinking(payload, model)
     request = urllib.request.Request(
         base_url.rstrip("/") + "/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

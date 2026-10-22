@@ -25,7 +25,7 @@ DEFAULTS: dict[str, Any] = {
     "ai_enabled": False,
     "ai_base_url": "https://xn--80ahc1bui.xn--p1ai/v1",
     "ai_api_key": "",
-    "ai_model": "deepseek-v4-flash",
+    "ai_model": "deepseek-flash",
     "ai_timeout_s": 30.0,
 }
 

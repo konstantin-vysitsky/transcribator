@@ -12,6 +12,6 @@
   "ai_enabled": true,
   "ai_base_url": "https://api.deepseek.com/v1",
   "ai_api_key": "",
-  "ai_model": "deepseek-chat",
+  "ai_model": "deepseek-flash",
   "ai_timeout_s": 30.0
 }
