@@ -8,7 +8,8 @@
 видно его на экране или нет.
 
 Что снимается: `panel_recording.png`, `panel_processing.png`,
-`panel_ai_off.png` и `prompt_editor.png`.
+`panel_ai_off.png`, `panel_ai_error.png`, `panel_ai_notready.png`
+и `prompt_editor.png`.
 """
 from __future__ import annotations
 
@@ -154,6 +155,15 @@ def main() -> int:
     panel.update("recording")
     time.sleep(0.6)
     capture(window, out / "panel_ai_off.png", root)
+
+    panel.set_ai_error("ключ отклонён")
+    time.sleep(0.4)
+    capture(window, out / "panel_ai_error.png", root)
+
+    panel.set_ai_error(None)
+    panel.set_ai_ready(False)
+    time.sleep(0.4)
+    capture(window, out / "panel_ai_notready.png", root)
 
     panel.update("idle")
     panel.stop()

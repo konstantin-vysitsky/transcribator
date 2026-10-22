@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dictation.prompt import DEFAULT_PROMPT, load_prompt  # noqa: E402
 from dictation.prompt_editor import PromptEditor  # noqa: E402
 from dictation.status_panel import (  # noqa: E402
+    _AI_BAD_BG,
     _AI_BG as _AI_ON_BG,
     _BTN_OFF_BG as _AI_OFF_BG,
     StatusPanel,
@@ -196,6 +197,24 @@ def test_status_panel() -> None:
     check("третье нажатие снова включает", panel.ai_enabled(), "переключатель залип")
     check("наружу сказано о включении снова", toggles == [True, False, True], repr(toggles))
 
+    # Каждое нажатие обязано менять состояние. Раньше флагов было два, и
+    # каждое второе нажатие проходило вхолостую: человек жмёт, ничего не
+    # меняется, и это выглядит как залипшая кнопка.
+    for index in range(8):
+        before = panel.ai_enabled()
+        run_on_ui(panel._on_toggle_ai)
+        if panel.ai_enabled() == before:
+            check(f"нажатие {index + 4} не холостое", False, "состояние не изменилось")
+            break
+    else:
+        check("восемь нажатий подряд все рабочие", True)
+    check(
+        "наружу ушло по сообщению на каждое нажатие",
+        len(toggles) == 11,
+        str(len(toggles)),
+    )
+    check("кнопка вернулась во включённое", panel.ai_enabled())
+
     panel.set_ai_default(True)
     time.sleep(0.4)
     check("настройка включает обработку", panel.ai_enabled())
@@ -226,9 +245,79 @@ def test_status_panel() -> None:
     time.sleep(0.3)
 
 
+def test_ai_ready_mark() -> None:
+    """Отметка настраиваемости: кнопка говорит, когда обрабатывать нечем.
+
+    Человек включает обработку, диктовка вставляется необработанной, и без
+    отметки это выглядит как поломка. Кнопка обязана сказать, что не готово.
+    """
+    print("отметка настройки ИИ:")
+    panel = StatusPanel(ai_enabled=False, ai_ready=False)
+    time.sleep(0.4)
+    button = panel._ai_btn
+    try:
+        check("кнопка построена", button is not None)
+        check("без ключа обработка не настроена", not panel.ai_ready())
+        check(
+            "на кнопке сказано про недонастройку",
+            button is not None and "не настроен" in button._text,
+            button._text if button else "",
+        )
+        check(
+            "кнопка перекрашена в предупреждение",
+            button is not None and button._bg == _AI_BAD_BG,
+            button._bg if button else "",
+        )
+        check(
+            "подсказка называет место, где лежит ключ",
+            "config.local.json" in panel.ai_hint(),
+            panel.ai_hint(),
+        )
+
+        panel.set_ai_ready(True)
+        time.sleep(0.4)
+        check("с ключом обработка настроена", panel.ai_ready())
+        check(
+            "надпись стала обычной",
+            button is not None and "не настроен" not in button._text,
+            button._text if button else "",
+        )
+        check("подсказка пуста", panel.ai_hint() == "", panel.ai_hint())
+
+        panel.set_ai_error("ключ отклонён")
+        time.sleep(0.4)
+        check(
+            "ошибка запроса видна на кнопке",
+            button is not None and "ошибка" in button._text,
+            button._text if button else "",
+        )
+        check(
+            "подсказка объясняет ошибку",
+            "ключ отклонён" in panel.ai_hint(),
+            panel.ai_hint(),
+        )
+
+        panel.set_ai_error(None)
+        time.sleep(0.4)
+        check(
+            "после удачной обработки ошибка снята",
+            button is not None and "ошибка" not in button._text,
+            button._text if button else "",
+        )
+
+        panel.set_ai_ready(False)
+        panel.set_ai_default(True)
+        time.sleep(0.4)
+        check("без ключа кнопка снова предупреждает", "не настроен" in (button._text if button else ""))
+    finally:
+        panel.stop()
+        time.sleep(0.3)
+
+
 def main() -> int:
     test_prompt_editor()
     test_status_panel()
+    test_ai_ready_mark()
     print()
     if FAILURES:
         print(f"ПРОВАЛЕНО: {len(FAILURES)}")

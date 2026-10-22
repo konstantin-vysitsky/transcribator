@@ -23,6 +23,8 @@ _STOP_BG = "#1565c0"
 _STOP_ACTIVE_BG = "#0d47a1"
 _AI_BG = "#6a1b9a"
 _AI_ACTIVE_BG = "#4a148c"
+_AI_BAD_BG = "#8d6e00"
+_AI_BAD_ACTIVE_BG = "#6d5400"
 _MARGIN_X = 16
 _MARGIN_Y = 48
 _PANEL_PAD_X = 14
@@ -194,6 +196,7 @@ class StatusPanel:
         on_stop_recording: Callable[[], None] | None = None,
         on_toggle_ai: Callable[[bool], None] | None = None,
         ai_enabled: bool = False,
+        ai_ready: bool = True,
     ) -> None:
         self._on_abort = on_abort
         self._on_stop_recording = on_stop_recording
@@ -215,6 +218,12 @@ class StatusPanel:
         self._stop_btn: _RoundButton | None = None
         self._abort_btn: _RoundButton | None = None
         self._ai_btn: _RoundButton | None = None
+        # `_ai_ready` — настроена ли обработка. Включённая кнопка при пустом
+        # ключе выглядит как рабочая, а текст вставляется необработанным:
+        # человек видит это и решает, что сломано приложение. Надпись на
+        # кнопке должна говорить, что ещё не готово.
+        self._ai_ready = ai_ready
+        self._ai_last_error: str | None = None
         self._drag_active = False
         self._drag_press: tuple[int, int] | None = None
         self._drag_offset = (0, 0)
@@ -423,6 +432,10 @@ class StatusPanel:
             anchor="w",
         )
 
+        # Виджеты готовы — рисуем настоящую надпись кнопки. Раньше здесь
+        # ничего не было: кнопка держала образец «вкл», пока её не тронут.
+        self._render_ai()
+
         self._ready.set()
         _resize_canvas()
         root.mainloop()
@@ -457,18 +470,43 @@ class StatusPanel:
 
     # --- обработка через ИИ ------------------------------------------------
 
-    def _apply_ai_on(self) -> None:
-        if self._ai_btn is not None:
-            self._ai_btn.configure_button(
-                text="Обработка ИИ вкл",
-                bg=_AI_BG,
-                active_bg=_AI_ACTIVE_BG,
-            )
+    def _ai_text(self) -> str:
+        """Надпись на кнопке: сначала состояние, потом настроенность.
 
-    def _apply_ai_off(self) -> None:
-        if self._ai_btn is not None:
-            self._ai_btn.configure_button(
-                text="Обработка ИИ выкл",
+        Отдельной строчки под кнопку нет намеренно: панель висит у края экрана
+        и растёт от любой новой строки. Надпись на самой кнопке говорит всё,
+        а причина читается в подсказке — короткой строке статуса.
+        """
+        if not self._ai_ready:
+            return "ИИ не настроен: нет ключа"
+        state = "вкл" if self.ai_state() else "выкл"
+        if self._ai_last_error:
+            return f"ИИ {state} · ошибка"
+        return f"Обработка ИИ {state}"
+
+    def _ai_hint(self) -> str:
+        if not self._ai_ready:
+            return "нет ключа: заведите в кабинете федота.рф и вставьте в config.local.json"
+        if self._ai_last_error:
+            return f"последний запрос не прошёл: {self._ai_last_error}"
+        return ""
+
+    def _render_ai(self) -> None:
+        button = self._ai_btn
+        if button is None:
+            return
+        if not self._ai_ready:
+            button.configure_button(
+                text=self._ai_text(), bg=_AI_BAD_BG, active_bg=_AI_BAD_ACTIVE_BG
+            )
+            return
+        if self.ai_state():
+            button.configure_button(
+                text=self._ai_text(), bg=_AI_BG, active_bg=_AI_ACTIVE_BG
+            )
+        else:
+            button.configure_button(
+                text=self._ai_text(),
                 bg=_BTN_OFF_BG,
                 active_bg=_BTN_OFF_ACTIVE_BG,
             )
@@ -479,28 +517,31 @@ class StatusPanel:
         В `config.json` это не пишется: там лежит решение по умолчанию, а кнопка
         нужна для разового «здесь и сейчас». Иначе случайное нажатие меняло бы
         поведение диктовки навсегда.
+
+        Состояние берётся из `ai_state()`, а не из второго флага: флагов два, и
+        расхождение между ними и превращало каждое второе нажатие в холостое.
         """
-        if self._skip_ai.is_set():
+        enabled = not self.ai_state()
+        self._ai_enabled = enabled
+        if enabled:
             self._skip_ai.clear()
-            self._ai_enabled = True
-            self._apply_ai_on()
         else:
             self._skip_ai.set()
-            self._ai_enabled = False
-            self._apply_ai_off()
+        self._render_ai()
         if self._notify_toggle_ai is not None:
-            self._notify_toggle_ai(self._ai_enabled)
+            self._notify_toggle_ai(enabled)
 
     def _apply_reset_session_ai(self) -> None:
         self._skip_ai.clear()
         self._ai_enabled = self._ai_default_enabled
-        if self._ai_default_enabled:
-            self._apply_ai_on()
-        else:
-            self._apply_ai_off()
+        self._render_ai()
+
+    def ai_state(self) -> bool:
+        """Включена ли обработка сейчас. Это и есть состояние кнопки."""
+        return self._ai_enabled and not self._skip_ai.is_set()
 
     def ai_enabled(self) -> bool:
-        return self._ai_enabled and not self._skip_ai.is_set()
+        return self.ai_state()
 
     def set_ai_default(self, enabled: bool) -> None:
         """Запомнить решение из настроек и показать его на кнопке."""
@@ -508,6 +549,26 @@ class StatusPanel:
         if self._root is None:
             return
         self._root.after(0, self._apply_reset_session_ai)
+
+    def set_ai_ready(self, ready: bool) -> None:
+        """Сказать панели, настроена ли обработка. Без ключа кнопка об этом пишет."""
+        self._ai_ready = ready
+        if self._root is None:
+            return
+        self._root.after(0, self._render_ai)
+
+    def ai_ready(self) -> bool:
+        return self._ai_ready
+
+    def ai_hint(self) -> str:
+        return self._ai_hint()
+
+    def set_ai_error(self, reason: str | None) -> None:
+        """Показать на кнопке, что последний запрос к модели не прошёл."""
+        self._ai_last_error = reason
+        if self._root is None:
+            return
+        self._root.after(0, self._render_ai)
 
     def _on_abort_click(self) -> None:
         self._skip_auto_enter.set()

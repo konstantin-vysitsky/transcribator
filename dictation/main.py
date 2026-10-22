@@ -141,7 +141,7 @@ def main() -> None:
         tray_app.set_runtime_info(transcriber.runtime_label())
 
     def on_record_start() -> bool:
-        nonlocal record_target_hwnd
+        nonlocal record_target_hwnd, cfg
         if recorder.is_recording():
             # Уже пишем: второе нажатие не должно начинать заново и стирать
             # записанное. Пусть решает обработчик остановки.
@@ -149,6 +149,10 @@ def main() -> None:
         if busy.is_set():
             _log_line(project_root, "предыдущая диктовка ещё обрабатывается, запись не начата")
             return False
+        # Настройки перечитываются перед каждой записью: ключ к сервису
+        # обработки правят руками в файле, а приложение живёт без окна.
+        # С загрузки прошли часы, и старое значение врало бы дальше.
+        cfg = config.load_config()
         record_target_hwnd = capture_foreground_window()
         busy.set()
         transcribe_cancel.clear()
@@ -161,6 +165,7 @@ def main() -> None:
             print("Запись...")
             if tray_app is not None:
                 tray_app.reset_session()
+                tray_app.refresh_ai_settings()
                 tray_app.set_activity("recording")
             if not recorder.start():
                 # Запись уже идёт: второе нажатие не должно её стирать.
@@ -280,8 +285,12 @@ def main() -> None:
             )
             if tray_app is not None:
                 tray_app.add_transcription(text)
+                # Ошибка обработки остаётся на кнопке до следующей удачной:
+                # уведомление гаснет само, а кнопка — нет.
                 if ai_error is not None:
-                    tray_app.notify_ai_error(ai_error)
+                    tray_app.report_ai_error(ai_error)
+                elif use_ai:
+                    tray_app.clear_ai_error()
 
             if pasted:
                 suffix = " + Enter" if enter_sent else ""

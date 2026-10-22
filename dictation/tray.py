@@ -148,6 +148,7 @@ class TrayApp:
             on_stop_recording=self._handle_stop_recording,
             on_toggle_ai=self._handle_toggle_ai,
             ai_enabled=self._ai_enabled,
+            ai_ready=bool(str(cfg.get("ai_api_key", "")).strip()),
         )
         self._prompt_editor: PromptEditor | None = None
 
@@ -159,6 +160,30 @@ class TrayApp:
 
     def ai_enabled(self) -> bool:
         return self._status_panel.ai_enabled()
+
+    def ai_ready(self) -> bool:
+        return self._status_panel.ai_ready()
+
+    def refresh_ai_settings(self) -> None:
+        """Перечитать настройки обработки и показать их на кнопке панели.
+
+        Ключ правят руками в `config.local.json`, а приложение работает без
+        окна: без этого перечитывания кнопка продолжала бы говорить «нет
+        ключа» до перезапуска.
+        """
+        cfg = config.load_config()
+        self._status_panel.set_ai_ready(bool(str(cfg.get("ai_api_key", "")).strip()))
+
+    def report_ai_error(self, reason: str) -> None:
+        """Обработка не прошла: сказать в уведомлении и пометить кнопку."""
+        self._status_panel.set_ai_error(reason)
+        self.notify_ai_error(reason)
+
+    def clear_ai_error(self) -> None:
+        self._status_panel.set_ai_error(None)
+
+    def ai_hint(self) -> str:
+        return self._status_panel.ai_hint()
 
     def _handle_abort(self) -> None:
         if self._on_abort is not None:
@@ -173,6 +198,10 @@ class TrayApp:
         self._refresh_menu()
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(enabled)
+        # Включили, а обрабатывать нечем — говорим сейчас, иначе человек
+        # узнает об этом только по вставленной необработанной диктовке.
+        if enabled and not self._status_panel.ai_ready():
+            self.notify_ai_not_ready()
 
     def open_prompt_editor(self) -> None:
         if self._prompt_editor is None:
@@ -247,6 +276,19 @@ class TrayApp:
             return
         try:
             self._icon.notify("Обработка через ИИ не удалась", reason)
+        except Exception:
+            pass
+
+    def notify_ai_not_ready(self) -> None:
+        """Обработку включили, а ключа нет. Сказать об этом сразу, а не после диктовки."""
+        if self._icon is None:
+            return
+        try:
+            self._icon.notify(
+                "ИИ не настроен",
+                "Ключа нет. Заведите его в кабинете федота.рф и вставьте "
+                "в config.local.json рядом с config.json.",
+            )
         except Exception:
             pass
 
@@ -417,6 +459,8 @@ class TrayApp:
         self._refresh_menu()
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(self._ai_enabled)
+        if self._ai_enabled and not self._status_panel.ai_ready():
+            self.notify_ai_not_ready()
 
     def _edit_prompt(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         self.open_prompt_editor()
