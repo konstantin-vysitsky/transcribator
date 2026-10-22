@@ -9,9 +9,9 @@
   "sound_feedback": true,
   "min_utterance_s": 0.3,
   "autostart": true,
-  "ai_enabled": false,
-  "ai_base_url": "https://xn--80ahc1bui.xn--p1ai/v1",
+  "ai_enabled": true,
+  "ai_base_url": "https://api.deepseek.com/v1",
   "ai_api_key": "",
-  "ai_model": "deepseek-flash",
+  "ai_model": "deepseek-chat",
   "ai_timeout_s": 30.0
 }
