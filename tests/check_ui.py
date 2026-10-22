@@ -21,12 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dictation.prompt import DEFAULT_PROMPT, load_prompt  # noqa: E402
 from dictation.prompt_editor import PromptEditor  # noqa: E402
-from dictation.status_panel import (  # noqa: E402
-    _AI_BAD_BG,
-    _AI_BG as _AI_ON_BG,
-    _BTN_OFF_BG as _AI_OFF_BG,
-    StatusPanel,
-)
+from dictation.status_panel import StatusPanel  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -35,6 +30,17 @@ def check(name: str, condition: bool, detail: str = "") -> None:
     print(("  ок   " if condition else "  ПЛОХО ") + name + ("" if condition else f" {detail}"))
     if not condition:
         FAILURES.append(name)
+
+
+def stop_panel(panel: StatusPanel) -> None:
+    """Остановить панель и дать потоку Tk спокойно выйти.
+
+    Панель живёт в своём потоке и строит свой корень Tk. Второй корень в том
+    же процессе Tk делит с первым картинки и не всегда стартует чисто, поэтому
+    каждая панель в проверке работает отдельным процессом.
+    """
+    panel.stop()
+    time.sleep(0.4)
 
 
 def test_prompt_editor() -> None:
@@ -170,27 +176,29 @@ def test_status_panel() -> None:
     button = panel._ai_btn
     check(
         "надпись на кнопке сменилась",
-        button is not None and "вкл" in button._text,
-        button._text if button else "",
+        button is not None and "вкл" not in button.text and "ИИ" in button.text,
+        button.text if button else "",
     )
+    time.sleep(0.3)
     check(
-        "кнопка перекрашена во включённое",
-        button is not None and button._bg == _AI_ON_BG,
-        button._bg if button else "",
+        "ползунок ушёл во включённое",
+        button is not None and button.progress > 0.9,
+        button.progress if button else "",
     )
 
     run_on_ui(panel._on_toggle_ai)
     check("повторное нажатие выключает", not panel.ai_enabled())
     check("наружу сказано о выключении", toggles == [True, False], repr(toggles))
+    time.sleep(0.3)
     check(
-        "надпись вернулась",
-        button is not None and "выкл" in button._text,
-        button._text if button else "",
+        "надпись говорит про выключенное",
+        button is not None and "выкл" in button.text,
+        button.text if button else "",
     )
     check(
-        "кнопка перекрашена в выключенное",
-        button is not None and button._bg == _AI_OFF_BG,
-        button._bg if button else "",
+        "ползунок ушёл в выключенное",
+        button is not None and button.progress < 0.1,
+        button.progress if button else "",
     )
 
     run_on_ui(panel._on_toggle_ai)
@@ -219,18 +227,17 @@ def test_status_panel() -> None:
     time.sleep(0.4)
     check("настройка включает обработку", panel.ai_enabled())
     check(
-        "кнопка показывает включённое",
-        button is not None and "вкл" in button._text,
-        button._text if button else "",
+        "ползунок показывает включённое",
+        button is not None and button.progress > 0.9,
+        button.progress if button else "",
     )
 
     panel.update("processing", "отправляю текст модели…")
     time.sleep(0.4)
-    status = panel._status_label
     check(
         "видно обработку через ИИ",
-        status is not None and "ИИ" in status.cget("text"),
-        status.cget("text") if status else "",
+        panel._state == "processing",
+        panel._state,
     )
 
     panel.reset_session()
@@ -256,17 +263,12 @@ def test_ai_ready_mark() -> None:
     time.sleep(0.4)
     button = panel._ai_btn
     try:
-        check("кнопка построена", button is not None)
+        check("ползунок построен", button is not None)
         check("без ключа обработка не настроена", not panel.ai_ready())
         check(
-            "на кнопке сказано про недонастройку",
-            button is not None and "не настроен" in button._text,
-            button._text if button else "",
-        )
-        check(
-            "кнопка перекрашена в предупреждение",
-            button is not None and button._bg == _AI_BAD_BG,
-            button._bg if button else "",
+            "на ползунке сказано про недонастройку",
+            button is not None and "не настроен" in button.text,
+            button.text if button else "",
         )
         check(
             "подсказка называет место, где лежит ключ",
@@ -279,17 +281,17 @@ def test_ai_ready_mark() -> None:
         check("с ключом обработка настроена", panel.ai_ready())
         check(
             "надпись стала обычной",
-            button is not None and "не настроен" not in button._text,
-            button._text if button else "",
+            button is not None and "не настроен" not in button.text,
+            button.text if button else "",
         )
         check("подсказка пуста", panel.ai_hint() == "", panel.ai_hint())
 
         panel.set_ai_error("ключ отклонён")
         time.sleep(0.4)
         check(
-            "ошибка запроса видна на кнопке",
-            button is not None and "ошибка" in button._text,
-            button._text if button else "",
+            "ошибка запроса видна на ползунке",
+            button is not None and "ошибка" in button.text,
+            button.text if button else "",
         )
         check(
             "подсказка объясняет ошибку",
@@ -301,23 +303,42 @@ def test_ai_ready_mark() -> None:
         time.sleep(0.4)
         check(
             "после удачной обработки ошибка снята",
-            button is not None and "ошибка" not in button._text,
-            button._text if button else "",
+            button is not None and "ошибка" not in button.text,
+            button.text if button else "",
         )
 
         panel.set_ai_ready(False)
         panel.set_ai_default(True)
         time.sleep(0.4)
-        check("без ключа кнопка снова предупреждает", "не настроен" in (button._text if button else ""))
+        check("без ключа ползунок снова предупреждает", "не настроен" in (button.text if button else ""))
     finally:
         panel.stop()
         time.sleep(0.3)
 
 
-def main() -> int:
-    test_prompt_editor()
+_SECOND_PANEL_CODE = None
+
+
+def run_panel_checks() -> int:
+    """Проверки одной панели: запускаются в отдельном процессе.
+
+    Корень Tk у процесса один; второй корень делит с первым картинки и
+    стартует не всегда. Поэтому каждая проверка панели идёт своим процессом.
+    """
     test_status_panel()
     test_ai_ready_mark()
+    return 1 if FAILURES else 0
+
+
+def main() -> int:
+    test_prompt_editor()
+    # Панели проверяются в отдельных процессах: у процесса один корень Tk.
+    for run_number in (1, 2):
+        status = run_panel_checks_subprocess()
+        if status != 0:
+            check(f"проверка панели, процесс {run_number}", False, str(status))
+        else:
+            check(f"проверка панели, процесс {run_number}", True)
     print()
     if FAILURES:
         print(f"ПРОВАЛЕНО: {len(FAILURES)}")
@@ -328,5 +349,25 @@ def main() -> int:
     return 0
 
 
+def run_panel_checks_subprocess() -> int:
+    import subprocess  # noqa: PLC0415
+
+    root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--panel"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    print(result.stdout.rstrip())
+    if result.stderr.strip():
+        print(result.stderr.rstrip())
+    return result.returncode
+
+
 if __name__ == "__main__":
+    if "--panel" in sys.argv:
+        raise SystemExit(run_panel_checks())
     raise SystemExit(main())

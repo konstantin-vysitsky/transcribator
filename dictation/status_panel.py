@@ -1,41 +1,178 @@
+"""Панель диктовки: рисуется в большом размере и уменьшается при показе.
+
+Tk рисует только без сглаживания, и на экранах с масштабом 125–150%
+скругления и углы букв выглядели ступеньками, как в низком разрешении.
+Поэтому здесь вся панель рисуется картинкой через Pillow: рисунок делается
+в два раза крупнее нужного и уменьшается с хорошим сглаживанием. На экране
+появляется уже готовое изображение.
+
+Живут так не только корпус и кнопки, но и текст: он нарисован той же
+картинкой, а значит идёт с тем же сглаживанием, что и формы.
+"""
 from __future__ import annotations
 
+import math
 import sys
 import threading
+import time
 import tkinter as tk
 from collections.abc import Callable
-from tkinter import ttk
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
+
+from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+from dictation import panel_style
 
 ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 
-_BG = "#1e1e1e"
-_FG = "#e8e8e8"
-_ACCENT_RECORD = "#e53935"
-_ACCENT_TRANSCRIBE = "#4285f4"
-_BTN_ON_BG = "#2e7d32"
-_BTN_ON_ACTIVE_BG = "#1b5e20"
-_BTN_OFF_BG = "#c62828"
-_BTN_OFF_ACTIVE_BG = "#8e0000"
-_ABORT_BG = "#3a3a3a"
-_ABORT_ACTIVE_BG = "#c62828"
-_STOP_BG = "#1565c0"
-_STOP_ACTIVE_BG = "#0d47a1"
-_AI_BG = "#6a1b9a"
-_AI_ACTIVE_BG = "#4a148c"
-_AI_BAD_BG = "#8d6e00"
-_AI_BAD_ACTIVE_BG = "#6d5400"
+# Все размеры ниже — в точках экрана, как в макете HTML. На экране с
+# масштабом 125% панель вырастает вместе с системой.
+_PANEL_W = 396
+_PANEL_PAD_X = 16
+_PANEL_PAD_Y = 14
+_CONTENT_W = 364
+_RADIUS = 20          # у чёрного стекла — 24
+_STATUS_ROW_H = 34
+_DONE_W = 64
+_DONE_H = 32
+_ABORT = 32
+_DOT_SLOT = 20
+_DOT = 10
+_SWITCH_H = 34
+_SWITCH_PAD_R = 12
+_TRACK_W = 44
+_TRACK_H = 24
+_KNOB = 18
+_TRACK_PAD = 3
+_GAP = 8
+_SWITCH_ROW_TOP = 12
+_DIVIDER_GAP_TOP = 10
+_DIVIDER_GAP_BOTTOM = 12
 _MARGIN_X = 16
 _MARGIN_Y = 48
-_PANEL_PAD_X = 14
-_PANEL_PAD_Y = 10
-_RADIUS = 10
-_TOP_ROW_H = 36
-_ABORT_SIZE = 36
-_STOP_W = 64
-_PANEL_W = 340
 _DRAG_BORDER = 3
 _DRAG_THRESHOLD = 3
+
+_SUPERSAMPLE = 2      # во сколько раз крупнее рисунок в движении: сглаживание в четверть пикселя
+_SUPERSAMPLE_MAX = 3  # больше не растем: память растёт квадратом
+_RENDER_DELAY_MS = 8  # наведение и нажатие: рисунок собирается не на каждый пиксель мыши
+_PULSE_MS = 33
+_PULSE_PEAK_MS = 120
+_PULSE_BEAT_S = 1.1
+_COLOR_STEPS = 8
+_COLOR_MS = 20
+
+_ICON_ABORT = "\ue711"
+_ICON_FALLBACK = "\u2715"
+
+_FONT_BODY = ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/segoeui.ttf")
+_FONT_SMALL = ("C:/Windows/Fonts/segoeuisb.ttf", "C:/Windows/Fonts/segoeui.ttf")
+_FONT_ICONS = ("C:/Windows/Fonts/SegoeIcons.ttf", "C:/Windows/Fonts/seguisym.ttf")
+
+
+# --- цвета -------------------------------------------------------------------
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16))
+
+
+def _rgb_to_hex(rgb: tuple[float, float, float]) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(c))):02x}" for c in rgb)
+
+
+def mix(color_a: str, color_b: str, t: float) -> str:
+    """Смешать два цвета: t=0 — первый, t=1 — второй."""
+    t = max(0.0, min(1.0, t))
+    a = _hex_to_rgb(color_a)
+    b = _hex_to_rgb(color_b)
+    return _rgb_to_hex(
+        (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
+    )
+
+
+def _rgba(color: str, alpha: float) -> tuple[int, int, int, int]:
+    r, g, b = _hex_to_rgb(color)
+    return (r, g, b, max(0, min(255, round(alpha * 255))))
+
+
+# --- шрифты ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Fonts:
+    body: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
+    small: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
+    title: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
+    icon: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
+
+
+def _load_font(paths: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in paths:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _fonts(scale: float, supersample: int = _SUPERSAMPLE_MAX) -> _Fonts:
+    def size(points: float) -> int:
+        return max(8, round(points * scale * supersample))
+
+    return _Fonts(
+        body=(_load_font(_FONT_BODY, size(9.5)), size(9.5)),
+        small=(_load_font(_FONT_SMALL, size(9)), size(9)),
+        title=(_load_font(_FONT_BODY, size(10.5)), size(10.5)),
+        icon=(_load_font(_FONT_ICONS, size(10)), size(10)),
+    )
+
+
+def _icon_char() -> str:
+    try:
+        font = ImageFont.truetype(_FONT_ICONS[0], 16)
+        mask = font.getmask(_ICON_ABORT)
+        bbox = mask.getbbox() if hasattr(mask, "getbbox") else None
+        if bbox:
+            return _ICON_ABORT
+    except OSError:
+        pass
+    return _ICON_FALLBACK
+
+
+def _text_size(
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont, text: str
+) -> tuple[int, int]:
+    if isinstance(font, ImageFont.FreeTypeFont):
+        left, top, right, bottom = font.getbbox(text)
+        return right - left, bottom - top
+    return font.getsize(text)
+
+
+# --- кнопки и ползунки: их состояния ----------------------------------------
+
+
+@dataclass
+class _ButtonState:
+    text: str
+    fill: str
+    fg: str
+    border: str
+    shadow: str = ""
+    radius: int = 8
+    w: int = 0
+    h: int = 0
+    icon: bool = False
+
+
+class _SwitchState:
+    def __init__(self, text: str, secondary: bool) -> None:
+        self.text = text
+        self.secondary = secondary
+        self.progress = 1.0   # от выключенного к включённому: 0..1
+        self.hover = False
 
 
 def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
@@ -64,129 +201,11 @@ def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
     return True
 
 
-def _round_rect(
-    canvas: tk.Canvas,
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    radius: int,
-    **kwargs,
-) -> int:
-    r = min(radius, int((x2 - x1) / 2), int((y2 - y1) / 2))
-    points = [
-        x1 + r,
-        y1,
-        x2 - r,
-        y1,
-        x2,
-        y1,
-        x2,
-        y1 + r,
-        x2,
-        y2 - r,
-        x2,
-        y2,
-        x2 - r,
-        y2,
-        x1 + r,
-        y2,
-        x1,
-        y2,
-        x1,
-        y2 - r,
-        x1,
-        y1 + r,
-        x1,
-        y1,
-    ]
-    return canvas.create_polygon(points, smooth=True, **kwargs)
-
-
-class _RoundButton(tk.Frame):
-    def __init__(
-        self,
-        parent: tk.Misc,
-        text: str,
-        command: Callable[[], None],
-        *,
-        width: int | None = None,
-        height: int = _TOP_ROW_H,
-        bg: str,
-        active_bg: str,
-        fg: str = "#ffffff",
-        font: tuple[str, int, str] | tuple[str, int] = ("Segoe UI", 10, "bold"),
-        radius: int = _RADIUS,
-        expand: bool = False,
-    ) -> None:
-        super().__init__(parent, bg=_BG)
-        self._text = text
-        self._command = command
-        self._bg = bg
-        self._active_bg = active_bg
-        self._fg = fg
-        self._font = font
-        self._radius = radius
-        self._pressed = False
-        self._expand = expand
-
-        self._canvas = tk.Canvas(
-            self,
-            height=height,
-            highlightthickness=0,
-            bd=0,
-            bg=_BG,
-            cursor="hand2",
-        )
-        if width is not None:
-            self._canvas.configure(width=width)
-        self._canvas.pack(fill="both", expand=True)
-        self._canvas.bind("<Button-1>", self._on_click)
-        self._canvas.bind("<Configure>", self._on_resize)
-        if expand:
-            self.bind("<Configure>", self._on_resize)
-
-    def _on_resize(self, _event: tk.Event | None = None) -> None:
-        self._draw()
-
-    def _draw(self) -> None:
-        self._canvas.delete("all")
-        w = max(4, self._canvas.winfo_width())
-        h = max(4, self._canvas.winfo_height())
-        fill = self._active_bg if self._pressed else self._bg
-        _round_rect(self._canvas, 1, 1, w - 1, h - 1, self._radius, fill=fill, outline="")
-        self._canvas.create_text(
-            w // 2,
-            h // 2,
-            text=self._text,
-            fill=self._fg,
-            font=self._font,
-        )
-
-    def configure_button(
-        self,
-        *,
-        text: str | None = None,
-        bg: str | None = None,
-        active_bg: str | None = None,
-    ) -> None:
-        if text is not None:
-            self._text = text
-        if bg is not None:
-            self._bg = bg
-        if active_bg is not None:
-            self._active_bg = active_bg
-        self._draw()
-
-    def _on_click(self, _event: tk.Event) -> None:
-        self._pressed = True
-        self._draw()
-        self._command()
-        self.after(120, self._release_visual)
-
-    def _release_visual(self) -> None:
-        self._pressed = False
-        self._draw()
+def _rounded(d: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
+             radius: float, fill: Any = None, outline: Any = None,
+             width: int = 1) -> None:
+    """Прямоугольник со скруглением. Координаты — в точках рисунка."""
+    d.rounded_rectangle(box, radius=max(0, radius), fill=fill, outline=outline, width=width)
 
 
 class StatusPanel:
@@ -197,6 +216,10 @@ class StatusPanel:
         on_toggle_ai: Callable[[bool], None] | None = None,
         ai_enabled: bool = False,
         ai_ready: bool = True,
+        *,
+        style: str | None = None,
+        theme: str | None = None,
+        scale: float = 0.0,
     ) -> None:
         self._on_abort = on_abort
         self._on_stop_recording = on_stop_recording
@@ -207,408 +230,731 @@ class StatusPanel:
         self._root: tk.Tk | None = None
         self._window: tk.Toplevel | None = None
         self._canvas: tk.Canvas | None = None
-        self._content: tk.Frame | None = None
-        self._status_label: tk.Label | None = None
-        self._detail_label: tk.Label | None = None
-        self._progress: ttk.Progressbar | None = None
-        self._record_dot: tk.Label | None = None
-        self._top_row: tk.Frame | None = None
-        self._bottom_col: tk.Frame | None = None
-        self._auto_enter_btn: _RoundButton | None = None
-        self._stop_btn: _RoundButton | None = None
-        self._abort_btn: _RoundButton | None = None
-        self._ai_btn: _RoundButton | None = None
-        # `_ai_ready` — настроена ли обработка. Включённая кнопка при пустом
-        # ключе выглядит как рабочая, а текст вставляется необработанным:
+        self._image_item: int | None = None
+        self._photo: ImageTk.PhotoImage | None = None
+        self._image: Image.Image | None = None
+
+        # Границы нажатий в точках экрана: по ним определяем, куда пришёл клик.
+        self._hit_stop: tuple[int, int, int, int] | None = None
+        self._hit_abort: tuple[int, int, int, int] | None = None
+        self._hit_auto: tuple[int, int, int, int] | None = None
+        self._hit_ai: tuple[int, int, int, int] | None = None
+
+        self._stop_btn = _ButtonState("Готово", "", "", "")
+        self._abort_btn = _ButtonState("", "", "", "", icon=True)
+        self._auto_enter_btn = _SwitchState("Автоотправка", False)
+        self._ai_btn = _SwitchState("Обработка ИИ", True)
+
+        # `_ai_ready` — настроена ли обработка. Включённый ползунок при пустом
+        # ключе выглядит как рабочий, а текст вставляется необработанным:
         # человек видит это и решает, что сломано приложение. Надпись на
-        # кнопке должна говорить, что ещё не готово.
+        # ползунке должна говорить, что ещё не готово.
         self._ai_ready = ai_ready
         self._ai_last_error: str | None = None
+        self._ai_btn.text = "ИИ не настроен" if not ai_ready else ("ИИ выкл" if not ai_enabled else "Обработка ИИ")
+
+        # Вид и тема. Значения приходят из настроек; здесь только проверка
+        # на случай, если настройки позвали напрямую.
+        self._theme_choice = panel_style.normalize_theme(theme)
+        self._style = panel_style.normalize_style(style)
+        self._manual_scale = float(scale or 0.0)
+        self._system_theme = panel_style.system_theme()
+        self._alive = True
+        self._ss = _SUPERSAMPLE
+        self._fonts = _fonts(1.0)
+        self._palette: dict[str, Any] = {}
+        self._icon = _icon_char()
+        self._recompute_palette()
+
+        self._state: ActivityState = "idle"
+        self._detail = ""
+        self._progress = 0.0
+        self._hover_auto = False
+        self._hover_ai = False
+        self._hover_stop = False
+        self._hover_abort = False
+        self._pressed_stop_until = 0.0
+        self._pressed_abort_until = 0.0
+        self._pulse_started = 0.0
+        self._render_job: str | None = None
+        self._pulse_job: str | None = None
+        self._tween_job: str | None = None
+        self._bitmap_anim_job: str | None = None
+        self._bitmap_anim_until = 0.0
+
         self._drag_active = False
         self._drag_press: tuple[int, int] | None = None
         self._drag_offset = (0, 0)
         self._drag_moved = False
-        self._drag_flash_job: str | None = None
-        self._resizing = False
+        self._flash_until = 0.0
+
         self._skip_auto_enter = threading.Event()
-        # Одно состояние на кнопку и на решение в main.py. Отдельного «пропуска
-        # на сессию» нет: кнопка и настройка трея пишут одно и то же значение,
-        # и разойтись им негде.
+        # `_alive` гаснет при остановке: после выхода из цикла окна очередь
+        # Tk закрыта, а любой запрос в неё пишет ошибку в журнал.
+        self._alive = True
+        # `_skip_ai` — это «выключено на эту сессию». Он заведён отдельно от
+        # настройки, чтобы ползунок не писал в config.json; в исходном
+        # состоянии он повторяет настройку.
+        self._skip_ai = threading.Event()
+        if not ai_enabled:
+            self._skip_ai.set()
         self._ai_enabled = ai_enabled
         self._ai_default_enabled = ai_enabled
+
         self._ready = threading.Event()
-        self._pulse_job: str | None = None
-        self._pulse_on = True
+        self._size: tuple[int, int] = (_PANEL_W, 0)
         threading.Thread(target=self._run, daemon=True, name="status-panel").start()
         self._ready.wait(timeout=5.0)
+
+    # --- масштаб и палитра --------------------------------------------------
+
+    def _spec(self, value: float) -> int:
+        return max(1, round(value * self._scale))
+
+    @property
+    def _scale(self) -> float:
+        """Во сколько раз панель крупнее макета, точка в точку.
+
+        Ноль означает «как в макете»: 396 точек шириной, текст 9,5 пункта.
+        Tk при этом дюйм считает равным 72 точкам, а Windows — 96, поэтому за
+        основу берётся не `tk_scaling`, а частота точек экрана из
+        `winfo_fpixels`: она уже учитывает системное увеличение, и на 125%
+        панель выйдет крупнее, на 100% — ровно как в макете.
+
+        Масштаб из настроек (`panel_scale`) главнее: 0 — как считает система,
+        иначе ровно заданное число. Текст живёт в тех же единицах, что и
+        клетка рисунка, поэтому при любом масштабе он выглядит одинаково
+        чётко — просто крупнее или мельче.
+        """
+        manual = float(getattr(self, "_manual_scale", 0.0) or 0.0)
+        if manual > 0:
+            return max(0.6, min(3.0, manual))
+        root = self._root
+        if root is None:
+            return 1.0
+        try:
+            ppi = float(root.winfo_fpixels("1i"))
+        except (tk.TclError, ValueError):
+            return 1.0
+        # winfo_fpixels при системном масштабе 125% даёт 120, при 150% — 144.
+        return max(1.0, min(3.0, round(ppi / 96.0, 2)))
+
+    @property
+    def palette(self) -> dict[str, Any]:
+        return self._palette
+
+    @property
+    def style(self) -> str:
+        return self._style
+
+    @property
+    def theme_choice(self) -> str:
+        return self._theme_choice
+
+    def _icon_font_available(self) -> bool:
+        return self._icon == _ICON_ABORT
+
+    def _recompute_palette(self) -> None:
+        resolved = panel_style.resolve_theme(self._theme_choice, self._system_theme)
+        colors = panel_style.palette(self._style, resolved)  # type: ignore[arg-type]
+        r, g, b = _hex_to_rgb(str(colors["bg"]))
+        colors["__luma"] = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+        self._palette = colors
+
+    def _light(self) -> bool:
+        return float(self._palette.get("__luma", 0)) > 0.5
+
+    # --- цвета состояний ----------------------------------------------------
+
+    def _stop_colors(self, active: bool) -> tuple[str, str, str, str]:
+        pal = self._palette
+        return (
+            mix(str(pal["done_bg"]), "#ffffff", 0.10) if active else str(pal["done_bg"]),
+            str(pal["done_fg"]),
+            str(pal["done_border"]),
+            str(pal.get("done_shadow", "")) if self._light() else "",
+        )
+
+    def _abort_colors(self, active: bool) -> tuple[str, str, str]:
+        pal = self._palette
+        if active:
+            return str(pal["icon_hover_bg"]), str(pal["icon_hover_fg"]), str(pal["icon_hover_bg"])
+        return str(pal["icon_bg"]), str(pal["icon_fg"]), str(pal["icon_border"])
+
+    def _switch_colors(self, secondary: bool, t: float, hover: bool) -> dict[str, str]:
+        pal = self._palette
+        if secondary and "sw2_on_track" in pal:
+            bg_off, bg_on = pal["sw_off_bg"], pal["sw2_on_bg"]
+            border_off, border_on = pal["sw_off_border"], pal["sw2_on_border"]
+            fg_off, fg_on = pal["sw_off_fg"], pal["sw2_on_fg"]
+            track_off, track_a = pal["sw_off_track"], pal["sw2_on_track"]
+            track_b = pal.get("sw2_on_track_end", track_a)
+            knob_off, knob_on = pal["sw_off_knob"], pal["sw2_on_knob"]
+        else:
+            bg_off, bg_on = pal["sw_off_bg"], pal["sw_on_bg"]
+            border_off, border_on = pal["sw_off_border"], pal["sw_on_border"]
+            fg_off, fg_on = pal["sw_off_fg"], pal["sw_on_fg"]
+            track_off, track_a = pal["sw_off_track"], pal["sw_on_track"]
+            track_b = pal.get("sw_on_track_end", track_a)
+            knob_off, knob_on = pal["sw_off_knob"], pal["sw_on_knob"]
+        if hover:
+            border_on = mix(str(border_on), str(fg_on), 0.35)
+        return {
+            "bg": mix(str(bg_off), str(bg_on), t),
+            "border": mix(str(border_off), str(border_on), t),
+            "fg": mix(str(fg_off), str(fg_on), t),
+            "track": mix(str(track_off), mix(str(track_a), str(track_b), t), t),
+            "knob": mix(str(knob_off), str(knob_on), t),
+        }
+
+    # --- построение окна ----------------------------------------------------
 
     def _run(self) -> None:
         root = tk.Tk()
         root.withdraw()
         self._root = root
+        scale = self._scale
+        self._fonts = _fonts(scale)
+        self._recompute_palette()
 
         window = tk.Toplevel(root)
         window.withdraw()
         window.overrideredirect(True)
         window.attributes("-topmost", True)
-        window.configure(bg=_BG)
-        window.bind("<Button-1>", self._on_drag_press, add="+")
+        window.configure(bg=self._palette["bg"])
+        window.bind("<Button-1>", self._on_mouse_down, add="+")
         window.bind("<B1-Motion>", self._on_drag_move, add="+")
-        window.bind("<ButtonRelease-1>", self._on_drag_release, add="+")
+        window.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
+        window.bind("<Motion>", self._on_motion, add="+")
+        window.bind("<Leave>", lambda _e: self._set_hover(None), add="+")
         self._window = window
 
-        canvas = tk.Canvas(window, highlightthickness=0, bd=0, bg=_BG)
+        canvas = tk.Canvas(window, highlightthickness=0, bd=0, bg=self._palette["bg"])
         canvas.pack()
         self._canvas = canvas
 
-        content = tk.Frame(canvas, bg=_BG)
-        self._content = content
-        content_window = canvas.create_window(
-            0,
-            0,
-            window=content,
-            anchor="nw",
-            width=_PANEL_W,
-        )
+        self._size = (self._spec(_PANEL_W), self._spec(170))
+        canvas.configure(width=self._size[0], height=self._size[1])
 
-        def _resize_canvas(_event: tk.Event | None = None) -> None:
-            if self._canvas is None or self._content is None:
-                return
-            if self._resizing:
-                # <Configure> приходит и от наших же правок геометрии:
-                # без защиты вызов уходит в рекурсию и цикл окна встаёт.
-                return
-            self._resizing = True
-            try:
-                self._content.update_idletasks()
-                w = _PANEL_W + _PANEL_PAD_X * 2
-                h = self._content.winfo_reqheight() + _PANEL_PAD_Y * 2
-                self._canvas.configure(width=w, height=h)
-                self._canvas.delete("panel_bg")
-                _round_rect(
-                    self._canvas,
-                    0,
-                    0,
-                    w,
-                    h,
-                    _RADIUS,
-                    fill=_BG,
-                    outline="#3a3a3a",
-                    tags="panel_bg",
-                )
-                self._canvas.coords(content_window, _PANEL_PAD_X, _PANEL_PAD_Y)
-                self._canvas.itemconfigure(content_window, width=_PANEL_W)
-            finally:
-                self._resizing = False
-
-        frame = tk.Frame(content, bg=_BG)
-        frame.pack(fill="x")
-        frame.bind("<Configure>", _resize_canvas)
-        frame.columnconfigure(0, weight=1)
-
-        top_row = tk.Frame(frame, bg=_BG, height=_TOP_ROW_H)
-        top_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        top_row.grid_propagate(False)
-        top_row.columnconfigure(0, weight=1)
-        top_row.columnconfigure(1, weight=0)
-        top_row.columnconfigure(2, weight=0)
-        self._top_row = top_row
-
-        self._auto_enter_btn = _RoundButton(
-            top_row,
-            text="Автоотправка вкл",
-            command=self._on_toggle_auto_enter,
-            height=_TOP_ROW_H,
-            bg=_BTN_ON_BG,
-            active_bg=_BTN_ON_ACTIVE_BG,
-            font=("Segoe UI", 9, "bold"),
-            expand=True,
-        )
-        self._auto_enter_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-
-        self._stop_btn = _RoundButton(
-            top_row,
-            text="Готово",
-            command=self._on_stop_click,
-            width=_STOP_W,
-            height=_TOP_ROW_H,
-            bg=_STOP_BG,
-            active_bg=_STOP_ACTIVE_BG,
-            font=("Segoe UI", 9, "bold"),
-            radius=8,
-        )
-
-        self._abort_btn = _RoundButton(
-            top_row,
-            text="✕",
-            command=self._on_abort_click,
-            width=_ABORT_SIZE,
-            height=_TOP_ROW_H,
-            bg=_ABORT_BG,
-            active_bg=_ABORT_ACTIVE_BG,
-            font=("Segoe UI", 13, "bold"),
-            radius=8,
-        )
-        self._abort_btn.grid(row=0, column=2, sticky="ns")
-
-        # Вторая строка кнопок: обработка через ИИ. «Автоотправка» управляет
-        # клавишей Enter, «Обработка ИИ» — тем, идёт ли текст перед вставкой
-        # через модель. Это разные решения, и смешивать их в одной кнопке
-        # нельзя: отключив Enter, человек не должен терять обработку.
-        # Промпт на панели не нужен: он правится из меню трея, и писать
-        # инструкцию на ходу диктовки никто не станет.
-        ai_row = tk.Frame(frame, bg=_BG, height=_TOP_ROW_H)
-        ai_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        ai_row.grid_propagate(False)
-        ai_row.columnconfigure(0, weight=1)
-
-        self._ai_btn = _RoundButton(
-            ai_row,
-            text="Обработка ИИ вкл",
-            command=self._on_toggle_ai,
-            height=_TOP_ROW_H,
-            bg=_AI_BG,
-            active_bg=_AI_ACTIVE_BG,
-            font=("Segoe UI", 9, "bold"),
-            expand=True,
-        )
-        self._ai_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-
-        bottom_col = tk.Frame(frame, bg=_BG)
-        bottom_col.grid(row=2, column=0, sticky="ew")
-        bottom_col.columnconfigure(0, weight=1)
-        self._bottom_col = bottom_col
-
-        header = tk.Frame(bottom_col, bg=_BG)
-        header.grid(row=0, column=0, sticky="ew")
-        header.columnconfigure(1, weight=1)
-
-        self._record_dot = tk.Label(
-            header,
-            text="●",
-            font=("Segoe UI", 11),
-            fg=_ACCENT_RECORD,
-            bg=_BG,
-        )
-
-        self._status_label = tk.Label(
-            header,
-            text="",
-            font=("Segoe UI", 10, "bold"),
-            fg=_FG,
-            bg=_BG,
-            anchor="w",
-        )
-        self._status_label.grid(row=0, column=1, sticky="w")
-
-        style = ttk.Style(window)
-        style.theme_use("clam")
-        style.configure(
-            "Dictation.Horizontal.TProgressbar",
-            troughcolor="#3a3a3a",
-            background=_ACCENT_TRANSCRIBE,
-            bordercolor=_BG,
-            lightcolor=_ACCENT_TRANSCRIBE,
-            darkcolor=_ACCENT_TRANSCRIBE,
-            thickness=6,
-        )
-
-        self._progress = ttk.Progressbar(
-            bottom_col,
-            style="Dictation.Horizontal.TProgressbar",
-            mode="determinate",
-            maximum=100,
-        )
-
-        self._detail_label = tk.Label(
-            bottom_col,
-            text="",
-            font=("Segoe UI", 9),
-            fg="#b0b0b0",
-            bg=_BG,
-            anchor="w",
-        )
-
-        # Виджеты готовы — рисуем настоящую надпись кнопки. Раньше здесь
-        # ничего не было: кнопка держала образец «вкл», пока её не тронут.
-        self._render_ai()
-
+        self._render()
         self._ready.set()
-        _resize_canvas()
+        root.after(1500, self._watch_system_theme)
         root.mainloop()
 
-    def _apply_auto_enter_on(self) -> None:
-        if self._auto_enter_btn is not None:
-            self._auto_enter_btn.configure_button(
-                text="Автоотправка вкл",
-                bg=_BTN_ON_BG,
-                active_bg=_BTN_ON_ACTIVE_BG,
-            )
+    def _apply_window_region(self) -> None:
+        """Скрыть углы окна за пределами скругления.
 
-    def _apply_auto_enter_off(self) -> None:
-        if self._auto_enter_btn is not None:
-            self._auto_enter_btn.configure_button(
-                text="Без автоотправки",
-                bg=_BTN_OFF_BG,
-                active_bg=_BTN_OFF_ACTIVE_BG,
-            )
-
-    def _on_toggle_auto_enter(self) -> None:
-        if self._skip_auto_enter.is_set():
-            self._skip_auto_enter.clear()
-            self._apply_auto_enter_on()
-        else:
-            self._skip_auto_enter.set()
-            self._apply_auto_enter_off()
-
-    def _on_stop_click(self) -> None:
-        if self._on_stop_recording is not None:
-            self._on_stop_recording()
-
-    # --- обработка через ИИ ------------------------------------------------
-
-    def _ai_text(self) -> str:
-        """Надпись на кнопке: сначала состояние, потом настроенность.
-
-        Отдельной строчки под кнопку нет намеренно: панель висит у края экрана
-        и растёт от любой новой строки. Надпись на самой кнопке говорит всё,
-        а причина читается в подсказке — короткой строке статуса.
+        Рисунок у панели скруглён, но окно под ним прямоугольное, и углы
+        оставались бы квадратными: фон панели заливал бы скруглённые дырки.
+        Обрезка окна по скруглённому прямоугольнику убирает этот квадрат.
         """
-        if not self._ai_ready:
-            return "ИИ не настроен: нет ключа"
-        state = "вкл" if self.ai_state() else "выкл"
-        if self._ai_last_error:
-            return f"ИИ {state} · ошибка"
-        return f"Обработка ИИ {state}"
-
-    def _ai_hint(self) -> str:
-        if not self._ai_ready:
-            return "нет ключа: заведите в кабинете федота.рф и вставьте в config.local.json"
-        if self._ai_last_error:
-            return f"последний запрос не прошёл: {self._ai_last_error}"
-        return ""
-
-    def _render_ai(self) -> None:
-        button = self._ai_btn
-        if button is None:
-            return
-        if not self._ai_ready:
-            button.configure_button(
-                text=self._ai_text(), bg=_AI_BAD_BG, active_bg=_AI_BAD_ACTIVE_BG
-            )
-            return
-        if self.ai_state():
-            button.configure_button(
-                text=self._ai_text(), bg=_AI_BG, active_bg=_AI_ACTIVE_BG
-            )
-        else:
-            button.configure_button(
-                text=self._ai_text(),
-                bg=_BTN_OFF_BG,
-                active_bg=_BTN_OFF_ACTIVE_BG,
-            )
-
-    def _on_toggle_ai(self) -> None:
-        """Кнопка переключает обработку и запоминает решение.
-
-        Нажатие уходит наружу (`_notify_toggle_ai`), а там оно пишется в
-        `config.json`. Так состояние кнопки переживает перезапуск, и в меню
-        трея ничего переключать не нужно.
-
-        Состояние берётся из `ai_state()`, а не из второго флага: флагов два, и
-        расхождение между ними и превращало каждое второе нажатие в холостое.
-        """
-        enabled = not self.ai_state()
-        self._ai_enabled = enabled
-        self._ai_default_enabled = enabled
-        self._render_ai()
-        if self._notify_toggle_ai is not None:
-            self._notify_toggle_ai(enabled)
-
-    def _apply_reset_session_ai(self) -> None:
-        self._ai_enabled = self._ai_default_enabled
-        self._render_ai()
-
-    def ai_state(self) -> bool:
-        """Включена ли обработка сейчас. Это и есть состояние кнопки."""
-        return self._ai_enabled
-
-    def ai_enabled(self) -> bool:
-        return self.ai_state()
-
-    def set_ai_default(self, enabled: bool) -> None:
-        """Применить решение, сохранённое в настройках, и показать его на кнопке."""
-        self._ai_default_enabled = enabled
-        self._ai_enabled = enabled
-        if self._root is None:
-            return
-        self._root.after(0, self._apply_reset_session_ai)
-
-    def set_ai_ready(self, ready: bool) -> None:
-        """Сказать панели, настроена ли обработка. Без ключа кнопка об этом пишет."""
-        self._ai_ready = ready
-        if self._root is None:
-            return
-        self._root.after(0, self._render_ai)
-
-    def ai_ready(self) -> bool:
-        return self._ai_ready
-
-    def ai_hint(self) -> str:
-        return self._ai_hint()
-
-    def set_ai_error(self, reason: str | None) -> None:
-        """Показать на кнопке, что последний запрос к модели не прошёл."""
-        self._ai_last_error = reason
-        if self._root is None:
-            return
-        self._root.after(0, self._render_ai)
-
-    def _on_abort_click(self) -> None:
-        self._skip_auto_enter.set()
-        self._apply_auto_enter_off()
-        if self._on_abort is not None:
-            self._on_abort()
-        # Панель закроется после фактической остановки транскрибации в main.py
-
-    def _apply_reset_session(self) -> None:
-        self._skip_auto_enter.clear()
-        self._apply_auto_enter_on()
-        self._apply_reset_session_ai()
-
-    def reset_session(self) -> None:
-        if self._root is None:
-            return
-        self._root.after(0, self._apply_reset_session)
-
-    def skip_auto_enter(self) -> bool:
-        return self._skip_auto_enter.is_set()
-
-    def _cancel_pulse(self) -> None:
-        if self._root is None or self._pulse_job is None:
-            self._pulse_job = None
+        if self._window is None or sys.platform != "win32":
             return
         try:
-            self._root.after_cancel(self._pulse_job)
-        except Exception:
-            pass
-        self._pulse_job = None
+            import ctypes  # noqa: PLC0415
+            from ctypes import wintypes  # noqa: PLC0415
 
-    def _schedule_pulse(self) -> None:
-        self._cancel_pulse()
-        if self._root is None or self._record_dot is None:
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            user32.GetDC.restype = wintypes.HDC
+            gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
+            gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+            user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
+            hwnd = int(self._window.winfo_id())
+            w, h = self._size
+            radius = self._spec(_RADIUS) * 2
+            if self._style == "black":
+                radius = round(radius * 1.2)
+            hdc = user32.GetDC(hwnd)
+            region = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius)
+            user32.SetWindowRgn(hwnd, region, True)
+            user32.ReleaseDC(hwnd, hdc)
+        except Exception:
+            # Не удалось — панель просто останется с квадратными углами.
+            pass
+
+    # --- рисование ----------------------------------------------------------
+
+    def _layout(self) -> dict[str, int]:
+        """Высоты строк панели в точках экрана. От режима зависит только низ."""
+        pad_x = self._spec(_PANEL_PAD_X)
+        pad_y = self._spec(_PANEL_PAD_Y)
+        content_w = self._spec(_CONTENT_W)
+        status_h = max(self._spec(_STATUS_ROW_H), self._spec(_DONE_H) + self._spec(2))
+        y = pad_y + status_h
+        out = {
+            "pad_x": pad_x,
+            "pad_y": pad_y,
+            "content_w": content_w,
+            "status_h": status_h,
+            "status_top": pad_y,
+            "body_top": y,
+        }
+        if self._state == "recording":
+            divider_y = y + self._spec(_DIVIDER_GAP_TOP + _DIVIDER_GAP_BOTTOM)
+            out["divider_y"] = divider_y
+            out["switch_top"] = divider_y + self._spec(_DIVIDER_GAP_BOTTOM)
+            out["switch_h"] = self._spec(_SWITCH_H)
+            out["bottom"] = out["switch_top"] + out["switch_h"] + pad_y
+        else:
+            progress_top = y + self._spec(8)
+            out["progress_top"] = progress_top
+            out["progress_h"] = self._spec(6)
+            detail_top = progress_top + out["progress_h"] + self._spec(6)
+            out["detail_top"] = detail_top
+            out["detail_h"] = self._spec(16) if self._detail else 0
+            out["bottom"] = detail_top + out["detail_h"] + pad_y
+        return out
+
+    def _render(self) -> None:
+        """Собрать рисунок панели и показать уменьшенным.
+
+        Ошибку Tk здесь гасим не по лени: панель живёт в своём потоке, и
+        исключение из него пишется в журнал как поломка всего приложения.
+        Окно при этом просто остаётся прежним.
+        """
+        if self._root is None or self._canvas is None:
+            return
+        try:
+            self._render_inner()
+        except (tk.TclError, RuntimeError):
             return
 
-        def _tick() -> None:
-            if self._record_dot is None or self._root is None:
-                return
-            self._pulse_on = not self._pulse_on
-            self._record_dot.configure(
-                fg=_ACCENT_RECORD if self._pulse_on else _BG,
-            )
-            self._pulse_job = self._root.after(500, _tick)
+    def _render_inner(self) -> None:
+        pal = self._palette
+        fonts = self._fonts
+        lay = self._layout()
+        w = self._spec(_PANEL_W)
+        h = lay["bottom"]
+        self._size = (w, h)
 
-        _tick()
+        # Сглаживание рисунка. При смене вида и темы окно не перерисовывается
+        # каждый кадр, а мигание точки — кадр за кадром, поэтому крупный
+        # рисунок берём для неподвижных кадров и полегче — для анимации.
+        ss = _SUPERSAMPLE
+        if self._state != "recording" or not self._pulse_job:
+            ss = min(_SUPERSAMPLE_MAX, ss + 1)
+        self._ss = ss
+        self._fonts = _fonts(self._scale, ss)
+
+        img = Image.new("RGB", (w * ss, h * ss), str(pal["bg"]))
+        d = ImageDraw.Draw(img)
+        radius = self._spec(_RADIUS)
+        if self._style == "black":
+            radius = round(radius * 1.2)
+        r2 = radius * ss
+        w2 = w * ss
+        h2 = h * ss
+        bg = str(pal["bg"])
+        border = str(pal["border"])
+
+        # Корпус: фон и рамка. Скругление рисуется сразу в крупном размере —
+        # это и есть то сглаживание, которого не даёт Tk.
+        d.rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=r2, fill=bg)
+        d.rounded_rectangle(
+            (0, 0, w2 - 1, h2 - 1), radius=r2, outline=border, width=ss
+        )
+        # Свет сверху: мягкая полоса от верха корпуса.
+        d.rounded_rectangle(
+            (2 * ss, 1 * ss, w2 - 2 * ss, int(h2 / 2.2)),
+            radius=max(2, r2 - 2 * ss),
+            fill=mix(bg, str(pal.get("top_glow", bg)), 0.75),
+        )
+        if self._style == "smoke":
+            # Кромка идёт по высоте корпуса. Верх и низ скругляются по тому
+            # же радиусу, что и корпус: иначе снаружи торчали бы прямые углы.
+            top = lay["pad_y"]
+            bottom = h - lay["pad_y"]
+            bar_w = max(2, self._spec(3))
+            mid = (top + bottom) // 2
+            self._accent_bar(d, (0, top, bar_w, mid), str(pal["accent_left"]),
+                             top_round=True, bottom_round=False)
+            self._accent_bar(d, (0, mid, bar_w, bottom), str(pal["accent_right"]),
+                             top_round=False, bottom_round=True)
+
+        # Хром между строками.
+        if self._state == "recording":
+            dy = lay["divider_y"]
+            d.line((lay["pad_x"] * ss, dy * ss, (w - lay["pad_x"]) * ss, dy * ss),
+                   fill=border, width=ss)
+
+        s = ss
+        px = lay["pad_x"]
+
+        # Строка состояния.
+        cx = px
+        cy = lay["status_top"] + lay["status_h"] // 2
+        if self._state == "recording":
+            # Точка с волнами и ореолом рисуется отдельным слоем с
+            # прозрачностью: иначе ореол закрасил бы фон квадратом.
+            slot = self._spec(_DOT_SLOT)
+            layer = self._dot_layer(px + slot // 2, cy)
+            if layer is not None:
+                img.paste(layer, (px, cy - slot // 2), layer)
+            cx = px + slot + self._spec(4)
+        title = {
+            "recording": "Запись — говорите",
+            "transcribing": "Распознаю…",
+            "processing": "Обрабатываю через ИИ…",
+        }.get(self._state, "")
+        self._text(d, cx * s, cy * s, title, fonts.title, str(pal["title"]), "lm")
+
+        # Кнопки справа: крестик у края, «Готово» у него.
+        ax = w - px - self._spec(_ABORT)
+        self._hit_abort = (ax, cy - self._spec(_ABORT) // 2, ax + self._spec(_ABORT), cy + self._spec(_ABORT) // 2)
+        active = self._hover_abort or time.monotonic() < self._pressed_abort_until
+        bg_a, fg_a, br_a = self._abort_colors(active)
+        self._button(d, (ax, cy - self._spec(_ABORT) // 2, ax + self._spec(_ABORT),
+                         cy + self._spec(_ABORT) // 2), bg_a, fg_a, br_a, self._spec(8))
+        self._text(d, (ax + self._spec(_ABORT) // 2) * s, cy * s, self._icon, fonts.icon, fg_a, "mm")
+
+        if self._state == "recording":
+            dx = ax - self._spec(_GAP) - self._spec(_DONE_W)
+            self._hit_stop = (dx, cy - self._spec(_DONE_H) // 2, dx + self._spec(_DONE_W),
+                              cy + self._spec(_DONE_H) // 2)
+            active = self._hover_stop or time.monotonic() < self._pressed_stop_until
+            fill, fg, br, shadow = self._stop_colors(active)
+            self._button(d, self._hit_stop, fill, fg, br, self._spec(8), shadow, glow=self._light())
+            self._text(d, (dx + self._spec(_DONE_W) // 2) * s, cy * s, "Готово",
+                       fonts.body, fg, "mm")
+        else:
+            self._hit_stop = None
+
+        if self._state == "recording":
+            # Ползунки: два в ряд, ровно половина ширины.
+            top = lay["switch_top"]
+            sh = lay["switch_h"]
+            half = (lay["content_w"] - self._spec(_GAP)) // 2
+            self._hit_auto = (px, top, px + half, top + sh)
+            self._hit_ai = (px + half + self._spec(_GAP), top, px + 2 * half + self._spec(_GAP), top + sh)
+            self._switch(d, self._hit_auto, self._auto_enter_btn, top, sh)
+            self._switch(d, self._hit_ai, self._ai_btn, top, sh)
+        else:
+            self._hit_auto = None
+            self._hit_ai = None
+            top = lay["progress_top"]
+            ph = lay["progress_h"]
+            _rounded(d, (px * s, top * s, (px + lay["content_w"]) * s, (top + ph) * s), ph * s / 2,
+                     fill=str(pal["track"]))
+            filled = max(0.0, min(1.0, self._progress)) * lay["content_w"]
+            if filled > 0:
+                filled = max(filled, ph)
+                _rounded(d, (px * s, top * s, (px + filled) * s, (top + ph) * s), ph * s / 2,
+                         fill=str(pal["track_fill"]))
+                # Лёгкое свечение по краю заливки: видно, что идёт работа.
+                glow = mix(bg, str(pal["track_fill"]), 0.35)
+                d.rounded_rectangle(
+                    ((px - 1) * s, (top - 1) * s, (px + filled + 1) * s, (top + ph + 1) * s),
+                    radius=(ph + 2) * s / 2, outline=glow, width=s,
+                )
+            if self._detail:
+                self._text(d, px * s, lay["detail_top"] * s, self._detail, fonts.small,
+                           mix(str(pal["title"]), bg, 0.35), "la")
+
+        small = img.resize((w, h), Image.LANCZOS)
+        self._image = small
+        # Готовую картинку отдаём хранителю: у Tk дешевле уменьшить свою
+        # картинку при показе, чем ехать через PIL для каждого кадра точки.
+        self._photo = ImageTk.PhotoImage(small)
+        canvas = self._canvas
+        canvas.configure(bg=bg)
+        if self._image_item is None:
+            self._image_item = canvas.create_image(0, 0, image=self._photo, anchor="nw")
+        else:
+            canvas.itemconfigure(self._image_item, image=self._photo)
+        canvas.configure(width=w, height=h)
+        canvas.tag_raise(self._image_item)
+        self._apply_window_region()
+        self._window_size_changed(apply_geometry=self._state == "idle")
+
+    def _window_size_changed(self, *, apply_geometry: bool) -> None:
+        if self._window is None:
+            return
+        self._window.update_idletasks()
+        if self._state != "idle" and apply_geometry:
+            self._reposition()
+
+    def _accent_bar(
+        self,
+        d: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+        color: str,
+        *,
+        top_round: bool,
+        bottom_round: bool,
+    ) -> None:
+        """Цветная кромка у левого края «дымчатого» вида.
+
+        Прямоугольник по краю панели накрывал бы её собственное скругление
+        прямоугольным углом. Поэтому наружные углы кромки повторяют радиус
+        корпуса, а внутренние остаются прямыми.
+        """
+        s = self._ss
+        x1, y1, x2, y2 = box
+        x1, y1, x2, y2 = x1 * s, y1 * s, x2 * s, y2 * s
+        outer = 20 * s
+        shape = Image.new("RGBA", (int(x2 - x1) + outer * 2, int(y2 - y1) + outer * 2), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(shape)
+        sd.rounded_rectangle(
+            (outer, outer, outer + (x2 - x1), outer + (y2 - y1)),
+            radius=outer,
+            fill=color,
+        )
+        # Запятки: скругление остаётся на наружных углах, внутренние обрезаем.
+        sd.rectangle((outer * 2, outer, outer * 2 + (x2 - x1), outer + (y2 - y1)), fill=(0, 0, 0, 0))
+        sd.rectangle((0, 0, outer * 2, outer * 2), fill=(0, 0, 0, 0))
+        sd.rectangle((0, outer + (y2 - y1), outer * 2, outer * 2 + (y2 - y1)), fill=(0, 0, 0, 0))
+        if not top_round:
+            sd.rectangle((outer, 0, outer * 2, outer * 2), fill=color)
+        if not bottom_round:
+            sd.rectangle((outer, outer + (y2 - y1), outer * 2, outer * 2 + (y2 - y1)), fill=color)
+        sprite = shape.crop((outer, outer, outer + int(x2 - x1), outer + int(y2 - y1)))
+        base = d._image if hasattr(d, "_image") else None
+        if base is not None:
+            base.paste(sprite, (int(x1), int(y1)), sprite)
+        else:  # запасной путь: без прозрачности углы будут прямоугольными
+            d.rounded_rectangle(box, radius=outer, fill=color)
+
+    def _button(
+        self,
+        d: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+        fill: str,
+        fg: str,
+        border: str,
+        radius: int,
+        shadow: str = "",
+        glow: bool = False,
+    ) -> None:
+        s = self._ss
+        x1, y1, x2, y2 = box
+        x1, y1, x2, y2 = x1 * s, y1 * s, x2 * s, y2 * s
+        _rounded(d, (x1, y1, x2, y2), radius * s, fill=fill, outline=border, width=s)
+        # Мягкий свет сверху: полоса в десять процентов светлее заливки.
+        _rounded(d, (x1 + 2 * s, y1 + s, x2 - 2 * s, y1 + (y2 - y1) // 2),
+                 max(2, radius - 2) * s, fill=mix(fill, "#ffffff", 0.10))
+
+    def _switch(
+        self,
+        d: ImageDraw.ImageDraw,
+        box: tuple[int, int, int, int],
+        state: _SwitchState,
+        top: int,
+        height: int,
+    ) -> None:
+        s = self._ss
+        x1, _, x2, _ = box
+        colors = self._switch_colors(state.secondary, state.progress, state.hover)
+        y1 = top * s
+        y2 = (top + height) * s
+        _rounded(d, (x1 * s, y1, x2 * s, y2), (height * s) // 2,
+                 fill=colors["bg"], outline=colors["border"], width=s)
+        track_w = self._spec(_TRACK_W)
+        track_h = self._spec(_TRACK_H)
+        pad = self._spec(_TRACK_PAD)
+        knob = self._spec(_KNOB)
+        left = x1 + self._spec(6)
+        ty1 = top + (height - track_h) // 2
+        ty2 = ty1 + track_h
+        if state.progress > 0.05:
+            g = max(1, self._spec(2))
+            _rounded(
+                d,
+                ((left - g) * s, (ty1 - g) * s, (left + track_w + g) * s, (ty2 + g) * s),
+                (track_h + 2 * g) * s // 2,
+                fill=mix(colors["bg"], colors["track"], 0.30 * state.progress),
+            )
+        _rounded(d, (left * s, ty1 * s, (left + track_w) * s, ty2 * s),
+                 track_h * s // 2, fill=colors["track"])
+        travel = track_w - knob - pad * 2
+        kx = left + pad + travel * state.progress
+        d.ellipse(
+            (kx * s, (ty1 + pad) * s, (kx + knob) * s, (ty2 - pad) * s),
+            fill=colors["knob"],
+        )
+        self._text(
+            d,
+            (left + track_w + self._spec(7)) * s,
+            (top + height / 2) * s,
+            state.text,
+            self._fonts.small,
+            colors["fg"],
+            "lm",
+            max_width=(x2 - (left + track_w + self._spec(7)) - self._spec(6)),
+        )
+
+    def _dot_layer(self, center_x: int, center_y: int, *, size: float | None = None) -> Image.Image:
+        """Слой с точкой записи: мигает и выпускает мягкие волны.
+
+        Точка живёт на отдельном слое с прозрачностью и накладывается на
+        картинку целиком: рисуй её прямо на фоне — ореол закрасил бы фон
+        квадратом. Рисунок уже крупный, поэтому кольца выходят гладкими.
+        Размер места под точку берётся общий для всех состояний.
+        """
+        pal = self._palette
+        s = self._ss
+        scale = self._spec(1) * self._ss  # доля точки в рисунке
+        slot = self._spec(_DOT_SLOT)
+        c = slot / 2 * s
+        cy = slot / 2 * s
+        elapsed = time.monotonic() - self._pulse_started
+        beat = (elapsed % _PULSE_BEAT_S) / _PULSE_BEAT_S
+        overlay = Image.new("RGBA", (slot * s, slot * s), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        wave_alpha = float(pal["dot_glow_alpha"])
+        for shift in (0.0, 0.5):
+            t = (beat + shift) % 1.0
+            radius = (3 + 9 * math.sqrt(t)) * scale
+            a = (1 - t) ** 2 * wave_alpha
+            if a <= 0.01:
+                continue
+            od.ellipse((c - radius, cy - radius, c + radius, cy + radius),
+                       outline=_rgba(str(pal["dot_wave"]), a), width=s)
+        if beat < _PULSE_PEAK_MS / 1000:
+            pulse = 1.0
+        else:
+            pulse = max(0.45, 1.0 - 0.55 * (beat - 0.11) / 0.89)
+        halo = 8.5 * scale
+        od.ellipse((c - halo, cy - halo, c + halo, cy + halo),
+                   fill=_rgba(str(pal["dot_glow"]), min(1.0, 0.55 * pulse * wave_alpha)))
+        core = 5 * scale
+        od.ellipse((c - core, cy - core, c + core, cy + core),
+                   fill=_rgba(mix(str(pal["dot"]), str(pal["bg"]), (1 - pulse) * 0.75), 1.0))
+        return overlay
+
+    def _text(
+        self,
+        d: ImageDraw.ImageDraw,
+        x: float,
+        y: float,
+        text: str,
+        font: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int],
+        color: str,
+        anchor: str = "la",
+        max_width: int | None = None,
+    ) -> None:
+        if not text:
+            return
+        face, _size = font
+        if max_width is not None:
+            text = self._fit(face, text, max_width * self._ss)
+        d.text((x, y), text, font=face, fill=color, anchor=anchor)
+
+    def _fit(
+        self,
+        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        text: str,
+        max_width: float,
+    ) -> str:
+        """Укоротить подпись, если она не влезает в ползунок."""
+        if _text_size(font, text)[0] <= max_width:
+            return text
+        ellipsis = "..."
+        while text and _text_size(font, text + ellipsis)[0] > max_width:
+            text = text[:-1]
+        return text + ellipsis if text else ""
+
+    # --- перерисовка с задержкой ------------------------------------------
+
+    def _request_render(self, delay: int = 0) -> None:
+        if self._render_job is not None or not self._alive:
+            return
+        self._render_job = delay
+        self._after(delay, self._flush_render)
+
+    def _flush_render(self) -> None:
+        self._render_job = None
+        self._render()
+
+    # --- состояние точки записи -------------------------------------------
+
+    def _start_pulse(self) -> None:
+        self._pulse_started = time.monotonic()
+        if self._pulse_job is None and self._alive:
+            self._pulse_job = 0
+            self._after(_PULSE_MS, self._tick_pulse)
+
+    def _tick_pulse(self) -> None:
+        if self._state != "recording" or not self._alive:
+            self._pulse_job = None
+            return
+        self._render()
+        self._after(_PULSE_MS, self._tick_pulse)
+
+    def _stop_pulse(self) -> None:
+        self._pulse_job = None
+
+    def _tween_switch(self, state: _SwitchState, target: float) -> None:
+        if not self._alive:
+            state.progress = target
+            return
+        start = state.progress
+
+        def _tick(i: int) -> None:
+            state.progress = start + (target - start) * (i / _COLOR_STEPS)
+            self._request_render()
+
+        for i in range(1, _COLOR_STEPS + 1):
+            self._after(_COLOR_MS * i, lambda k=i: _tick(k))
+
+    # --- мышь ---------------------------------------------------------------
+
+    def _hit(self, x: int, y: int) -> str | None:
+        for name, box in (
+            ("stop", self._hit_stop),
+            ("abort", self._hit_abort),
+            ("auto", self._hit_auto),
+            ("ai", self._hit_ai),
+        ):
+            if box is not None and box[0] <= x < box[2] and box[1] <= y < box[3]:
+                return name
+        return None
+
+    def _on_mouse_down(self, event: tk.Event) -> None:
+        widget = getattr(event, "widget", None)
+        if widget is not None and widget is not self._canvas:
+            return
+        x, y = int(event.x), int(event.y)
+        hit = self._hit(x, y)
+        if hit is None:
+            self._on_drag_press(event)
+            return
+        now = time.monotonic()
+        if hit == "stop":
+            self._pressed_stop_until = now + 0.14
+            self._request_render()
+            self._on_stop_click()
+        elif hit == "abort":
+            self._pressed_abort_until = now + 0.14
+            self._request_render()
+            self._on_abort_click()
+        elif hit == "auto":
+            self._on_toggle_auto_enter()
+        elif hit == "ai":
+            self._on_toggle_ai()
+
+    def _on_mouse_up(self, event: tk.Event) -> None:
+        self._on_drag_release(event)
+
+    def _on_motion(self, event: tk.Event) -> None:
+        if getattr(event, "widget", None) is not self._canvas:
+            return
+        self._set_hover(self._hit(int(event.x), int(event.y)))
+
+    def _set_hover(self, hit: str | None) -> None:
+        changed = False
+        for name, attr in (("stop", "_hover_stop"), ("abort", "_hover_abort"),
+                           ("auto", "_hover_auto"), ("ai", "_hover_ai")):
+            want = hit == name
+            if getattr(self, attr) != want:
+                setattr(self, attr, want)
+                changed = True
+        self._auto_enter_btn.hover = self._hover_auto
+        self._ai_btn.hover = self._hover_ai
+        if changed:
+            self._request_render(_RENDER_DELAY_MS)
+
+    # --- перетаскивание -----------------------------------------------------
 
     def _reposition(self) -> None:
         if self._root is None or self._window is None:
@@ -616,11 +962,10 @@ class StatusPanel:
         if self._drag_active:
             return
         self._window.update_idletasks()
-        width = self._window.winfo_width()
-        height = self._window.winfo_height()
-        x = self._root.winfo_screenwidth() - width - _MARGIN_X
-        y = self._root.winfo_screenheight() - height - _MARGIN_Y
-        self._window.geometry(f"+{x}+{y}")
+        width, height = self._size
+        x = self._root.winfo_screenwidth() - width - self._spec(_MARGIN_X)
+        y = self._root.winfo_screenheight() - height - self._spec(_MARGIN_Y)
+        self._window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _begin_local_grab(self) -> None:
         """Локальный захват: панель остаётся перетаскиваемой, другие окна не блокируются.
@@ -644,40 +989,9 @@ class StatusPanel:
         except tk.TclError:
             pass
 
-    def _cancel_drag_flash(self) -> None:
-        if self._root is None or self._drag_flash_job is None:
-            self._drag_flash_job = None
-            return
-        try:
-            self._root.after_cancel(self._drag_flash_job)
-        except Exception:
-            pass
-        self._drag_flash_job = None
-
-    def _restore_panel_outline(self) -> None:
-        self._drag_flash_job = None
-        if self._canvas is None:
-            return
-        try:
-            self._canvas.itemconfigure("panel_bg", outline="#3a3a3a")
-        except tk.TclError:
-            pass
-
-    def _flash_panel_outline(self) -> None:
-        """Короткая подсветка рамки — видно, что панель поймана."""
-        self._cancel_drag_flash()
-        if self._canvas is None or self._root is None:
-            return
-        try:
-            self._canvas.itemconfigure("panel_bg", outline=_ACCENT_TRANSCRIBE)
-        except tk.TclError:
-            return
-        self._drag_flash_job = self._root.after(350, self._restore_panel_outline)
-
     def _on_drag_press(self, event: tk.Event) -> None:
-        if self._window is None or not _is_panel_background(event.widget, self):
+        if self._window is None:
             return
-        self._cancel_drag_flash()
         self._window.update_idletasks()
         self._drag_active = True
         self._drag_moved = False
@@ -699,7 +1013,6 @@ class StatusPanel:
             if max(dx, dy) < _DRAG_THRESHOLD:
                 return
             self._drag_moved = True
-            self._flash_panel_outline()
         self._window.geometry(f"+{x_root + self._drag_offset[0]}+{y_root + self._drag_offset[1]}")
 
     def _on_drag_release(self, _event: tk.Event) -> None:
@@ -719,37 +1032,203 @@ class StatusPanel:
         self._window.update_idletasks()
         screen_w = self._root.winfo_screenwidth()
         screen_h = self._root.winfo_screenheight()
-        width = self._window.winfo_width()
-        height = self._window.winfo_height()
-        x = min(
-            max(self._window.winfo_x(), _DRAG_BORDER),
-            max(_DRAG_BORDER, screen_w - width - _DRAG_BORDER),
-        )
-        y = min(
-            max(self._window.winfo_y(), _DRAG_BORDER),
-            max(_DRAG_BORDER, screen_h - height - _DRAG_BORDER),
-        )
+        width, height = self._size
+        x = min(max(self._window.winfo_x(), _DRAG_BORDER),
+                max(_DRAG_BORDER, screen_w - width - _DRAG_BORDER))
+        y = min(max(self._window.winfo_y(), _DRAG_BORDER),
+                max(_DRAG_BORDER, screen_h - height - _DRAG_BORDER))
         self._window.geometry(f"+{x}+{y}")
 
-    def _refresh_canvas_bg(self) -> None:
-        if self._canvas is None or self._content is None:
+    # --- вид и тема ---------------------------------------------------------
+
+    def _after(self, delay: int, callback: Callable[[], None]) -> bool:
+        """Поставить действие в очередь потока Tk. False — окно уже закрыто.
+
+        После выхода из цикла окна `after` бросает RuntimeError и пишет его в
+        журнал. Это не поломка, поэтому проверяем заранее и молчим.
+        """
+        if self._root is None or not self._alive:
+            return False
+        try:
+            self._root.after(delay, callback)
+            return True
+        except (RuntimeError, tk.TclError):
+            return False
+
+    def set_style(self, style: str) -> None:
+        """Сменить вид панели. Можно звать из любого потока."""
+        target = panel_style.normalize_style(style)
+        self._after(0, lambda: self._style_changed(target))
+
+    def set_theme(self, theme: str) -> None:
+        """Сменить тему: auto (как в Windows), dark, light. Из любого потока."""
+        target = panel_style.normalize_theme(theme)
+        self._after(0, lambda: self._theme_changed(target))
+
+    def set_scale(self, scale: float) -> None:
+        """Задать размер панели вручную: 1 — ровно как в макете.
+
+        На экранах с высоким разрешением система считает панель крупнее, а
+        текст в ней мельчает вместе с клеткой. Кому нужен привычный размер
+        почерпнее, тот выставляет этот масштаб. 0 — «как считает система».
+        """
+        target = max(0.0, min(3.0, float(scale)))
+        self._after(0, lambda: self._scale_changed(target))
+
+    def _scale_changed(self, scale: float) -> None:
+        self._manual_scale = scale
+        try:  # шрифты пересобираются под новый размер сразу, а не при смене вида
+            self._fonts = _fonts(self._scale, _SUPERSAMPLE_MAX)
+        except Exception:
+            pass
+        self._request_render()
+
+    def _style_changed(self, style: str) -> None:
+        if style == self._style:
             return
-        self._content.update_idletasks()
-        w = _PANEL_W + _PANEL_PAD_X * 2
-        h = self._content.winfo_reqheight() + _PANEL_PAD_Y * 2
-        self._canvas.configure(width=w, height=h)
-        self._canvas.delete("panel_bg")
-        _round_rect(
-            self._canvas,
-            0,
-            0,
-            w,
-            h,
-            _RADIUS,
-            fill=_BG,
-            outline="#3a3a3a",
-            tags="panel_bg",
-        )
+        self._style = style
+        self._recompute_palette()
+        self._request_render()
+
+    def _theme_changed(self, theme: str) -> None:
+        self._theme_choice = theme
+        self._system_theme = panel_style.system_theme()
+        self._recompute_palette()
+        self._request_render()
+
+    def _watch_system_theme(self) -> None:
+        """Тема Windows может смениться в любой момент: «Как в Windows» идёт следом."""
+        if self._root is None or not self._alive:
+            return
+        current = panel_style.system_theme()
+        if current != self._system_theme:
+            self._system_theme = current
+            if self._theme_choice == "auto":
+                self._recompute_palette()
+                self._request_render()
+        self._after(1500, self._watch_system_theme)
+
+    # --- ползунки и кнопки --------------------------------------------------
+
+    def _on_toggle_auto_enter(self) -> None:
+        if self._skip_auto_enter.is_set():
+            self._skip_auto_enter.clear()
+        else:
+            self._skip_auto_enter.set()
+        self._tween_switch(self._auto_enter_btn, 0.0 if self._skip_auto_enter.is_set() else 1.0)
+
+    def _on_stop_click(self) -> None:
+        if self._on_stop_recording is not None:
+            self._on_stop_recording()
+
+    # --- обработка через ИИ ------------------------------------------------
+
+    def _ai_text(self) -> str:
+        """Надпись на ползунке: сначала состояние, потом настроенность.
+
+        Отдельной строчки нет намеренно: панель висит у края экрана и растёт
+        от любой новой строки. Надпись на ползунке говорит всё, а причина
+        читается в подсказке — короткой строке статуса.
+        """
+        if not self._ai_ready:
+            return "ИИ не настроен"
+        if self._ai_last_error:
+            return "ИИ · ошибка" if self.ai_state() else "ИИ выкл · ошибка"
+        # «вкл» не пишется: включённый ползунок это и так говорит, а место в
+        # строке кончается — длинная надпись обрезалась бы по живому.
+        return "ИИ выкл" if not self.ai_state() else "Обработка ИИ"
+
+    def _ai_hint(self) -> str:
+        if not self._ai_ready:
+            return "нет ключа: заведите в кабинете федота.рф и вставьте в config.local.json"
+        if self._ai_last_error:
+            return f"последний запрос не прошёл: {self._ai_last_error}"
+        return ""
+
+    def _render_ai(self) -> None:
+        self._ai_btn.text = self._ai_text()
+        self._ai_btn.progress = 1.0 if self.ai_state() else 0.0
+        self._request_render()
+
+    def _on_toggle_ai(self) -> None:
+        """Ползунок переключает обработку до конца сессии.
+
+        В `config.json` это не пишется: там лежит решение по умолчанию, а
+        ползунок нужен для разового «здесь и сейчас». Иначе случайное нажатие
+        меняло бы поведение диктовки навсегда.
+
+        Состояние берётся из `ai_state()`, а не из второго флага: флагов два, и
+        расхождение между ними и превращало каждое второе нажатие в холостое.
+        """
+        enabled = not self.ai_state()
+        self._ai_enabled = enabled
+        if enabled:
+            self._skip_ai.clear()
+        else:
+            self._skip_ai.set()
+        self._ai_btn.text = self._ai_text()
+        self._tween_switch(self._ai_btn, 1.0 if enabled else 0.0)
+        if self._notify_toggle_ai is not None:
+            self._notify_toggle_ai(enabled)
+
+    def _apply_reset_session_ai(self) -> None:
+        self._skip_ai.clear()
+        self._ai_enabled = self._ai_default_enabled
+        self._ai_btn.text = self._ai_text()
+        self._ai_btn.progress = 1.0 if self.ai_state() else 0.0
+        self._request_render()
+
+    def ai_state(self) -> bool:
+        """Включена ли обработка сейчас. Это и есть состояние ползунка."""
+        return self._ai_enabled and not self._skip_ai.is_set()
+
+    def ai_enabled(self) -> bool:
+        return self.ai_state()
+
+    def set_ai_default(self, enabled: bool) -> None:
+        """Запомнить решение из настроек и показать его на ползунке."""
+        self._ai_default_enabled = enabled
+        if self._alive and self._root is not None:
+            self._after(0, self._apply_reset_session_ai)
+
+    def set_ai_ready(self, ready: bool) -> None:
+        """Сказать панели, настроена ли обработка. Без ключа ползунок об этом пишет."""
+        self._ai_ready = ready
+        if self._alive and self._root is not None:
+            self._after(0, self._render_ai)
+
+    def ai_ready(self) -> bool:
+        return self._ai_ready
+
+    def ai_hint(self) -> str:
+        return self._ai_hint()
+
+    def set_ai_error(self, reason: str | None) -> None:
+        """Показать на ползунке, что последний запрос к модели не прошёл."""
+        self._ai_last_error = reason
+        if self._alive and self._root is not None:
+            self._after(0, self._render_ai)
+
+    def _on_abort_click(self) -> None:
+        self._skip_auto_enter.set()
+        self._tween_switch(self._auto_enter_btn, 0.0)
+        if self._on_abort is not None:
+            self._on_abort()
+        # Панель закроется после фактической остановки транскрибации в main.py
+
+    def _apply_reset_session(self) -> None:
+        self._skip_auto_enter.clear()
+        self._auto_enter_btn.progress = 1.0
+        self._apply_reset_session_ai()
+
+    def reset_session(self) -> None:
+        if self._alive and self._root is not None:
+            self._after(0, self._apply_reset_session)
+
+    def skip_auto_enter(self) -> bool:
+        return self._skip_auto_enter.is_set()
+
+    # --- состояния ----------------------------------------------------------
 
     def _apply_update(
         self,
@@ -757,59 +1236,29 @@ class StatusPanel:
         detail: str = "",
         progress: float | None = None,
     ) -> None:
-        if self._window is None or self._status_label is None:
+        if self._window is None:
             return
-
-        self._cancel_pulse()
+        previous = self._state
+        self._state = state
+        self._detail = detail.strip()
+        if progress is not None:
+            self._progress = max(0.0, min(1.0, progress))
 
         if state == "idle":
+            self._stop_pulse()
             self._window.withdraw()
             return
 
-        if self._progress is not None:
-            self._progress.grid_remove()
-        if self._detail_label is not None:
-            self._detail_label.grid_remove()
+        if state == "recording" and previous != "recording":
+            self._start_pulse()
+        if state != "recording":
+            self._stop_pulse()
 
-        if state == "recording":
-            if self._stop_btn is not None:
-                self._stop_btn.grid(row=0, column=1, sticky="ns", padx=(0, 6))
-            if self._record_dot is not None:
-                self._record_dot.grid(row=0, column=0, sticky="w", padx=(0, 6))
-            self._status_label.configure(text="Запись — говорите")
-            self._schedule_pulse()
-        elif state == "transcribing":
-            if self._stop_btn is not None:
-                self._stop_btn.grid_remove()
-            if self._record_dot is not None:
-                self._record_dot.grid_remove()
-            self._status_label.configure(text="Распознаю…")
-            if self._progress is not None:
-                self._progress.grid(row=1, column=0, sticky="ew", pady=(6, 4))
-                value = 0.0 if progress is None else max(0.0, min(1.0, progress)) * 100
-                self._progress.configure(value=value)
-            if self._detail_label is not None:
-                detail_text = detail.strip()
-                self._detail_label.configure(text=detail_text)
-                if detail_text:
-                    self._detail_label.grid(row=2, column=0, sticky="ew")
-        elif state == "processing":
-            # Обработка через ИИ: распознавание уже закончено, но текст ещё не
-            # вставлен. Ждать молча нельзя — пауза тут длиннее, чем при
-            # распознавании, и без надписи это выглядит как зависание.
-            if self._stop_btn is not None:
-                self._stop_btn.grid_remove()
-            if self._record_dot is not None:
-                self._record_dot.grid_remove()
-            self._status_label.configure(text="Обрабатываю через ИИ…")
-            if self._detail_label is not None:
-                detail_text = detail.strip()
-                self._detail_label.configure(text=detail_text)
-                if detail_text:
-                    self._detail_label.grid(row=1, column=0, sticky="ew")
-
-        self._refresh_canvas_bg()
+        self._render()
+        # Окно и размер ставим вместе с показом: одно окно в процессе — обычный
+        # случай, второе (в проверке) иначе вышло бы без места на экране.
         self._window.deiconify()
+        self._window.geometry(f"{self._size[0]}x{self._size[1]}")
         self._reposition()
         self._window.lift()
 
@@ -819,19 +1268,16 @@ class StatusPanel:
         detail: str = "",
         progress: float | None = None,
     ) -> None:
-        if self._root is None:
-            return
-        self._root.after(0, lambda: self._apply_update(state, detail, progress))
+        self._after(0, lambda: self._apply_update(state, detail, progress))
 
     def stop(self) -> None:
         if self._root is None:
             return
 
         def _shutdown() -> None:
-            self._cancel_pulse()
-            if self._window is not None:
-                self._window.destroy()
-                self._window = None
+            self._alive = False
+            self._stop_pulse()
+            self._window = None
             self._root.quit()
 
-        self._root.after(0, _shutdown)
+        self._after(0, _shutdown)

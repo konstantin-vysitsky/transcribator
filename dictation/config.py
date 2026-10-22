@@ -27,10 +27,22 @@ DEFAULTS: dict[str, Any] = {
     "ai_api_key": "",
     "ai_model": "deepseek-flash",
     "ai_timeout_s": 30.0,
+    # Вид панели и её тема. Тема «auto» — панель следует за Windows: у
+    # человека ночью тёмная тема, днём светлая, и выбор ему не нужен.
+    "panel_style": "black",
+    "panel_theme": "auto",
+    # Размер панели. 0 — как считает система по масштабу экрана, иначе ровно
+    # записанное число: 1 — как в макете, 2 — вдвое крупнее.
+    "panel_scale": 0.0,
 }
 
 # Поля, которые читаются ещё и из config.local.json и там главнее.
 _LOCAL_OVERRIDES = ("ai_api_key",)
+
+# Допустимые значения вида и темы панели. Держим здесь, а не в panel_style:
+# panel_style ввозит этот модуль, и обратная зависимость замкнула бы круг.
+_STYLES = ("glow", "black", "smoke", "frost")
+_THEMES = ("auto", "dark", "light")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -44,7 +56,26 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _clamp(merged: dict[str, Any]) -> dict[str, Any]:
     merged["cpu_threads"] = max(1, min(10, int(merged.get("cpu_threads", 6))))
     merged["ai_timeout_s"] = max(5.0, min(120.0, float(merged.get("ai_timeout_s", 30.0))))
+    # Вид и тему панели правят и руками в файле: опечатка не должна ронять
+    # окно, она превращается в значение по умолчанию.
+    merged["panel_style"] = _normalize_style(merged.get("panel_style"))
+    merged["panel_theme"] = _normalize_theme(merged.get("panel_theme"))
+    try:
+        scale = float(merged.get("panel_scale", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        scale = 0.0
+    merged["panel_scale"] = 0.0 if scale <= 0 else max(0.75, min(3.0, round(scale, 2)))
     return merged
+
+
+def _normalize_style(value: object) -> str:
+    style = str(value or "").strip().lower()
+    return style if style in _STYLES else str(DEFAULTS["panel_style"])
+
+
+def _normalize_theme(value: object) -> str:
+    theme = str(value or "").strip().lower()
+    return theme if theme in _THEMES else str(DEFAULTS["panel_theme"])
 
 
 def load_config() -> dict[str, Any]:

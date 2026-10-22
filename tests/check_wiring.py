@@ -199,6 +199,8 @@ def test_tray_menu() -> None:
     app._hotkey_mode = "hold"
     app._autostart_enabled = False
     app._ai_enabled = True
+    app._panel_style = "black"
+    app._panel_theme = "auto"
     app._history = __import__("collections").deque(maxlen=3)
     app._history_lock = __import__("threading").Lock()
 
@@ -213,6 +215,76 @@ def test_tray_menu() -> None:
     check("пункт с галочкой", ai_item.checked is not None)
 
     check("объект pystray.Menu собран", isinstance(menu, pystray.Menu))
+
+    # Вид и тема панели выбираются в настройках, а не в коде.
+    check("пункт вида панели есть", "Вид панели" in texts)
+    check("пункт темы панели есть", "Тема панели" in texts)
+    style_item = next(item for item in menu.items if str(item.text) == "Вид панели")
+    theme_item = next(item for item in menu.items if str(item.text) == "Тема панели")
+    style_labels = [str(i.text) for i in style_item.submenu.items]
+    theme_labels = [str(i.text) for i in theme_item.submenu.items]
+    check("четыре вида панели", len(style_labels) == 4, style_labels)
+    check("три темы панели", len(theme_labels) == 3, theme_labels)
+    checked_styles = [str(i.text) for i in style_item.submenu.items if i.checked]
+    check("вид отмечен галочкой", checked_styles == ["2 · Чёрное стекло"], checked_styles)
+
+
+def test_panel_style_settings() -> None:
+    """Вид и тема панели: значения пишутся в настройки и переживают перезапуск."""
+    print("вид и тема панели:")
+    from dictation import panel_style
+
+    tmp = tempfile.TemporaryDirectory()
+    original_path = config.CONFIG_PATH
+    original_local = config.LOCAL_CONFIG_PATH
+    try:
+        config.CONFIG_PATH = Path(tmp.name) / "config.json"
+        config.LOCAL_CONFIG_PATH = Path(tmp.name) / "config.local.json"
+        fresh = config.load_config()
+        check("по умолчанию чёрное стекло", fresh["panel_style"] == "black", fresh["panel_style"])
+        check("по умолчанию тема как в Windows", fresh["panel_theme"] == "auto")
+
+        check("вид записан", panel_style.apply_style("smoke") == "smoke")
+        check("вид прочитан", config.load_config()["panel_style"] == "smoke")
+        check("тема записана", panel_style.apply_theme("light") == "light")
+        check("тема прочитана", config.load_config()["panel_theme"] == "light")
+
+        # Опечатка в файле не должна ронять окно.
+        check("чужой вид заменяется", panel_style.normalize_style("невид") == "black")
+        check("чужая тема заменяется", panel_style.normalize_theme("включ") == "auto")
+        broken = config._read_json(config.CONFIG_PATH)
+        broken["panel_style"] = "чушь"
+        broken["panel_theme"] = "чушь"
+        config.CONFIG_PATH.write_text(
+            json.dumps(broken, ensure_ascii=False), encoding="utf-8"
+        )
+        healed = config.load_config()
+        check("чтение чинит вид", healed["panel_style"] == "black", healed["panel_style"])
+        check("чтение чинит тему", healed["panel_theme"] == "auto", healed["panel_theme"])
+
+        check("авто следует за светлой Windows", panel_style.resolve_theme("auto", "light") == "light")
+        check("авто следует за тёмной Windows", panel_style.resolve_theme("auto", "dark") == "dark")
+        check("ручная тёмная не слушает Windows",
+              panel_style.resolve_theme("dark", "light") == "dark")
+
+        # У каждого вида обе темы, и светлая — не копия тёмной.
+        for style in ("glow", "black", "smoke", "frost"):
+            dark = panel_style.palette(style, "dark")
+            light = panel_style.palette(style, "light")
+            check(f"у вида {style} есть тёмная", bool(dark.get("bg")))
+            check(f"у вида {style} есть светлая", bool(light.get("bg")))
+            check(f"у вида {style} темы разные", dark["bg"] != light["bg"])
+        black_light = panel_style.palette("black", "light")
+        frost_light = panel_style.palette("frost", "light")
+        check(
+            "на светлой теме чёрное стекло темнее светлого",
+            str(black_light["bg"]) < str(frost_light["bg"]),
+            (black_light["bg"], frost_light["bg"]),
+        )
+    finally:
+        config.CONFIG_PATH = original_path
+        config.LOCAL_CONFIG_PATH = original_local
+        tmp.cleanup()
 
 
 def test_default_prompt_content() -> None:
@@ -271,6 +343,7 @@ def main() -> int:
     test_panel_click_is_saved()
     test_default_prompt_content()
     test_tray_menu()
+    test_panel_style_settings()
     print()
     if FAILURES:
         print(f"ПРОВАЛЕНО: {len(FAILURES)}")
