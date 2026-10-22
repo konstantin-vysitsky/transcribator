@@ -244,6 +244,29 @@ def test_status_panel() -> None:
     time.sleep(0.4)
     check("сброс вернул обработку к настройке", panel.ai_enabled())
 
+    # Две ступени хода: распознавание, затем обработка. Ступень видна не по
+    # подписи, а по заполнению — поэтому проверяется доля, а не текст.
+    panel.update("transcribing", "12 сек · ~8 сек осталось", 0.5)
+    time.sleep(0.5)
+    check(
+        "идёт первая ступень",
+        panel._progress > 0.4 and not panel._transcribe_done,
+        f"{panel._progress:.2f}",
+    )
+    panel.mark_transcribed()
+    panel.update("processing", "жду ответа модели…")
+    time.sleep(0.5)
+    check("первая ступень дозалилась", panel._shown > 0.9, f"{panel._shown:.2f}")
+    check("вторая ступень в работе", panel._transcribe_done and panel._ai_result is None)
+    check(
+        "вторая ступень пошла вперёд без вестей о доле",
+        panel._ai_shown > 0.02,
+        f"{panel._ai_shown:.2f}",
+    )
+    panel.set_ai_finished(recovered=True)
+    time.sleep(0.4)
+    check("вторая ступень заполнилась", panel._ai_result is True and panel._ai_shown == 1.0)
+
     panel.update("idle")
     time.sleep(0.3)
     check("панель спрятана в простое", window is not None and not window.winfo_viewable())

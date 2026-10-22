@@ -254,17 +254,22 @@ def main() -> None:
             if progress_thread is not None:
                 progress_thread.join(timeout=1.0)
                 progress_thread = None
-
+            use_ai = cfg.get("ai_enabled", False)
+            if tray_app is not None:
+                use_ai = tray_app.ai_enabled()
+            if tray_app is not None and not (use_ai and not transcribe_cancel.is_set()):
+                # Распознавание — единственная ступень: доводим её до конца.
+                tray_app.mark_transcribed()
             raw_text = text
             ai_error: str | None = None
             # Кнопка панели и настройка говорят одно и то же: нажатие пишется
             # в config.json, поэтому `cfg` видит его уже в этом процессе.
-            use_ai = cfg.get("ai_enabled", False)
-            if tray_app is not None:
-                use_ai = tray_app.ai_enabled()
             if use_ai and not transcribe_cancel.is_set():
                 if tray_app is not None:
-                    tray_app.set_activity("processing", "отправляю текст модели…")
+                    # Метка на панели говорит, что распознавание кончилось и
+                    # началась вторая ступень: без неё две полосы не отличить.
+                    tray_app.mark_transcribed()
+                    tray_app.set_activity("processing", "жду ответа модели…")
                 text, ai_error = ai.process_text(
                     text,
                     prompt=load_prompt(project_root),
@@ -273,6 +278,8 @@ def main() -> None:
                     model=str(cfg.get("ai_model", ai.DEFAULT_MODEL)),
                     timeout_s=float(cfg.get("ai_timeout_s", ai.DEFAULT_TIMEOUT_S)),
                 )
+                if tray_app is not None:
+                    tray_app.finish_ai_stage(recovered=ai_error is None)
                 if transcribe_cancel.is_set():
                     return
                 if ai_error is not None:
