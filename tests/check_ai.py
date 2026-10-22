@@ -118,6 +118,24 @@ def test_request_shape() -> None:
     check("стрим выключен", captured["body"]["stream"] is False)
     check("temperature 0", captured["body"]["temperature"] == 0)
     check("запас токенов не меньше минимума", captured["body"]["max_tokens"] >= 512)
+    check("размышления выключены", captured["body"].get("thinking") == {"type": "disabled"})
+
+
+def test_thinking_only_for_deepseek() -> None:
+    print("режим размышлений:")
+    captured: dict = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse({"choices": [{"message": {"content": "ок"}}]})
+
+    original = with_urlopen(fake_urlopen)
+    try:
+        # Чужой совместимый сервис на незнакомое поле может ответить отказом.
+        ai.process_text("текст", "промпт", "k", base_url="https://example.test/v1", model="gpt-4o-mini")
+    finally:
+        urllib.request.urlopen = original
+    check("чужой модели поле не отправлено", "thinking" not in captured["body"], str(captured["body"].keys()))
 
 
 def test_base_url_without_v1() -> None:
@@ -238,6 +256,7 @@ def main() -> int:
     test_prompt_roundtrip()
     test_request_shape()
     test_base_url_without_v1()
+    test_thinking_only_for_deepseek()
     test_failures_keep_text()
     test_max_tokens_scaling()
     test_config_defaults()
