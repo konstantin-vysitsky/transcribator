@@ -60,6 +60,15 @@ _RENDER_DELAY_MS = 8  # наведение и нажатие: рисунок с�
 _PULSE_MS = 33
 _PULSE_PEAK_MS = 120
 _PULSE_BEAT_S = 1.1
+# Полоса хода работы: заливка подходит к новой доле за _EASE_MS, а пока
+# идёт обработка, по ней бежит светлая волна — движение видно даже когда
+# доля не меняется (модель думает, а время не идёт).
+_BAR_H = 10
+_BAR_MS = 40
+_EASE_MS = 160
+_EASE_STEPS = 6
+_SHEEN_STRIP = 72
+_STAGE_CLEAR = 9    # место вокруг полосы: мягкое пятно у её конца не должно срезаться
 _COLOR_STEPS = 8
 _COLOR_MS = 20
 
@@ -69,6 +78,13 @@ _ICON_FALLBACK = "\u2715"
 _FONT_BODY = ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/segoeui.ttf")
 _FONT_SMALL = ("C:/Windows/Fonts/segoeuisb.ttf", "C:/Windows/Fonts/segoeui.ttf")
 _FONT_ICONS = ("C:/Windows/Fonts/SegoeIcons.ttf", "C:/Windows/Fonts/seguisym.ttf")
+
+_SHEEN_MS = 1600  # сколько свет идёт от начала полосы до конца
+
+
+def _seconds_note(seconds: float) -> str:
+    """Сколько длилась обработка: «ИИ · 3,2 с»."""
+    return f"· {seconds:.1f} с".replace(".", ",")
 
 
 # --- цвета -------------------------------------------------------------------
@@ -107,6 +123,7 @@ class _Fonts:
     small: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
     title: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
     icon: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
+    tiny: tuple[ImageFont.FreeTypeFont | ImageFont.ImageFont, int]
 
 
 def _load_font(paths: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -127,6 +144,7 @@ def _fonts(scale: float, supersample: int = _SUPERSAMPLE_MAX) -> _Fonts:
         small=(_load_font(_FONT_SMALL, size(9)), size(9)),
         title=(_load_font(_FONT_BODY, size(10.5)), size(10.5)),
         icon=(_load_font(_FONT_ICONS, size(10)), size(10)),
+        tiny=(_load_font(_FONT_SMALL, size(8.5)), size(8.5)),
     )
 
 
@@ -268,7 +286,19 @@ class StatusPanel:
 
         self._state: ActivityState = "idle"
         self._detail = ""
+        # Четыре доли хода. `_progress` — то, что сказал вызывающий код,
+        # `_shown` — то, что видно: оно подходит к цели плавно.
         self._progress = 0.0
+        self._shown = 0.0
+        self._ai_progress = 0.0
+        self._ai_shown = 0.0
+        self._ai_note = ""
+        self._ai_elapsed = 0.0
+        self._ai_started = time.monotonic()
+        self._transcribe_done = False
+        self._ai_result: bool | None = None  # True — вышло, False — нет
+        self._bar_started = time.monotonic()
+        self._bar_job: str | None = None
         self._hover_auto = False
         self._hover_ai = False
         self._hover_stop = False
@@ -497,13 +527,19 @@ class StatusPanel:
             out["switch_h"] = self._spec(_SWITCH_H)
             out["bottom"] = out["switch_top"] + out["switch_h"] + pad_y
         else:
-            progress_top = y + self._spec(8)
-            out["progress_top"] = progress_top
-            out["progress_h"] = self._spec(6)
-            detail_top = progress_top + out["progress_h"] + self._spec(6)
-            out["detail_top"] = detail_top
+            # Две ступени хода. У второй сверху и снизу есть место под мягкое
+            # пятно: без него свечение срезалось бы краем полосы.
+            clear = self._spec(_STAGE_CLEAR)
+            gap = self._spec(3)
+            bar_h = self._spec(_BAR_H)
+            out["stage1_top"] = y + clear
+            out["stage2_top"] = y + clear + bar_h + gap + clear * 2
+            out["bar_h"] = bar_h
+            out["progress_top"] = out["stage1_top"]
+            out["progress_h"] = bar_h
+            out["detail_top"] = out["stage2_top"] + bar_h + clear + self._spec(6)
             out["detail_h"] = self._spec(16) if self._detail else 0
-            out["bottom"] = detail_top + out["detail_h"] + pad_y
+            out["bottom"] = out["detail_top"] + out["detail_h"] + pad_y
         return out
 
     def _render(self) -> None:
@@ -551,14 +587,18 @@ class StatusPanel:
         # Корпус: фон и рамка. Скругление рисуется сразу в крупном размере —
         # это и есть то сглаживание, которого не даёт Tk.
         d.rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=r2, fill=bg)
+        # Свет сверху: полупрозрачная полоса от верха корпуса. Заливать её
+        # непрозрачным цветом нельзя — панель вышла бы двухцветной.
+        overlay = Image.new("RGBA", (w2, h2), (0, 0, 0, 0))
+        od = ImageDraw.Draw(overlay)
+        od.rounded_rectangle(
+            (2 * ss, ss, w2 - 2 * ss, int(h2 / 2.2)),
+            radius=max(2, r2 - 2 * ss),
+            fill=_rgba(str(pal.get("top_glow", bg)), 0.5),
+        )
+        img.paste(overlay, (0, 0), overlay)
         d.rounded_rectangle(
             (0, 0, w2 - 1, h2 - 1), radius=r2, outline=border, width=ss
-        )
-        # Свет сверху: мягкая полоса от верха корпуса.
-        d.rounded_rectangle(
-            (2 * ss, 1 * ss, w2 - 2 * ss, int(h2 / 2.2)),
-            radius=max(2, r2 - 2 * ss),
-            fill=mix(bg, str(pal.get("top_glow", bg)), 0.75),
         )
         if self._style == "smoke":
             # Кромка идёт по высоте корпуса. Верх и низ скругляются по тому
@@ -632,24 +672,10 @@ class StatusPanel:
         else:
             self._hit_auto = None
             self._hit_ai = None
-            top = lay["progress_top"]
-            ph = lay["progress_h"]
-            _rounded(d, (px * s, top * s, (px + lay["content_w"]) * s, (top + ph) * s), ph * s / 2,
-                     fill=str(pal["track"]))
-            filled = max(0.0, min(1.0, self._progress)) * lay["content_w"]
-            if filled > 0:
-                filled = max(filled, ph)
-                _rounded(d, (px * s, top * s, (px + filled) * s, (top + ph) * s), ph * s / 2,
-                         fill=str(pal["track_fill"]))
-                # Лёгкое свечение по краю заливки: видно, что идёт работа.
-                glow = mix(bg, str(pal["track_fill"]), 0.35)
-                d.rounded_rectangle(
-                    ((px - 1) * s, (top - 1) * s, (px + filled + 1) * s, (top + ph + 1) * s),
-                    radius=(ph + 2) * s / 2, outline=glow, width=s,
-                )
+            self._draw_progress(d, lay)
             if self._detail:
                 self._text(d, px * s, lay["detail_top"] * s, self._detail, fonts.small,
-                           mix(str(pal["title"]), bg, 0.35), "la")
+                           mix(str(pal["title"]), bg, 0.45), "la")
 
         small = img.resize((w, h), Image.LANCZOS)
         self._image = small
@@ -673,6 +699,248 @@ class StatusPanel:
         self._window.update_idletasks()
         if self._state != "idle" and apply_geometry:
             self._reposition()
+
+    def _draw_progress(self, d: ImageDraw.ImageDraw, lay: dict[str, int]) -> None:
+        """Две ступени хода работы: распознавание и обработка через ИИ.
+
+        Ступени различаются меткой перед полосой, а не порядком: квадрат с
+        числом — распознавание, ромб с блеском — ИИ. Без метки две полоски
+        друг под другом читались бы как одна длинная. Пока ступень не
+        началась, она стоит погашенной: видно, что впереди ещё работа.
+        """
+        px = lay["pad_x"]
+        bar_w = lay["content_w"]
+        bar_h = lay["bar_h"]
+        ai_on = self._ai_enabled
+        note = ""
+        if self._ai_result is not None:
+            note = "готово" if self._ai_result else "без обработки"
+        elif self._transcribe_done:
+            note = _seconds_note(self._ai_elapsed)
+
+        stages = [
+            ("1", self._shown, {"active": True}, "готово" if self._transcribe_done else ""),
+            ("ai", self._ai_shown,
+             {"active": ai_on, "done": self._ai_result is True,
+              "failed": self._ai_result is False, "doc": self._state == "processing"},
+             note),
+        ]
+        for index, (mark, value, mode, tail) in enumerate(stages):
+            top = lay["stage1_top"] if index == 0 else lay["stage2_top"]
+            self._stage(d, px, top, bar_w, bar_h, mark, value, mode, tail)
+
+    def _stage(
+        self,
+        d: ImageDraw.ImageDraw,
+        px: int,
+        top: int,
+        width: int,
+        height: int,
+        mark: str,
+        value: float,
+        mode: dict[str, bool],
+        tail: str,
+    ) -> None:
+        """Одна ступень: метка, полоса, подпись справа."""
+        s = self._ss
+        pal = self._palette
+        fonts = self._fonts
+        active = bool(mode.get("active"))
+        done = bool(mode.get("done"))
+        failed = bool(mode.get("failed"))
+        frac = max(0.0, min(1.0, float(value) if active else 0.0))
+        if done:
+            frac = 1.0
+
+        mark_box = self._spec(16)
+        gap = self._spec(8)
+        bar_x = px + mark_box + gap
+        tail_w = 0
+        if tail:
+            face = fonts.tiny[0]
+            tail_w = int(_text_size(face, tail)[0] / s) + self._spec(8)
+        bar_w = max(self._spec(40), width - mark_box - gap - tail_w)
+        cy = top + height // 2
+
+        # Метка ступени: квадрат с числом у первой, ромб у второй.
+        if mark == "1" or failed:
+            _rounded(d, (px * s, (cy - mark_box // 2) * s, (px + mark_box) * s,
+                         (cy + mark_box // 2) * s), self._spec(5) * s,
+                     fill=str(pal["stage_mark"]))
+            self._text(d, (px * s) + (mark_box * s) // 2, cy * s,
+                       "\u2715" if failed else mark, fonts.tiny,
+                       str(pal["dot"]) if failed else str(pal["title"]), "mm")
+        else:
+            diamond = self._diamond(mark_box, str(pal["stage_mark"]))
+            if diamond is not None:
+                d._image.paste(diamond, ((px + mark_box // 2) * s, cy * s), diamond)
+
+        # Полоса: лоток, заливка, мягкое пятно у её конца и бегущий отсвет.
+        _rounded(d, (bar_x * s, top * s, (bar_x + bar_w) * s, (top + height) * s),
+                 height * s // 2, fill=str(pal["bar_bg"]))
+        fill_w = max(height, frac * bar_w) if frac > 0 else 0.0
+        doc = bool(mode.get("doc", False))
+        bar_color = self._doc_color() if doc else self._bar_color(
+            fraction=frac, done=done, failed=failed)
+        bar_halo = self._doc_halo() if doc else str(pal["bar_halo"])
+        if fill_w:
+            # Пятно лежит на лотке, заливка — поверх пятна: иначе ореол
+            # закрасил бы конец полосы и она оборвалась бы на просвет.
+            spot, at = self._stage_glow(
+                int(bar_x + fill_w - height // 2), int(cy),
+                height // 2 + self._spec(4), bar_halo, 0.9 if doc else 0.42,
+            )
+            d._image.paste(spot, at, spot)
+            _rounded(d, (bar_x * s, top * s, (bar_x + fill_w) * s, (top + height) * s),
+                     height * s // 2, fill=bar_color)
+            if doc and frac < 0.995:
+                self._sheen(d, bar_x, top, fill_w, height,
+                            self._spec(_SHEEN_STRIP))
+            if not doc:
+                self._dim_stage(d, bar_x, top, bar_w, height)
+        if tail:
+            tx = bar_x + bar_w + self._spec(8)
+            self._text(d, tx * s, cy * s, tail, fonts.tiny,
+                       str(pal["dot"]) if failed else str(pal["title"]), "lm")
+
+    def _dim_stage(self, d: ImageDraw.ImageDraw, bar_x: int, top: int,
+                   bar_w: int, height: int) -> None:
+        """Притушить погашенную ступень: не начавшаяся работа не должна звать."""
+        s = self._ss
+        bg = _rgba(str(self._palette["bg"]), 0.62)
+        left = bar_x - self._spec(22)
+        right = bar_x + bar_w + self._spec(4)
+        dim = Image.new("RGBA", ((right - left) * s, (height + 4) * s), (0, 0, 0, 0))
+        dd = ImageDraw.Draw(dim)
+        dd.rectangle((0, 0, (right - left) * s, (height + 4) * s), fill=bg)
+        d._image.paste(dim, (left * s, (top - 2) * s), dim)
+
+    def _doc_color(self) -> str:
+        """Цвет второй ступени: узнаётся по цвету, без чтения подписи."""
+        pal = self._palette
+        return mix(str(pal["bar_fill"]), str(pal.get("dot", pal["bar_fill"])), 0.28)
+
+    def _doc_halo(self) -> str:
+        return mix(str(self._palette.get("bar_halo", "#ffffff")),
+                   str(self._palette.get("dot", "#ffffff")), 0.35)
+
+    def _bar_color(self, *, fraction: float, done: bool, failed: bool) -> str:
+        """Цвет заливки: две ступени узнаются по цвету, а не по подписи."""
+        pal = self._palette
+        if failed:
+            return mix(str(pal["bar_fill"]), str(pal["dot"]), 0.55)
+        if done:
+            return str(pal["bar_fill"])
+        start = str(pal["bar_fill"])
+        end = str(pal.get("bar_fill_end", pal["bar_fill"]))
+        return mix(start, end, min(1.0, max(0.0, fraction)))
+
+    def _sheen(
+        self,
+        d: ImageDraw.ImageDraw,
+        bar_x: int,
+        top: int,
+        fill_w: int,
+        height: int,
+        strip: int,
+    ) -> None:
+        """Бегущий отсвет по заливке: движение видно, даже когда доля стоит.
+
+        Свет идёт от начала заливки к концу мягкой волной: слой с
+        прозрачностью, поэтому отсвет не спорит с цветом полосы.
+        """
+        s = self._ss
+        if fill_w <= height:
+            return
+        elapsed = time.monotonic() - self._bar_started
+        x = (elapsed % _SHEEN_MS) / _SHEEN_MS
+        head = bar_x + int(x * (fill_w + strip)) - strip
+        if head + strip <= bar_x or head - strip >= bar_x + fill_w:
+            return
+        left = max(bar_x + 1, head - strip)
+        right = min(bar_x + fill_w - 1, head + strip)
+        if right - left < 2:
+            return
+        wave = Image.new(
+            "RGBA", ((right - left) * s, height * s), (0, 0, 0, 0)
+        )
+        wd = ImageDraw.Draw(wave)
+        steps = 8
+        for i in range(steps):
+            k = i / (steps - 1)
+            a = math.sin(k * math.pi) ** 2
+            x0 = (left - bar_x + int(k * (right - left))) * s
+            x1 = (left - bar_x + int((k + 1) * (right - left))) * s + 1
+            wd.rectangle((x0, 0, x1, height * s), fill=_rgba("#ffffff", 0.30 * a))
+        d._image.paste(wave, (left * s, int(top * s)), wave)
+
+    def _glow_disc(
+        self, d: ImageDraw.ImageDraw, cx: int, cy: int, radius: int, color: str
+    ) -> None:
+        """Круг с мягким краем: три круга, от светлого к фону.
+
+        Прозрачности у рисунка панели нет, поэтому мягкость даёт не альфа,
+        а ступени цвета. Крупный рисунок при уменьшении размывает их в
+        ровное свечение.
+        """
+        s = self._ss
+        bg = str(self._palette["bg"])
+        for _k, r, color_here in self._disc_rings(radius, color):
+            d.ellipse(((cx - r) * s, (cy - r) * s, (cx + r) * s, (cy + r) * s),
+                      fill=color_here)
+
+    def _stage_glow(self, cx: int, cy: int, radius: int, color: str,
+                    alpha: float) -> tuple[Image.Image, tuple[int, int]]:
+        """Мягкое пятно у конца полосы: слой с прозрачностью и место для него.
+
+        Ступенями цвета мягкость не выходит: на тёмном фоне видны кольца, и
+        пятно выглядит наклейкой. Отдельный слой гасится альфой ровно.
+        """
+        s = self._ss
+        side = (radius * 2 + 2) * s
+        img = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(img)
+        c = side / 2
+        for scale, k in ((1.0, 0.14), (0.84, 0.22), (0.66, 0.32), (0.46, 0.5)):
+            rr = radius * scale * s
+            gd.ellipse((c - rr, c - rr, c + rr, c + rr),
+                       fill=_rgba(color, alpha * k))
+        return img, (int((cx - radius - 1) * s), int((cy - radius - 1) * s))
+
+    def _disc_rings(self, radius: int, color: str, bg: str = ""):
+        base = bg or str(self._palette["bg"])
+        for k, scale in ((0.55, 1.0), (0.28, 0.74), (0.14, 0.48)):
+            yield k, max(1, int(radius * scale)), mix(base, color, k)
+
+    def _glow_disc_image(self, size: int, color: str) -> Image.Image:
+        """То же пятно отдельной картинкой: его надо класть поверх лотка."""
+        s = self._ss
+        side = size * s
+        img = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(img)
+        c = side / 2
+        # Фон, на который ляжет пятно, — лоток полосы, а не корпус панели.
+        for _k, r, color_here in self._disc_rings(
+            size // 2, color, str(self._palette["bar_bg"])
+        ):
+            rr = r * s
+            gd.ellipse((c - rr, c - rr, c + rr, c + rr), fill=color_here)
+        return img
+
+    def _diamond(self, size: int, color: str) -> Image.Image | None:
+        """Метка второй ступени: ромб, как знак ИИ."""
+        s = self._ss
+        side = size * s
+        if side <= 4:
+            return None
+        img = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        dd = ImageDraw.Draw(img)
+        pad = 1 * s
+        dd.polygon(
+            [(side / 2, pad), (side - pad, side / 2), (side / 2, side - pad), (pad, side / 2)],
+            fill=color,
+        )
+        return img
 
     def _accent_bar(
         self,
@@ -1230,6 +1498,144 @@ class StatusPanel:
 
     # --- состояния ----------------------------------------------------------
 
+    # --- ход работы: две ступени и плавная заливка --------------------------
+
+    def _reset_stages(self, state: ActivityState) -> None:
+        """Новая диктовка — ступени с нуля.
+
+        Доли сбрасывать обязательно: иначе вторая диктовка начиналась бы с
+        заполненной до половины полосы от прошлой.
+        """
+        self._transcribe_done = False
+        self._ai_result = None
+        self._ai_progress = 0.0
+        self._ai_note = ""
+        self._ai_elapsed = 0.0
+        if state == "recording":
+            return
+        # Смена «распознаю» ↔ «обрабатываю» — это переход между ступенями,
+        # а не новая диктовка. Доли тут не трогаем: их ведёт метка ступени.
+        if state in ("transcribing", "processing"):
+            return
+        self._progress = 0.0
+        self._shown = 0.0
+        self._ai_shown = 0.0
+
+    def _note_ai_progress(self) -> None:
+        """Заметить, что пришли вести от обработки ИИ.
+
+        Счётчик распознавания зовёт панель с долей распознавания раз в
+        полсекунды и без всяких вестей об ИИ. Вести про ИИ приходят без доли.
+        Поэтому весть без доли — это про ИИ.
+        """
+        if self._state != "processing":
+            return
+        self._transcribe_done = True
+        self._ai_elapsed += max(0.0, time.monotonic() - self._ai_started)
+        self._ai_started = time.monotonic()
+        self._ai_progress = min(0.94, self._ai_progress + 0.1)
+        self._ai_note = self._detail or self._ai_note
+
+    def _move_progress(self, progress: float | None) -> None:
+        """Раздать пришедшую долю нужной ступени."""
+        if progress is None:
+            return
+        value = max(0.0, min(1.0, progress))
+        if self._state == "processing":
+            self._ai_progress = max(self._ai_progress, min(0.94, value))
+        else:
+            self._transcribe_done = False
+            # Задним числом доля не уходит: иначе заполненная полоса
+            # откатывалась бы назад, когда неточная оценка сдаёт позиции.
+            if value >= 0.999:
+                self._transcribe_done = True
+            self._progress = value if value >= self._progress else self._progress
+
+    def _start_bar(self) -> None:
+        if self._bar_job is not None or not self._alive:
+            return
+        self._bar_job = 0
+        self._after(_BAR_MS, self._tick_bar)
+
+    def _stop_bar(self) -> None:
+        self._bar_job = None
+
+    def _tick_bar(self) -> None:
+        """Кадр хода: подтянуть доли и, если надо, перерисовать.
+
+        Отсвет и мягкое приближение доли — тоже движение, поэтому панель
+        обновляется и когда новых вестей нет.
+        """
+        if not self._alive or self._state in ("idle", "recording"):
+            self._bar_job = None
+            return
+        busy = self._state == "processing"
+        near = self._step(self._shown, self._progress)
+        if busy:
+            near = max(near, self._step(self._ai_shown, self._ai_progress))
+        self._shown = near
+        if busy:
+            self._ai_shown = near
+        self._render()
+        self._after(_BAR_MS, self._tick_bar)
+
+    @staticmethod
+    def _step(shown: float, target: float) -> float:
+        """Один шаг к цели: к концу подходит медленнее, как поезд к станции."""
+        delta = target - shown
+        if abs(delta) < 0.004:
+            return target
+        return shown + delta * 0.22
+
+    def mark_transcribed(self) -> None:
+        """Распознавание позади: первая ступень заполнена, начинается вторая.
+
+        Состояние здесь не меняется: его ставит вызывающий код следующей
+        вестью. Иначе три разных действия наперегонки переставляли бы
+        состояние друг за другом, а рисуется по последнему.
+        """
+        if self._window is None:
+            return
+
+        def _apply() -> None:
+            self._mark_now()
+            self._render()
+
+        self._after(0, _apply)
+
+    def _mark_now(self) -> None:
+        """То же без очереди: метку порой надо поставить в середине отрисовки."""
+        self._transcribe_done = True
+        self._progress = 1.0
+        self._shown = 1.0
+        self._ai_result = None
+        self._ai_progress = 0.0
+        self._ai_shown = 0.0
+        self._ai_note = ""
+        self._ai_elapsed = 0.0
+        self._ai_started = time.monotonic()
+
+    def set_ai_finished(self, recovered: bool = True) -> None:
+        """Обработка закончилась. С `recovered` — вторая ступень вышла.
+
+        Когда не вышло, метка ступени перечёркивается: человек видит, что
+        текст ушёл в вставку без обработки, а не что панель просто исчезла.
+        """
+        if self._window is None:
+            return
+
+        def _apply() -> None:
+            # Не «идёт обработка» — значит после неё панель уже погасили или
+            # перевели в простой. Тогда итог второй ступени никому не нужен.
+            if self._state == "idle":
+                return
+            self._ai_progress = 1.0
+            self._ai_shown = 1.0
+            self._ai_result = True if recovered else False
+            self._render()
+
+        self._after(0, _apply)
+
     def _apply_update(
         self,
         state: ActivityState,
@@ -1241,11 +1647,14 @@ class StatusPanel:
         previous = self._state
         self._state = state
         self._detail = detail.strip()
-        if progress is not None:
-            self._progress = max(0.0, min(1.0, progress))
+        if state != previous:
+            self._reset_stages(state)
+        self._note_ai_progress()
+        self._move_progress(progress)
 
         if state == "idle":
             self._stop_pulse()
+            self._stop_bar()
             self._window.withdraw()
             return
 
@@ -1253,6 +1662,7 @@ class StatusPanel:
             self._start_pulse()
         if state != "recording":
             self._stop_pulse()
+        self._start_bar()
 
         self._render()
         # Окно и размер ставим вместе с показом: одно окно в процессе — обычный

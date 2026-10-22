@@ -188,6 +188,14 @@ class TrayApp:
     def clear_ai_error(self) -> None:
         self._status_panel.set_ai_error(None)
 
+    def mark_transcribed(self) -> None:
+        """Распознавание позади: на панели зажигается вторая ступень."""
+        self._status_panel.mark_transcribed()
+
+    def finish_ai_stage(self, recovered: bool = True) -> None:
+        """Итог обработки ИИ: вторая ступень заполнилась или перечёркнута."""
+        self._status_panel.set_ai_finished(recovered)
+
     def ai_hint(self) -> str:
         return self._status_panel.ai_hint()
 
