@@ -11,7 +11,7 @@ import pyperclip
 import pystray
 from PIL import Image, ImageDraw
 
-from dictation import autostart, config
+from dictation import autostart, config, panel_style
 from dictation.prompt import load_prompt, save_prompt
 from dictation.prompt_editor import PromptEditor
 from dictation.status_panel import StatusPanel
@@ -143,12 +143,18 @@ class TrayApp:
         self._cpu_threads = int(cfg.get("cpu_threads", 6))
         self._ai_enabled = bool(cfg.get("ai_enabled", False))
         self._autostart_enabled = autostart.is_autostart_enabled()
+        self._panel_style = panel_style.normalize_style(cfg.get("panel_style"))
+        self._panel_theme = panel_style.normalize_theme(cfg.get("panel_theme"))
+        self._panel_scale = float(cfg.get("panel_scale") or 0.0)
         self._status_panel = StatusPanel(
             on_abort=self._handle_abort,
             on_stop_recording=self._handle_stop_recording,
             on_toggle_ai=self._handle_toggle_ai,
             ai_enabled=self._ai_enabled,
             ai_ready=bool(str(cfg.get("ai_api_key", "")).strip()),
+            style=self._panel_style,
+            theme=self._panel_theme,
+            scale=self._panel_scale,
         )
         self._prompt_editor: PromptEditor | None = None
 
@@ -413,6 +419,48 @@ class TrayApp:
             ),
             pystray.MenuItem("Промпт обработки…", self._edit_prompt),
             pystray.MenuItem(
+                "Вид панели",
+                pystray.Menu(
+                    *[
+                        pystray.MenuItem(
+                            label,
+                            self._select_panel_style(name),
+                            checked=lambda _item, n=name: self._panel_style == n,
+                            radio=True,
+                        )
+                        for name, label in panel_style.STYLE_LABELS.items()
+                    ]
+                ),
+            ),
+            pystray.MenuItem(
+                "Тема панели",
+                pystray.Menu(
+                    *[
+                        pystray.MenuItem(
+                            label,
+                            self._select_panel_theme(name),
+                            checked=lambda _item, n=name: self._panel_theme == n,
+                            radio=True,
+                        )
+                        for name, label in panel_style.THEME_LABELS.items()
+                    ]
+                ),
+            ),
+            pystray.MenuItem(
+                "Размер панели",
+                pystray.Menu(
+                    *[
+                        pystray.MenuItem(
+                            label,
+                            self._select_panel_scale(value),
+                            checked=lambda _item, v=value: abs(self._panel_scale - v) < 0.01,
+                            radio=True,
+                        )
+                        for label, value in panel_style.SCALE_LABELS.items()
+                    ]
+                ),
+            ),
+            pystray.MenuItem(
                 "Запуск с Windows",
                 self._toggle_autostart,
                 checked=lambda _item: self._autostart_enabled,
@@ -420,6 +468,44 @@ class TrayApp:
             pystray.MenuItem("Перезагрузить", self._restart),
             pystray.MenuItem("Выход", self._exit),
         )
+
+    def _select_panel_style(self, style: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
+        """Вид панели: показать сразу и запомнить.
+
+        Панель живёт всё время работы приложения, поэтому смена вида не ждёт
+        перезапуска: человек выбирает пункт и тут же видит его в деле.
+        """
+
+        def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+            if self._panel_style == style:
+                return
+            self._panel_style = panel_style.apply_style(style)
+            self._status_panel.set_style(self._panel_style)
+            self._refresh_menu()
+
+        return _handler
+
+    def _select_panel_theme(self, theme: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
+        def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+            if self._panel_theme == theme:
+                return
+            self._panel_theme = panel_style.apply_theme(theme)
+            self._status_panel.set_theme(self._panel_theme)
+            self._refresh_menu()
+
+        return _handler
+
+    def _select_panel_scale(self, scale: float) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
+        """Размер панели: мелкий текст на большом экране уменьшает и клетку."""
+
+        def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+            if abs(self._panel_scale - scale) < 0.01:
+                return
+            self._panel_scale = panel_style.apply_scale(scale)
+            self._status_panel.set_scale(self._panel_scale)
+            self._refresh_menu()
+
+        return _handler
 
     def _select_hotkey_mode(self, mode: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
         def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
