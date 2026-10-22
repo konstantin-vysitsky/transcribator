@@ -18,6 +18,7 @@ def relaunch(
     config_path: Path | None = None,
     *,
     delay_s: float = 0.8,
+    parent_pid: int | None = None,
 ) -> None:
     """Запускает новый экземпляр приложения и завершает текущий."""
     root = project_root.resolve()
@@ -27,6 +28,8 @@ def relaunch(
     cmd = [str(launcher), str(root / "spawn_tray.py")]
     if config_path is not None:
         cmd.extend(["--config", str(config_path.resolve())])
+    if parent_pid is not None:
+        cmd.extend(["--parent-pid", str(parent_pid)])
 
     time.sleep(delay_s)
 
