@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 import time
@@ -10,7 +11,7 @@ import numpy as np
 
 from dictation import ai, autostart, config
 from dictation.hotkey import HotkeyListener, format_hotkey_label
-from dictation.single_instance import acquire_single_instance
+from dictation.single_instance import wait_single_instance
 from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
 from dictation.prompt import load_prompt
@@ -54,7 +55,7 @@ def main() -> None:
     if args.config is not None:
         config.CONFIG_PATH = args.config.resolve()
 
-    if not acquire_single_instance():
+    if not wait_single_instance():
         # Второй экземпляр молча выходит — а снаружи это выглядит как
         # «приложение не отвечает». Пишем причину в журнал.
         _log_line(config.CONFIG_PATH.parent, "второй экземпляр уже запущен, выход")
@@ -435,7 +436,10 @@ def main() -> None:
         if restart_requested:
             from dictation.restart import relaunch
 
-            relaunch(project_root, config.CONFIG_PATH)
+            # Работу новый экземпляр перечитать не может: он наследует её
+            # оттого, кто его запустил. Поэтому после перезапуска из меню
+            # приложение дозапускается само, а не ждёт следующего входа.
+            relaunch(project_root, config.CONFIG_PATH, parent_pid=os.getpid())
         sys.exit(0)
 
 
