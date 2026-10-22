@@ -193,8 +193,16 @@ class TrayApp:
         if self._on_stop_recording is not None:
             self._on_stop_recording()
 
-    def _handle_toggle_ai(self, enabled: bool) -> None:
+    def _save_ai_enabled(self, enabled: bool) -> None:
+        """Записать решение об обработке в настройки.
+
+        Пишут оба входа — пункт меню и кнопка панели. Иначе кнопка жила до
+        перезапуска, а после него обработка возвращалась к старому значению.
+        """
         self._ai_enabled = enabled
+        cfg = config.load_config()
+        cfg["ai_enabled"] = enabled
+        config.save_config(cfg)
         self._refresh_menu()
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(enabled)
@@ -202,6 +210,9 @@ class TrayApp:
         # узнает об этом только по вставленной необработанной диктовке.
         if enabled and not self._status_panel.ai_ready():
             self.notify_ai_not_ready()
+
+    def _handle_toggle_ai(self, enabled: bool) -> None:
+        self._save_ai_enabled(enabled)
 
     def open_prompt_editor(self) -> None:
         if self._prompt_editor is None:
@@ -445,22 +456,12 @@ class TrayApp:
         return _handler
 
     def _toggle_ai(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-        """Меню трея переключает обработку насовсем, кнопка панели — на раз.
-
-        Разница намеренная: в меню человек заходит редко и осознанно, там
-        решение сохраняется в `config.json`. Кнопка на панели нажимается на
-        ходу, и запоминать её нажатие было бы неожиданно.
-        """
-        self._ai_enabled = not self._ai_enabled
-        cfg = config.load_config()
-        cfg["ai_enabled"] = self._ai_enabled
-        config.save_config(cfg)
-        self._status_panel.set_ai_default(self._ai_enabled)
-        self._refresh_menu()
-        if self._notify_toggle_ai is not None:
-            self._notify_toggle_ai(self._ai_enabled)
-        if self._ai_enabled and not self._status_panel.ai_ready():
-            self.notify_ai_not_ready()
+        """Меню трея и кнопка панели делают одно и то же: переключают и запоминают."""
+        enabled = not self._ai_enabled
+        # Панель тоже надо сказать про новое значение: без этого кнопка держала
+        # бы прежнее состояние и при первом нажатии вела себя вслепую.
+        self._status_panel.set_ai_default(enabled)
+        self._save_ai_enabled(enabled)
 
     def _edit_prompt(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         self.open_prompt_editor()
