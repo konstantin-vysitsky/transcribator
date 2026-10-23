@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru" data-style="black" data-theme="dark" data-mode="recording">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Панель диктовки</title>
+<link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <div class="bar on" id="bar">
+    <div class="pad">
+      <div class="row">
+        <div class="state">
+          <span class="dot" id="dot"><span class="halo"></span></span>
+          <span class="meter" id="meter" title="Громкость микрофона"><i id="meterFill"></i></span>
+          <span class="title" id="title">Запись — говорите</span>
+        </div>
+        <div class="actions">
+          <button class="done" id="done" type="button">Готово</button>
+          <button class="x" id="abort" type="button" title="Отменить" aria-label="Отменить">✕</button>
+        </div>
+      </div>
+
+      <div class="work">
+        <div class="stage">
+          <span class="mark on" id="mark1">1</span>
+          <span class="track" id="track1"><i id="fill1"></i></span>
+          <span class="note" id="note1"></span>
+        </div>
+        <div class="stage">
+          <span class="mark" id="mark2">ИИ</span>
+          <span class="track" id="track2"><i id="fill2"></i></span>
+          <span class="note" id="note2"></span>
+        </div>
+        <div class="detail" id="detail"></div>
+      </div>
+
+      <div class="switches">
+        <button class="sw" id="sw-auto" type="button" title="Автоотправка: Enter после вставки">
+          <span class="sw-track"><span class="sw-knob"></span></span>
+          <span class="sw-text">Автоотправка</span>
+        </button>
+        <button class="sw ai" id="sw-ai" type="button" title="Обработка через ИИ">
+          <span class="sw-track"><span class="sw-knob"></span></span>
+          <span class="sw-text" id="sw-ai-text">Обработка ИИ</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div class="stub" id="stub">
+    <b id="stub-name">Вид не перенесён</b>
+    <small>Перенесён только «Чёрное стекло». Выберите его в меню трея: «Вид панели».</small>
+  </div>
+
+  <script src="panel.js"></script>
+</body>
+</html>
