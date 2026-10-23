@@ -31,9 +31,6 @@ DEFAULTS: dict[str, Any] = {
     # человека ночью тёмная тема, днём светлая, и выбор ему не нужен.
     "panel_style": "black",
     "panel_theme": "auto",
-    # Размер панели. 0 — как считает система по масштабу экрана, иначе ровно
-    # записанное число: 1 — как в макете, 2 — вдвое крупнее.
-    "panel_scale": 0.0,
 }
 
 # Поля, которые читаются ещё и из config.local.json и там главнее.
@@ -60,11 +57,6 @@ def _clamp(merged: dict[str, Any]) -> dict[str, Any]:
     # окно, она превращается в значение по умолчанию.
     merged["panel_style"] = _normalize_style(merged.get("panel_style"))
     merged["panel_theme"] = _normalize_theme(merged.get("panel_theme"))
-    try:
-        scale = float(merged.get("panel_scale", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        scale = 0.0
-    merged["panel_scale"] = 0.0 if scale <= 0 else max(0.75, min(3.0, round(scale, 2)))
     return merged
 
 

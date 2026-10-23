@@ -34,9 +34,7 @@ def shot(panel: StatusPanel, name: str) -> None:
 def main() -> None:
     style = sys.argv[1] if len(sys.argv) > 1 else None
     theme = sys.argv[2] if len(sys.argv) > 2 else "dark"
-    panel = StatusPanel(
-        ai_enabled=True, ai_ready=True, style=style, theme=theme, scale=1.0
-    )
+    panel = StatusPanel(ai_enabled=True, ai_ready=True, style=style, theme=theme)
     panel.update("transcribing", "12 сек · ~8 сек осталось", 0.62)
     shot(panel, f"{style or 'default'}-{theme}-stage1")
     panel.mark_transcribed()

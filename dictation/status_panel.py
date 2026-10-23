@@ -390,7 +390,6 @@ class StatusPanel:
         *,
         style: str | None = None,
         theme: str | None = None,
-        scale: float = 0.0,
     ) -> None:
         self._on_abort = on_abort
         self._on_stop_recording = on_stop_recording
@@ -429,7 +428,6 @@ class StatusPanel:
         # на случай, если настройки позвали напрямую.
         self._theme_choice = panel_style.normalize_theme(theme)
         self._style = panel_style.normalize_style(style)
-        self._manual_scale = float(scale or 0.0)
         self._system_theme = panel_style.system_theme()
         self._alive = True
         self._ss = _SUPERSAMPLE
@@ -502,14 +500,10 @@ class StatusPanel:
         `winfo_fpixels`: она уже учитывает системное увеличение, и на 125%
         панель выйдет крупнее, на 100% — ровно как в макете.
 
-        Масштаб из настроек (`panel_scale`) главнее: 0 — как считает система,
-        иначе ровно заданное число. Текст живёт в тех же единицах, что и
-        клетка рисунка, поэтому при любом масштабе он выглядит одинаково
-        чётко — просто крупнее или мельче.
+        Размер не настраивается: панель всегда идёт за системой, как в макете.
+        Текст живёт в тех же единицах, что и клетка рисунка, поэтому при любом
+        размере он выглядит одинаково чётко — просто крупнее или мельче.
         """
-        manual = float(getattr(self, "_manual_scale", 0.0) or 0.0)
-        if manual > 0:
-            return max(0.6, min(3.0, manual))
         root = self._root
         if root is None:
             return 1.0
@@ -1498,24 +1492,6 @@ class StatusPanel:
         """Сменить тему: auto (как в Windows), dark, light. Из любого потока."""
         target = panel_style.normalize_theme(theme)
         self._after(0, lambda: self._theme_changed(target))
-
-    def set_scale(self, scale: float) -> None:
-        """Задать размер панели вручную: 1 — ровно как в макете.
-
-        На экранах с высоким разрешением система считает панель крупнее, а
-        текст в ней мельчает вместе с клеткой. Кому нужен привычный размер
-        почерпнее, тот выставляет этот масштаб. 0 — «как считает система».
-        """
-        target = max(0.0, min(3.0, float(scale)))
-        self._after(0, lambda: self._scale_changed(target))
-
-    def _scale_changed(self, scale: float) -> None:
-        self._manual_scale = scale
-        try:  # шрифты пересобираются под новый размер сразу, а не при смене вида
-            self._fonts = _fonts(self._scale, _SUPERSAMPLE_MAX)
-        except Exception:
-            pass
-        self._request_render()
 
     def _style_changed(self, style: str) -> None:
         if style == self._style:
