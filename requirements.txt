@@ -7,4 +7,8 @@ pynput
 pyperclip
 pystray
 Pillow
+# Окно панели и окно промпта — страницы в браузерном движке Windows.
+pywebview
+# Связь Python с системными формами Windows, на которых живёт окно движка.
+pythonnet
 setuptools<81

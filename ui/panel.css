@@ -1,0 +1,482 @@
+/* Панель диктовки. Размеры в точках макета: их масштабирует сама Windows. */
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  overflow: hidden;
+  color-scheme: none;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  color: var(--title);
+}
+
+/* Окно без рамки: страница не должна оставлять вокруг плашки ни края,
+   ни полос прокрутки — их добавляет сама форма и Windows. */
+html { overflow: hidden; }
+body { padding: 0; overflow: hidden; }
+
+/* Плашка стоит в углу страницы ровно по своему размеру. Окно бывает выше
+   того, что нарисовано: пока движок не пересчитал страницу после смены
+   состояния, ей дают запас, иначе нижняя строка обрежется. Растянутая на
+   весь запас плашка разъехалась бы, поэтому её размер — свой. */
+.bar { height: auto; }
+.stub { border-radius: var(--radius); }
+
+/* Ширину и высоту держит окно, но страница не всегда знает их вовремя:
+   в окне без рамки она узнаёт о них с задержкой и до тех пор считает себя
+   маленькой. От этого подпись вылезала под кнопку, а плашка выходила
+   ростом в прежний вид. Поэтому плашке даны прямые размеры — те же, что
+   у окна, без оглядки на размер страницы. Значения приходят из Python
+   вместе с палитрой вида. */
+.bar, .stub {
+  width: var(--panel-w, 100%);
+  height: var(--panel-h, auto);
+}
+
+/* Тёмный стол за прозрачными углами.
+   Углы за круглым краем страница не рисует, и там показывает форму — она
+   светлая, и углы выходят белыми. Слой размером с окно, из которого
+   вырезан круг плашки, закрывает их тёмным, проверенным на совпадение
+   с тёмной темой. Внутрь плашки он не попадает: там прозрачное отверстие.
+   Фон слоя через маску съедается целиком, поэтому в композиции участвуют
+   не два слоя, а оба сразу: первая лента красит всё окно, круги снимают. */
+body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  background: var(--corner-fill, #15161a);
+  -webkit-mask:
+    linear-gradient(#000, #000),
+    radial-gradient(circle at 0 0, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px)),
+    radial-gradient(circle at 100% 0, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px)),
+    radial-gradient(circle at 0 100%, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px)),
+    radial-gradient(circle at 100% 100%, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px));
+  -webkit-mask-composite: source-over, xor, xor, xor;
+  mask:
+    linear-gradient(#000, #000),
+    radial-gradient(circle at 0 0, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px)),
+    radial-gradient(circle at 100% 0, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px)),
+    radial-gradient(circle at 0 100%, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px)),
+    radial-gradient(circle at 100% 100%, transparent 0 var(--corner), #000 calc(var(--corner) + 0.5px));
+  mask-composite: source-over, exclude, exclude, exclude;
+}
+
+.bar, .stub { z-index: 1; }
+
+/* Корпус — сам HTML: прозрачный фон, размытие того, что за окном. */
+.bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  height: auto;
+  border-radius: var(--radius);
+  background:
+    linear-gradient(150deg, var(--bg-a), var(--bg-b)),
+    linear-gradient(150deg, var(--bg-tint-a), var(--bg-tint-b));
+  border: 1px solid var(--border);
+  box-shadow:
+    inset 0 1px 0 var(--gloss),
+    inset 0 0 24px -12px var(--glow);
+  backdrop-filter: blur(30px) saturate(1.15);
+  -webkit-backdrop-filter: blur(30px) saturate(1.15);
+  overflow: hidden;
+  display: none;
+}
+
+.bar.on { display: block; }
+
+/* Кромка вида «Дымчатое»: цветная полоса слева. */
+.bar::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: linear-gradient(var(--accent-left, transparent), var(--accent-right, transparent));
+  box-shadow: 0 0 16px var(--accent-left, transparent);
+  opacity: 0;
+}
+
+[data-style="smoke"] .bar::before { opacity: 1; }
+
+/* Заглушки для видов, которые на страницу ещё не перенесены. */
+.stub {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: var(--radius);
+  background: var(--bg-a);
+  border: 1px dashed var(--border);
+  color: var(--title);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+  padding: 16px;
+  background:
+    linear-gradient(150deg, var(--bg-tint-a), var(--bg-tint-b)),
+    var(--bg-a);
+}
+
+.stub b { font-size: 14px; }
+.stub small { color: var(--muted); font-size: 12px; }
+[data-style="smoke"] .stub,
+[data-style="frost"] .stub { display: flex; }
+
+/* --- содержимое ------------------------------------------------------- */
+
+.pad {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  padding: var(--pad-y) var(--pad-x);
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-y);
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 34px;
+}
+
+.state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Заголовок один в строке с кнопками и потому забирает всё место, что
+   осталось: иначе длинная подпись уходит под кнопку «Готово». */
+.title { flex: 1 1 0; }
+.state { flex: 1 1 0; }
+
+/* Кнопки не сжимаются: иначе заголовок выдавливает их за край. */
+.actions { flex: 0 0 auto; }
+
+.dot {
+  position: relative;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  margin: 0 4px;
+  border-radius: 50%;
+}
+
+.dot::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--dot);
+  box-shadow: 0 0 10px var(--dot-glow);
+  animation: dotBlink 1.1s ease-in-out infinite;
+}
+
+.dot .halo {
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--dot-wave) 0%, transparent 70%);
+  animation: haloWave 1.1s ease-out infinite 0.22s;
+}
+
+@keyframes dotBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@keyframes haloWave {
+  0% { transform: scale(0.4); opacity: 0.6; }
+  100% { transform: scale(1.9); opacity: 0; }
+}
+
+/* Столбик громкости: столько, сколько сейчас слышно. */
+.meter {
+  flex: none;
+  width: 4px;
+  height: 18px;
+  border-radius: 3px;
+  background: var(--track);
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+}
+
+.meter i {
+  display: block;
+  width: 100%;
+  height: 0%;
+  border-radius: 3px;
+  background: var(--bar-fill);
+  box-shadow: 0 0 8px var(--bar-halo);
+  transition: height 90ms linear;
+}
+
+.title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13.5px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+button {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.done {
+  height: var(--done-h);
+  padding: 0 14px;
+  border-radius: var(--btn-radius);
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  color: var(--done-fg);
+  background: linear-gradient(var(--done-top), var(--done-bg));
+  border: 1px solid var(--done-border);
+  box-shadow: inset 0 1px 0 var(--gloss), 0 4px 14px -8px var(--done-shadow);
+}
+
+.done:hover { background: linear-gradient(var(--done-top), var(--done-hover)); }
+.done:active { transform: translateY(1px); }
+.done[hidden] { display: none; }
+
+.x {
+  width: var(--done-h);
+  height: var(--done-h);
+  border-radius: var(--btn-radius);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--icon-fg);
+  background: var(--icon-bg);
+  border: 1px solid var(--icon-border);
+}
+
+.x:hover {
+  color: var(--icon-hover-fg);
+  background: var(--icon-hover-bg);
+  border-color: var(--icon-hover-bg);
+}
+
+.x:active { transform: translateY(1px); }
+
+/* --- ступени хода работы --------------------------------------------- */
+
+.work { display: none; flex-direction: column; gap: 6px; }
+[data-mode="work"] .work { display: flex; }
+[data-mode="work"] .row { min-height: 30px; }
+
+.stage {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 16px;
+}
+
+.mark {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  display: grid;
+  place-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--muted);
+  background: var(--stage-mark);
+  border: 1px solid var(--border);
+}
+
+.mark.off { opacity: 0.45; }
+.mark.on { color: var(--title); background: var(--done-bg); border-color: var(--done-border); }
+.mark.good { color: #fff; }
+.mark.bad { text-decoration: line-through; }
+
+.track {
+  position: relative;
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.track i {
+  display: block;
+  width: 0%;
+  height: 100%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--bar-fill), var(--bar-fill-end));
+  box-shadow: 0 0 10px var(--bar-halo);
+  transition: width 220ms ease-out;
+}
+
+.track.running i::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+  animation: sheen 1.4s linear infinite;
+}
+
+@keyframes sheen {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
+.note {
+  flex: none;
+  min-width: 0;
+  max-width: 120px;
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.detail {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-height: 14px;
+}
+
+/* --- ползунки --------------------------------------------------------- */
+
+.switches {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+  padding-top: 10px;
+  border-top: 1px solid var(--divider);
+}
+
+[data-mode="work"] .switches { display: none; }
+
+.sw {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 34px;
+  padding: 0 12px 0 6px;
+  border-radius: 99px;
+  font-weight: 600;
+  font-size: 12.5px;
+  white-space: nowrap;
+  color: var(--sw-off-fg);
+  background: var(--sw-off-bg);
+  border: 1px solid var(--sw-off-border);
+  transition: background 160ms, border-color 160ms, color 160ms;
+}
+
+.sw-track {
+  position: relative;
+  flex: none;
+  width: 44px;
+  height: 24px;
+  border-radius: 99px;
+  background: var(--sw-off-track);
+  transition: background 160ms, box-shadow 160ms;
+}
+
+.sw-knob {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--sw-off-knob);
+  transition: left 180ms cubic-bezier(0.3, 0.9, 0.3, 1.2), background 160ms;
+}
+
+.sw-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sw.on {
+  color: var(--sw-on-fg);
+  background: var(--sw-on-bg);
+  border-color: var(--sw-on-border);
+}
+
+.sw.on .sw-track {
+  background: linear-gradient(90deg, var(--sw-on-track), var(--sw-on-track-end));
+  box-shadow: 0 0 12px -2px var(--sw-on-track);
+}
+
+.sw.on .sw-knob { left: 23px; background: var(--sw-on-knob); }
+
+.sw.ai.on {
+  color: var(--sw2-on-fg, var(--sw-on-fg));
+  background: var(--sw2-on-bg, var(--sw-on-bg));
+  border-color: var(--sw2-on-border, var(--sw-on-border));
+}
+
+.sw.ai.on .sw-track {
+  background: linear-gradient(90deg, var(--sw2-on-track, var(--sw-on-track)), var(--sw2-on-track-end, var(--sw-on-track-end)));
+}
+
+.sw.alert .sw-text::after {
+  content: " · ошибка";
+  opacity: 0.85;
+}
+
+.sw:hover { filter: brightness(1.08); }
+.sw:active { transform: translateY(1px); }

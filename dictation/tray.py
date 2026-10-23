@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 from dictation import autostart, config, panel_style
 from dictation.prompt import load_prompt, save_prompt
 from dictation.prompt_editor import PromptEditor
-from dictation.status_panel import StatusPanel
+from dictation.status_panel import PAGE_STYLES, StatusPanel
 
 ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 _HISTORY_SIZE = 3
@@ -145,6 +145,10 @@ class TrayApp:
         self._autostart_enabled = autostart.is_autostart_enabled()
         self._panel_style = panel_style.normalize_style(cfg.get("panel_style"))
         self._panel_theme = panel_style.normalize_theme(cfg.get("panel_theme"))
+        if self._panel_style not in PAGE_STYLES:
+            # Пока на страницу перенесён один вид, остальные на панели были бы
+            # заглушкой. Пункт меню остаётся, а по умолчанию берём перенесённый.
+            self._panel_style = PAGE_STYLES[0]
         self._status_panel = StatusPanel(
             on_abort=self._handle_abort,
             on_stop_recording=self._handle_stop_recording,
@@ -250,6 +254,10 @@ class TrayApp:
         self._idle_tooltip = text
         if self._activity == "idle" and self._icon is not None:
             self._icon.title = text
+
+    def set_microphone_level(self, level: float) -> None:
+        """Громкость микрофона на панель: панель показывает, что слышно."""
+        self._status_panel.set_level(level)
 
     def set_activity(
         self,
@@ -473,6 +481,15 @@ class TrayApp:
                 return
             self._panel_style = panel_style.apply_style(style)
             self._status_panel.set_style(self._panel_style)
+            if self._panel_style not in PAGE_STYLES and self._icon is not None:
+                try:
+                    self._icon.notify(
+                        "Вид панели",
+                        "Этот вид ещё не перенесён на страницу: панель покажет "
+                        "заглушку. Перенесён «Чёрное стекло».",
+                    )
+                except Exception:
+                    pass
             self._refresh_menu()
 
         return _handler

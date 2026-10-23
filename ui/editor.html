@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Промпт обработки диктовки</title>
+<link rel="stylesheet" href="editor.css">
+</head>
+<body>
+  <header>
+    <h1>Промпт обработки диктовки</h1>
+    <p>Инструкция для модели: как приводить надиктованное к чёткому виду. Смысл менять нельзя — это записано в промпте явно.</p>
+  </header>
+
+  <main>
+    <textarea id="text" spellcheck="false" wrap="soft" aria-label="Текст промпта"></textarea>
+  </main>
+
+  <footer>
+    <div class="hint" id="hint" role="status"></div>
+    <div class="buttons">
+      <button class="ok" id="save" type="button">Сохранить</button>
+      <button class="plain" id="restore" type="button">Восстановить</button>
+      <button class="close" id="close" type="button">Закрыть</button>
+    </div>
+  </footer>
+
+  <script src="editor.js"></script>
+</body>
+</html>

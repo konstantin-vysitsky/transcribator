@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -22,16 +23,28 @@ class Recorder:
         self._ring: deque[np.ndarray] = deque(maxlen=max(1, PREROLL_SAMPLES // 1024 + 1))
         self._stream: sd.InputStream | None = None
         self._recording = False
+        # Куда сообщать громкость: панель показывает, что её слышно. Звать
+        # необязательно, а без него запись работает как прежде.
+        self.on_level: Callable[[float], None] | None = None
 
     def _callback(self, indata: np.ndarray, _frames: int, _time, status) -> None:
         if status:
             pass
         chunk = indata[:, 0].copy()
         with self._lock:
-            if self._recording:
+            recording = self._recording
+            if recording:
                 self._chunks.append(chunk)
             elif self._preroll:
                 self._ring.append(chunk)
+        if recording and self.on_level is not None and len(chunk):
+            # 300 — тишина, 9000 — громкая речь: этого хватает для столбика
+            # на панели. Считаем здесь же, чтобы не заводить второй поток.
+            level = float(np.sqrt(np.mean(np.square(chunk))))
+            try:
+                self.on_level(max(0.0, min(1.0, (level - 300.0) / 8700.0)))
+            except Exception:
+                self.on_level = None
 
     def start(self) -> bool:
         """Начать запись. False — запись уже идёт, начинать заново нельзя.

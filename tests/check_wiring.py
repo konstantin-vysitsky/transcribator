@@ -159,11 +159,9 @@ def test_panel_click_is_saved() -> None:
             saved.append(enabled)
 
         panel = StatusPanel(on_toggle_ai=on_toggle_and_record, ai_enabled=False)
-        # Нажатие в потоке Tk: при закрытом окне `after(0, ...)` не выполнится,
-        # и проверка прочитала бы старое состояние.
-        root = panel._root
-        assert root is not None
-        root.after(0, panel._on_toggle_ai)
+        # Нажатие без окна: так же, как кнопка страницы, когда окно ещё не
+        # поднялось. Проверяется, что нажатие доходит до настроек.
+        panel._on_toggle_ai()
         for _ in range(50):
             if saved:
                 break

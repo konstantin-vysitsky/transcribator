@@ -15,9 +15,11 @@ from dictation.single_instance import wait_single_instance
 from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
 from dictation.prompt import load_prompt
+from dictation.prompt_editor import set_logger as set_editor_logger
 from dictation.recorder import SAMPLE_RATE, Recorder
 from dictation.recording_store import RecordingStore
 from dictation.sounds import quiet_beep_start, quiet_beep_stop
+from dictation.status_panel import set_logger as set_panel_logger
 from dictation.timing import (
     TranscribeTimer,
     estimate_transcribe_seconds,
@@ -65,6 +67,10 @@ def main() -> None:
     project_root = config.CONFIG_PATH.parent
     use_tray = args.tray
     busy = threading.Event()
+    # Панель и окно промпта живут на странице: если её нет, причина
+    # ложится в тот же журнал, и приложение работает дальше без них.
+    set_panel_logger(lambda message: _log_line(project_root, f"интерфейс: {message}"))
+    set_editor_logger(lambda message: _log_line(project_root, f"интерфейс: {message}"))
     _log_line(project_root, "запуск приложения")
 
     # Промпт создаётся сразу при запуске, а не при первом обращении: иначе
@@ -140,6 +146,9 @@ def main() -> None:
     _log_line(project_root, f"модель загружена: {transcriber.runtime_label()}")
     if tray_app is not None:
         tray_app.set_runtime_info(transcriber.runtime_label())
+    if use_tray:
+        # Громкость видна на панели только во время записи.
+        recorder.on_level = tray_app.set_microphone_level if tray_app is not None else None
 
     def on_record_start() -> bool:
         nonlocal record_target_hwnd, cfg
