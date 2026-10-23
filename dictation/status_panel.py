@@ -11,6 +11,7 @@ Tk рисует только без сглаживания, и на экрана
 """
 from __future__ import annotations
 
+import ctypes
 import math
 import sys
 import threading
@@ -91,7 +92,8 @@ def _seconds_note(seconds: float) -> str:
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
-    color = color.lstrip("#")
+    # Прозрачность в этой работе не нужна: восьмизначный цвет даёт старшие шесть.
+    color = color.lstrip("#")[:6]
     return (int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16))
 
 
@@ -107,6 +109,19 @@ def mix(color_a: str, color_b: str, t: float) -> str:
     return _rgb_to_hex(
         (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
     )
+
+
+def _hex_rgba(color: str) -> tuple[int, int, int, int]:
+    """Цвет с прозрачностью: восемь знаков — своя, шесть — сплошной."""
+    value = str(color).lstrip("#")
+    r, g, b = _hex_to_rgb(value[:6])
+    a = int(value[6:8], 16) if len(value) >= 8 else 255
+    return (r, g, b, a)
+
+
+def _solid(color: str) -> str:
+    """Цвет без прозрачности: Tk восьмизначный не понимает."""
+    return "#" + str(color).lstrip("#")[:6]
 
 
 def _rgba(color: str, alpha: float) -> tuple[int, int, int, int]:
@@ -219,6 +234,125 @@ def _is_panel_background(widget: tk.Misc, panel: "StatusPanel") -> bool:
     return True
 
 
+def _transparency_on() -> bool:
+    """Включена ли прозрачность в оформлении Windows.
+
+    Это настройка человека, а не наша: при выключенной Windows не рисует
+    размытие и не делает окна полупрозрачными. Спрашиваем при каждой
+    проверке — её меняют и ждут, что панель пойдёт следом.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg  # noqa: PLC0415
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "EnableTransparency")
+        return bool(int(value))
+    except (OSError, ValueError, ImportError):
+        return False
+
+
+class _GlassWindow:
+    """Полупрозрачное окно: то, что за панелью, видно сквозь её цвета.
+
+    Tk рисует непрозрачный прямоугольник. Windows умеет больше: окну с
+    особым стилем (без рамки, слоёное) ставится прозрачность, и тогда цвет
+    окна перестаёт быть стеной — сквозь него виден рабочий стол. Форму окна
+    при этом задаёт сам рисунок: там, где у рисунка прозрачно, окна нет.
+
+    Прозрачность у окна общая на всю панель, поэтому каждый цвет палитры
+    написан восемью знаками: шесть — цвет, два — сколько сквозь него видно.
+    Так фон панели выходит прозрачным, а её края — мягкими, без ступенек.
+
+    Размытия фона здесь нет: у Windows оно поднимает каждую прозрачную клетку
+    рисунка до плотного фона и стирает всю прозрачность. Зато без него видно
+    рабочий стол, а не средний цвет под окном.
+    """
+
+    def __init__(self) -> None:
+        self.ok = False
+        self.reason = ""
+        self._user32 = None
+        self._wintypes = None
+        self._hwnd = 0
+        self._installed = False
+
+    def install(self, window: tk.Toplevel) -> bool:
+        if sys.platform != "win32":
+            self.reason = "не Windows"
+            return False
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+        except OSError as error:
+            self.reason = f"системные вызовы не нашлись: {error}"
+            return False
+        from ctypes import wintypes  # noqa: PLC0415
+
+        self._user32 = user32
+        self._wintypes = wintypes
+        self._setup_calls()
+        try:
+            window.update_idletasks()
+            # Виджет Tk — не окно верхнего уровня: сперва находим его окно.
+            self._hwnd = int(user32.GetAncestor(wintypes.HWND(int(window.winfo_id())), 2))
+        except Exception as error:  # noqa: BLE001
+            self.reason = f"окно не нашлось: {error}"
+            return False
+        self._installed = True
+        if not _transparency_on():
+            self.reason = "прозрачность выключена в Windows"
+            return False
+
+        self.ok = self._apply()
+        if not self.ok:
+            self.reason = self.reason or "система отказала"
+        return self.ok
+
+    def _setup_calls(self) -> None:
+        """Размеры и формы вызовов: 32-битные числа и указатели надо объявлять."""
+        user32, w = self._user32, self._wintypes
+        user32.GetAncestor.restype = w.HWND
+        user32.GetAncestor.argtypes = [w.HWND, ctypes.c_uint]
+        user32.GetWindowLongW.restype = ctypes.c_long
+        user32.GetWindowLongW.argtypes = [w.HWND, ctypes.c_int]
+        user32.SetWindowLongW.restype = ctypes.c_long
+        user32.SetWindowLongW.argtypes = [w.HWND, ctypes.c_int, ctypes.c_long]
+
+    def reapply(self) -> bool:
+        """Поставить стиль окна заново после показа: показанное окно его теряет."""
+        if not self.ok:
+            return False
+        try:
+            window = self._wintypes.HWND(self._hwnd)
+            self._user32.SetWindowLongW(window, -20,
+                                        self._user32.GetWindowLongW(window, -20) | 0x00080000)
+            self._user32.SetWindowLongW(window, -16,
+                                        self._user32.GetWindowLongW(window, -16))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _apply(self) -> bool:
+        w = self._wintypes
+        window = w.HWND(self._hwnd)
+        try:
+            style = self._user32.GetWindowLongW(window, -16)
+            # Tk запоминает стиль окна сам и при следующей настройке вернёт
+            # старый: подгоняем оба, иначе прозрачность слетит. Слоёное окно
+            # нужно, чтобы альфа окна вообще действовала.
+            extended = self._user32.GetWindowLongW(window, -20)
+            self._user32.SetWindowLongW(window, -16, (style | 0x00200000) & ~0x00080000)
+            self._user32.SetWindowLongW(window, -20, (extended | 0x00080000) & ~0x00000080)
+        except Exception as error:  # noqa: BLE001
+            self.reason = f"стиль окна: {error}"
+            return False
+        return True
+
+
 def _rounded(d: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
              radius: float, fill: Any = None, outline: Any = None,
              width: int = 1) -> None:
@@ -251,6 +385,7 @@ class StatusPanel:
         self._image_item: int | None = None
         self._photo: ImageTk.PhotoImage | None = None
         self._image: Image.Image | None = None
+        self._glass = _GlassWindow()
 
         # Границы нажатий в точках экрана: по ним определяем, куда пришёл клик.
         self._hit_stop: tuple[int, int, int, int] | None = None
@@ -387,6 +522,17 @@ class StatusPanel:
         r, g, b = _hex_to_rgb(str(colors["bg"]))
         colors["__luma"] = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
         self._palette = colors
+        # Цвет окна под рисунком — тоже палитра вида и темы: при смене вида
+        # он должен смениться вместе с рисунком. У стекла окно служит только
+        # подложкой под картинку.
+        window = getattr(self, "_window", None)
+        canvas = getattr(self, "_canvas", None)
+        if window is not None and canvas is not None and not self._glass.ok:
+            try:
+                window.configure(bg=self._window_color())
+                canvas.configure(bg=self._window_color())
+            except tk.TclError:
+                pass
 
     def _light(self) -> bool:
         return float(self._palette.get("__luma", 0)) > 0.5
@@ -448,7 +594,7 @@ class StatusPanel:
         window.withdraw()
         window.overrideredirect(True)
         window.attributes("-topmost", True)
-        window.configure(bg=self._palette["bg"])
+        window.configure(bg=self._window_color())
         window.bind("<Button-1>", self._on_mouse_down, add="+")
         window.bind("<B1-Motion>", self._on_drag_move, add="+")
         window.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
@@ -456,7 +602,16 @@ class StatusPanel:
         window.bind("<Leave>", lambda _e: self._set_hover(None), add="+")
         self._window = window
 
-        canvas = tk.Canvas(window, highlightthickness=0, bd=0, bg=self._palette["bg"])
+        # Стекло: окно становится полупрозрачным, и цвета рисунка читаются
+        # как полупрозрачные. Не вышло — панель остаётся плотной, как раньше:
+        # рисунок тогда сплющивается, а окно держит скруглённый край регионом.
+        self._glass = _GlassWindow()
+        self._glass.install(window)
+
+        # Со стеклом цвет холста — сам рисунок: панель станет видна только
+        # там, где у рисунка есть цвет, а пустые клетки по краям пропадут.
+        canvas = tk.Canvas(window, highlightthickness=0, bd=0,
+                           bg=self._window_color())
         canvas.pack()
         self._canvas = canvas
 
@@ -467,38 +622,6 @@ class StatusPanel:
         self._ready.set()
         root.after(1500, self._watch_system_theme)
         root.mainloop()
-
-    def _apply_window_region(self) -> None:
-        """Скрыть углы окна за пределами скругления.
-
-        Рисунок у панели скруглён, но окно под ним прямоугольное, и углы
-        оставались бы квадратными: фон панели заливал бы скруглённые дырки.
-        Обрезка окна по скруглённому прямоугольнику убирает этот квадрат.
-        """
-        if self._window is None or sys.platform != "win32":
-            return
-        try:
-            import ctypes  # noqa: PLC0415
-            from ctypes import wintypes  # noqa: PLC0415
-
-            user32 = ctypes.windll.user32
-            gdi32 = ctypes.windll.gdi32
-            user32.GetDC.restype = wintypes.HDC
-            gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
-            gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
-            user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
-            hwnd = int(self._window.winfo_id())
-            w, h = self._size
-            radius = self._spec(_RADIUS) * 2
-            if self._style == "black":
-                radius = round(radius * 1.2)
-            hdc = user32.GetDC(hwnd)
-            region = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius)
-            user32.SetWindowRgn(hwnd, region, True)
-            user32.ReleaseDC(hwnd, hdc)
-        except Exception:
-            # Не удалось — панель просто останется с квадратными углами.
-            pass
 
     # --- рисование ----------------------------------------------------------
 
@@ -570,7 +693,9 @@ class StatusPanel:
         self._ss = ss
         self._fonts = _fonts(self._scale, ss)
 
-        img = Image.new("RGB", (w * ss, h * ss), str(pal["bg"]))
+        # Рисунок с прозрачностью: корпус сам решает, сколько сквозь него видно.
+        # Без стекла та же картинка сплющивается в плотную: см. ниже.
+        img = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         radius = self._spec(_RADIUS)
         if self._style == "black":
@@ -583,7 +708,11 @@ class StatusPanel:
 
         # Корпус: фон и рамка. Скругление рисуется сразу в крупном размере —
         # это и есть то сглаживание, которого не даёт Tk.
-        d.rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=r2, fill=bg)
+        # Прозрачность корпуса записана в его цвет восемью знаками: своя
+        # прозрачность клетки плюс прозрачность окна и дают стекло. Без
+        # стекла прозрачность клеток сплющивается на плотный цвет — как раньше.
+        body = _hex_rgba(bg) if self._glass.ok else (*_hex_rgba(bg)[:3], 255)
+        d.rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=r2, fill=body)
         # Свет сверху: полупрозрачная полоса от верха корпуса. Заливать её
         # непрозрачным цветом нельзя — панель вышла бы двухцветной.
         overlay = Image.new("RGBA", (w2, h2), (0, 0, 0, 0))
@@ -678,17 +807,40 @@ class StatusPanel:
         self._image = small
         # Готовую картинку отдаём хранителю: у Tk дешевле уменьшить свою
         # картинку при показе, чем ехать через PIL для каждого кадра точки.
-        self._photo = ImageTk.PhotoImage(small)
+        # Картинка уходит отдельным пятном на прозрачном фоне: сквозь пустые
+        # клетки видно то, что за панелью, а край выходит мягким.
+        self._photo = ImageTk.PhotoImage(self._shown_image(small).convert("RGBA"))
         canvas = self._canvas
-        canvas.configure(bg=bg)
+        if not self._glass.ok:
+            canvas.configure(bg=self._window_color())
         if self._image_item is None:
             self._image_item = canvas.create_image(0, 0, image=self._photo, anchor="nw")
         else:
             canvas.itemconfigure(self._image_item, image=self._photo)
         canvas.configure(width=w, height=h)
         canvas.tag_raise(self._image_item)
-        self._apply_window_region()
         self._window_size_changed(apply_geometry=self._state == "idle")
+
+    def _window_color(self) -> str:
+        """Плотный цвет окна под рисунком: старший цвет панели.
+
+        Tk умеет только такой цвет, а он нужен для подложки: без стекла —
+        под непрозрачным рисунком, со стеклом — чтобы хорошо читались буквы.
+        """
+        return _solid(str(self._palette.get("bg", "#000000")))
+
+    def _shown_image(self, image: Image.Image) -> Image.Image:
+        """Картинка для показа: со стеклом — с прозрачностью, без него — плотная.
+
+        Прозрачные клетки у стекла пропадают сами: окно под ними видно
+        насквозь. Без стекла Tk вывел бы их чёрными, поэтому запасной путь
+        сплющивает рисунок на свой же плотный фон — ровно как раньше.
+        """
+        if self._glass.ok:
+            return image
+        solid = Image.new("RGB", image.size, _solid(str(self._palette.get("bg", "#000000"))))
+        solid.paste(image, (0, 0), image if image.mode == "RGBA" else None)
+        return solid
 
     def _window_size_changed(self, *, apply_geometry: bool) -> None:
         if self._window is None:
@@ -1665,6 +1817,10 @@ class StatusPanel:
         self._window.geometry(f"{self._size[0]}x{self._size[1]}")
         self._reposition()
         self._window.lift()
+        # Показанное окно снова плотное: стиль, поставленный до показа, при
+        # показе слетает. Без этого панель закрыта непрозрачным прямоугольником.
+        self._glass.reapply()
+        self._request_render()
 
     def update(
         self,
