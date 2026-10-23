@@ -322,12 +322,9 @@ class StatusPanel:
         # `_alive` гаснет при остановке: после выхода из цикла окна очередь
         # Tk закрыта, а любой запрос в неё пишет ошибку в журнал.
         self._alive = True
-        # `_skip_ai` — это «выключено на эту сессию». Он заведён отдельно от
-        # настройки, чтобы ползунок не писал в config.json; в исходном
-        # состоянии он повторяет настройку.
-        self._skip_ai = threading.Event()
-        if not ai_enabled:
-            self._skip_ai.set()
+        # Одно состояние на ползунок и на решение в main.py. Отдельного
+        # «пропуска на сессию» нет: нажатие по ползунку пишется в настройки
+        # и живёт до следующего нажатия, а не до перезапуска.
         self._ai_enabled = ai_enabled
         self._ai_default_enabled = ai_enabled
 
@@ -1419,28 +1416,24 @@ class StatusPanel:
         self._request_render()
 
     def _on_toggle_ai(self) -> None:
-        """Ползунок переключает обработку до конца сессии.
+        """Ползунок переключает обработку и запоминает решение.
 
-        В `config.json` это не пишется: там лежит решение по умолчанию, а
-        ползунок нужен для разового «здесь и сейчас». Иначе случайное нажатие
-        меняло бы поведение диктовки навсегда.
+        Нажатие уходит наружу (`_notify_toggle_ai`), а там оно пишется в
+        `config.json`. Так состояние ползунка переживает перезапуск, и в меню
+        трея ничего переключать не нужно.
 
         Состояние берётся из `ai_state()`, а не из второго флага: флагов два, и
         расхождение между ними и превращало каждое второе нажатие в холостое.
         """
         enabled = not self.ai_state()
         self._ai_enabled = enabled
-        if enabled:
-            self._skip_ai.clear()
-        else:
-            self._skip_ai.set()
+        self._ai_default_enabled = enabled
         self._ai_btn.text = self._ai_text()
         self._tween_switch(self._ai_btn, 1.0 if enabled else 0.0)
         if self._notify_toggle_ai is not None:
             self._notify_toggle_ai(enabled)
 
     def _apply_reset_session_ai(self) -> None:
-        self._skip_ai.clear()
         self._ai_enabled = self._ai_default_enabled
         self._ai_btn.text = self._ai_text()
         self._ai_btn.progress = 1.0 if self.ai_state() else 0.0
@@ -1448,14 +1441,15 @@ class StatusPanel:
 
     def ai_state(self) -> bool:
         """Включена ли обработка сейчас. Это и есть состояние ползунка."""
-        return self._ai_enabled and not self._skip_ai.is_set()
+        return self._ai_enabled
 
     def ai_enabled(self) -> bool:
         return self.ai_state()
 
     def set_ai_default(self, enabled: bool) -> None:
-        """Запомнить решение из настроек и показать его на ползунке."""
+        """Применить решение, сохранённое в настройках, и показать его на ползунке."""
         self._ai_default_enabled = enabled
+        self._ai_enabled = enabled
         if self._alive and self._root is not None:
             self._after(0, self._apply_reset_session_ai)
 
