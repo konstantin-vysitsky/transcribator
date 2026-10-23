@@ -58,3 +58,14 @@ tests/during.png
 
 # Кэш браузерного движка от пробных запусков.
 .webview2-panel/
+
+# Пробы переноса панели: черновики проверок и кэш браузерного движка.
+# Рабочие файлы проекта сюда не попадают: они лежат вне этих имён.
+tests/ui_probe_*.py
+tests/ui_launch_probe*.py
+tests/ui_bytes*.py
+tests/ui_console.py
+tests/ui_smoke.py
+tests/ui_windows.py
+.ui-probe-cache/
+.ui-cache-probe/
