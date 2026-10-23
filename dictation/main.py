@@ -67,11 +67,16 @@ def main() -> None:
     project_root = config.CONFIG_PATH.parent
     use_tray = args.tray
     busy = threading.Event()
-    # Панель и окно промпта живут на странице: если её нет, причина
-    # ложится в тот же журнал, и приложение работает дальше без них.
-    set_panel_logger(lambda message: _log_line(project_root, f"интерфейс: {message}"))
-    set_editor_logger(lambda message: _log_line(project_root, f"интерфейс: {message}"))
     _log_line(project_root, "запуск приложения")
+
+    # Панель и окно живут в своих потоках. Если что-то не поднялось,
+    # причина ложится в журнал строкой с приставкой «интерфейс:», а диктовка
+    # работает дальше без этой части.
+    def _interface(message: str) -> None:
+        _log_line(project_root, f"интерфейс: {message}")
+
+    set_panel_logger(_interface)
+    set_editor_logger(_interface)
 
     # Промпт создаётся сразу при запуске, а не при первом обращении: иначе
     # файл появляется только после первой диктовки с обработкой, и найти его
@@ -176,6 +181,9 @@ def main() -> None:
             if tray_app is not None:
                 tray_app.reset_session()
                 tray_app.refresh_ai_settings()
+                # Панель и звук — сперва, микрофон — сразу за ними: панель
+                # должна показаться в момент нажатия, а не после открытия
+                # микрофона, которое занимает время на старте.
                 tray_app.set_activity("recording")
             if not recorder.start():
                 # Запись уже идёт: второе нажатие не должно её стирать.
