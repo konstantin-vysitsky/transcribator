@@ -1,32 +1,34 @@
-"""Живая проверка панели диктовки и окна промпта на браузерном движке.
+"""Живая проверка окна промпта и панели статуса.
 
 Запуск: `.venv\\Scripts\\python.exe tests\\check_ui.py`
 
-Панель и окно промпта — страницы в окнах WebView2. Проверяется то, что
-видно только на живом движке: страницы поднимаются, состояние доезжает до
-страницы и обратно, кнопки страницы вызывают обработчики Python, окно
-панели встаёт на экран нужного размера, а промпт сохраняется, не
-сохраняется пустым и восстанавливается.
+Открывает окно правки промпта и панель статуса так же, как это делает
+приложение, ждёт и закрывает. Проверяется то, что видно только на живом
+Tk: окно строится и встаёт по макету, текст промпта доезжает до поля, кнопки
+на панели нажимаются и доходят до Python, вид и тема меняются без
+перезапуска, а две ступени хода работы заполняются.
 
-Страницы живут в отдельном процессе окон, а он один на приложение. Поэтому
-все проверки идут одним заходом в обоих порядках.
+Панель и окно снова на встроенной графике Tk, как было до переноса на
+страницу. Панели проверяются отдельными процессами: у процесса Tk один
+корень, и второй делит с первым картинки.
 
 Ничего не печатает в поле ввода, не трогает буфер обмена и не пишет в
 настоящие настройки и в настоящий промпт.
 """
 from __future__ import annotations
 
-import json
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dictation import web_lane  # noqa: E402
-from dictation.prompt import DEFAULT_PROMPT  # noqa: E402
-from dictation.status_panel import StatusPanel, palette_variables  # noqa: E402
+from dictation import panel_style  # noqa: E402
+from dictation.prompt import DEFAULT_PROMPT, load_prompt  # noqa: E402
+from dictation.prompt_editor import PromptEditor  # noqa: E402
+from dictation.status_panel import StatusPanel  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -37,262 +39,489 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         FAILURES.append(name)
 
 
-def wait_for(condition, limit_s: float = 6.0, step_s: float = 0.05) -> bool:
-    deadline = time.monotonic() + limit_s
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(step_s)
-    return False
+def stop_panel(panel: StatusPanel) -> None:
+    """Остановить панель и дать потоку Tk спокойно выйти.
 
-
-# --- панель ------------------------------------------------------------------
-
-
-def test_panel(events: list[tuple[str, object]]) -> None:
-    print("панель диктовки:")
-    panel = StatusPanel(
-        on_abort=lambda: events.append(("abort", None)),
-        on_stop_recording=lambda: events.append(("done", None)),
-        on_toggle_ai=lambda enabled: events.append(("ai", enabled)),
-        ai_enabled=False,
-        style="black",
-        theme="dark",
-    )
-    try:
-        check("страница панели поднялась", panel._page.ok)
-        check("всё приложение видит панель", pane_reachable(panel))
-        variables = palette_variables("black", "dark")
-        check("палитра переводится в переменные", "--bg-a" in variables and "--radius" in variables)
-
-        check("по умолчанию обработка выключена", not panel.ai_enabled())
-        panel.update("recording")
-        check("окно панели встало на экран", wait_for(lambda: panel._size is not None, 6.0))
-        width, height = panel._size or (0, 0)
-        print(f"       размер окна: {width}x{height}")
-        check("ширина панели как в макете", width == 396, str(width))
-        check("высота панели не больше предела", 100 <= height <= 640, str(height))
-
-        state = panel.page_state()
-        check("состояние говорит про запись", state["activity"] == "recording", repr(state["activity"]))
-        check("состояние несёт палитру вида", state["style"] == "black", repr(state["style"]))
-        check("длительность записи идёт", isinstance(state["duration"], float))
-
-        # Нажатие на странице доходит до Python: страница зовёт ту же дверь,
-        # что и живая панель, когда человек жмёт кнопку.
-        events.clear()
-        press(panel, "ai", True)
-        check(
-            "нажатие ползунка ИИ доходит до Python",
-            wait_for(lambda: ("ai", True) in events),
-            repr(events),
-        )
-        check("панель включает обработку", panel.ai_enabled())
-        events.clear()
-        press(panel, "done", None)
-        check("кнопка «Готово» доходит до Python", wait_for(lambda: ("done", None) in events), repr(events))
-        events.clear()
-        press(panel, "abort", None)
-        check("кнопка отмены доходит до Python", wait_for(lambda: ("abort", None) in events), repr(events))
-        check("отмена помечает «без автоотправки»", panel.skip_auto_enter())
-        press(panel, "auto_enter", True)
-        check("переключатель автоотправки снимает отметку", wait_for(lambda: not panel.skip_auto_enter()))
-
-        panel.set_ai_default(True)
-        check("настройка включает обработку", panel.ai_enabled())
-        panel.reset_session()
-        check("сброс возвращает к настройке", panel.ai_enabled())
-
-        panel.update("transcribing", "12 сек · ~8 сек осталось", 0.5)
-        check("идёт первая ступень", panel.page_state()["transcribe_progress"] >= 0.4)
-        panel.mark_transcribed()
-        panel.update("processing", "жду ответа модели…")
-        check("первая ступень дозалилась", panel.page_state()["transcribe_done"])
-        check("вторая ступень в работе", panel.page_state()["ai_result"] is None)
-        panel.set_ai_finished(recovered=True)
-        check("вторая ступень заполнилась", panel.page_state()["ai_result"] is True)
-
-        panel.update("idle")
-        check("в простое панель уходит с глаз", wait_for(lambda: not panel._shown_window, 4.0))
-
-        # Инструменты и виды: остальные виды помечены как заглушки.
-        panel.set_theme("light")
-        check("смена темы не ломает страницу", panel.page_state()["theme"] in ("light", "dark"))
-        panel.set_theme("dark")
-        panel.set_style("black")
-        check("вид «Чёрное стекло» остаётся", panel.style == "black")
-    finally:
-        panel.stop()
+    Панель живёт в своём потоке и строит свой корень Tk. Второй корень в том
+    же процессе Tk делит с первым картинки и не всегда стартует чисто, поэтому
+    каждая панель в проверке работает отдельным процессом.
+    """
+    panel.stop()
     time.sleep(0.4)
 
-    check("после остановки окно панели закрыто", not panel._page.ok or not web_lane._lane or True)
+
+def test_prompt_editor() -> None:
+    print("окно промпта:")
+    saved: list[str] = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        stored = {"value": "исходный промпт"}
+
+        editor = PromptEditor(
+            load=lambda: stored["value"],
+            save=lambda text: (saved.append(text), stored.update(value=text)),
+        )
+        check("объект построен", editor._root is not None)
+        check("окно существует", editor._window is not None)
+        check("поле текста существует", editor._text is not None)
+        check("окно дождалось готовности", editor.wait_ready(0.1))
+        check("на старте окно закрыто", not editor.is_open())
+
+        editor.open()
+        time.sleep(0.4)
+        root_widget = editor._root
+        assert root_widget is not None
+
+        def run_on_ui(action) -> None:
+            done = threading.Event()
+
+            def wrapper() -> None:
+                try:
+                    action()
+                finally:
+                    done.set()
+
+            root_widget.after(0, wrapper)
+            if not done.wait(timeout=3.0):
+                raise AssertionError("действие в потоке Tk не выполнилось")
+
+        text_value: list[str] = []
+        run_on_ui(lambda: text_value.append(editor._text.get("1.0", "end")))
+        check(
+            "окно считает себя открытым",
+            editor.is_open(),
+        )
+        window = editor._window
+        if window is not None:
+            width = window.winfo_width()
+            height = window.winfo_height()
+            print(f"       размер окна промпта: {width}x{height}")
+            check("окно промпта показано", window.winfo_viewable())
+            check("ширина окна по макету", 600 <= width <= 1600, str(width))
+            check("высота окна по макету", 500 <= height <= 1500, str(height))
+        check(
+            "в поле доехал текущий промпт",
+            bool(text_value) and text_value[0].startswith("исходный промпт"),
+            repr(text_value),
+        )
+
+        run_on_ui(editor._on_restore)
+        check("восстановление записало дефолт", saved and saved[-1].strip() == DEFAULT_PROMPT.strip(), repr(saved[-1:]))
+
+        restored: list[str] = []
+        run_on_ui(lambda: restored.append(editor._text.get("1.0", "end")))
+        check(
+            "восстановление видно в поле",
+            bool(restored) and restored[0].strip() == DEFAULT_PROMPT.strip(),
+            repr(restored[:1]),
+        )
+
+        def set_text(value: str) -> None:
+            editor._text.delete("1.0", "end")
+            editor._text.insert("1.0", value)
+
+        run_on_ui(lambda: set_text("мой текст"))
+        run_on_ui(editor._on_save)
+        check("сохранение записало правку", saved[-1].strip() == "мой текст", repr(saved[-1:]))
+
+        hint = editor._hint
+        check("подсказка о сохранении показана", hint is not None and "Сохранено" in hint.cget("text"))
+
+        run_on_ui(lambda: set_text("   "))
+        before = len(saved)
+        run_on_ui(editor._on_save)
+        check("пустой промпт не сохраняется", len(saved) == before, str(len(saved)))
+        check(
+            "про пустой промпт сказано",
+            hint is not None and "не сохраняется" in hint.cget("text"),
+            hint.cget("text") if hint else "",
+        )
+
+        editor.close()
+        time.sleep(0.3)
+        check("закрытое окно промпта считает себя закрытым", not editor.is_open())
+        check("закрытое окно спрятано", window is not None and not window.winfo_viewable())
+
+        editor.stop()
+        time.sleep(0.3)
+
+
+def test_status_panel() -> None:
+    print("панель статуса:")
+    toggles: list[bool] = []
+    clicks: list[str] = []
+
+    panel = StatusPanel(
+        on_abort=lambda: clicks.append("abort"),
+        on_stop_recording=lambda: clicks.append("done"),
+        on_toggle_ai=lambda enabled: toggles.append(enabled),
+        ai_enabled=False,
+    )
+    root_widget = panel._root
+    check("панель построена", root_widget is not None)
+    check("панель на встроенной графике", type(panel).__name__ == "_TkStatusPanel", type(panel).__name__)
+    check("кнопка ИИ создана", panel._ai_btn is not None)
+    check("кнопки промпта на панели нет", not hasattr(panel, "_prompt_btn"))
+    check("кнопка автоотправки на месте", panel._auto_enter_btn is not None)
+    check("кнопка Готово на месте", panel._stop_btn is not None)
+    check("кнопка отмены на месте", panel._abort_btn is not None)
+
+    check("по умолчанию обработка выключена", not panel.ai_enabled())
+
+    window = panel._window
+    check("в простое панель не видна", window is not None and not window.winfo_viewable())
+
+    panel.update("recording")
+    time.sleep(0.4)
+    check("панель показана на записи", window is not None and window.winfo_viewable())
+
+    if window is not None and window.winfo_viewable():
+        width = window.winfo_width()
+        height = window.winfo_height()
+        print(f"       размер окна панели: {width}x{height}")
+        check("ширина разумная", 200 < width < 600, str(width))
+        check("высота разумная", 100 < height < 400, str(height))
+
+    state = panel.page_state()
+    check("состояние говорит про запись", state["activity"] == "recording", repr(state["activity"]))
+    check("состояние несёт вид", state["style"] == "black", repr(state["style"]))
+    check("время записи идёт", state["duration"] > 0, repr(state["duration"]))
+    check("обработка из настроек видна в состоянии", state["ai_enabled"] is False)
+
+    assert root_widget is not None
+
+    def run_on_ui(action) -> None:
+        """Выполнить действие в потоке Tk и дождаться, пока оно отработает.
+
+        `after(0, ...)` лишь ставит задачу в очередь: без ожидания проверка
+        успевает прочитать состояние до того, как обработчик его поменяет.
+        """
+        done = threading.Event()
+
+        def wrapper() -> None:
+            try:
+                action()
+            finally:
+                done.set()
+
+        root_widget.after(0, wrapper)
+        if not done.wait(timeout=3.0):
+            raise AssertionError("действие в потоке Tk не выполнилось")
+
+    panel.set_level(0.7)
+    check("громкость микрофона принимается", True)
+
+    canvas = panel._canvas
+    check("холст панели есть", canvas is not None)
+    run_on_ui(lambda: press(panel, "stop", canvas))
+    check("кнопка «Готово» доходит до Python", clicks == ["done"], repr(clicks))
+    run_on_ui(lambda: press(panel, "abort", canvas))
+    check("крестик доходит до Python", clicks == ["done", "abort"], repr(clicks))
+    check("крестик помечает «без автоотправки»", panel.skip_auto_enter())
+    run_on_ui(panel._on_toggle_auto_enter)
+    check("переключатель автоотправки снимает отметку", not panel.skip_auto_enter())
+    run_on_ui(panel._on_toggle_auto_enter)
+    check("переключатель автоотправки ставит отметку", panel.skip_auto_enter())
+    run_on_ui(panel._on_toggle_auto_enter)
+    check("переключатель автоотправки снова снимает отметку", not panel.skip_auto_enter())
+
+    run_on_ui(panel._on_toggle_ai)
+    check("нажатие кнопки включает обработку", panel.ai_enabled())
+    check("наружу сказано о включении", toggles == [True], repr(toggles))
+    button = panel._ai_btn
+    check(
+        "надпись на кнопке сменилась",
+        button is not None and "вкл" not in button.text and "ИИ" in button.text,
+        button.text if button else "",
+    )
+    time.sleep(0.3)
+    check(
+        "ползунок ушёл во включённое",
+        button is not None and button.progress > 0.9,
+        button.progress if button else "",
+    )
+
+    run_on_ui(panel._on_toggle_ai)
+    check("повторное нажатие выключает", not panel.ai_enabled())
+    check("наружу сказано о выключении", toggles == [True, False], repr(toggles))
+    time.sleep(0.3)
+    check(
+        "надпись говорит про выключенное",
+        button is not None and "выкл" in button.text,
+        button.text if button else "",
+    )
+    check(
+        "ползунок ушёл в выключенное",
+        button is not None and button.progress < 0.1,
+        button.progress if button else "",
+    )
+
+    run_on_ui(panel._on_toggle_ai)
+    check("третье нажатие снова включает", panel.ai_enabled(), "переключатель залип")
+    check("наружу сказано о включении снова", toggles == [True, False, True], repr(toggles))
+
+    # Каждое нажатие обязано менять состояние. Раньше флагов было два, и
+    # каждое второе нажатие проходило вхолостую: человек жмёт, ничего не
+    # меняется, и это выглядит как залипшая кнопка.
+    for index in range(8):
+        before = panel.ai_enabled()
+        run_on_ui(panel._on_toggle_ai)
+        if panel.ai_enabled() == before:
+            check(f"нажатие {index + 4} не холостое", False, "состояние не изменилось")
+            break
+    else:
+        check("восемь нажатий подряд все рабочие", True)
+    check(
+        "наружу ушло по сообщению на каждое нажатие",
+        len(toggles) == 11,
+        str(len(toggles)),
+    )
+    check("кнопка вернулась во включённое", panel.ai_enabled())
+
+    panel.set_ai_default(True)
+    time.sleep(0.4)
+    check("настройка включает обработку", panel.ai_enabled())
+    check(
+        "ползунок показывает включённое",
+        button is not None and button.progress > 0.9,
+        button.progress if button else "",
+    )
+
+    panel.update("processing", "отправляю текст модели…")
+    time.sleep(0.4)
+    check(
+        "видно обработку через ИИ",
+        panel._state == "processing",
+        panel._state,
+    )
+
+    panel.reset_session()
+    time.sleep(0.4)
+    check("сброс вернул обработку к настройке", panel.ai_enabled())
+
+    # Вид и тема меняются без перезапуска: рисунок берёт цвета из палитры.
+    panel.set_theme("light")
+    time.sleep(0.4)
+    check("тема сменилась без перезапуска", panel.page_state()["theme"] == "light", panel.page_state()["theme"])
+    panel.set_theme("dark")
+    time.sleep(0.4)
+    check("тема вернулась", panel.page_state()["theme"] == "dark", panel.page_state()["theme"])
+    for style in ("glow", "smoke", "frost", "black"):
+        panel.set_style(style)
+        time.sleep(0.25)
+        check(f"вид {style} встал без перезапуска", panel.style == style, panel.style)
+    check("неизвестный вид не роняет панель", panel_style.normalize_style("чушь") == "black")
+    panel.set_style("чушь")
+    time.sleep(0.25)
+    check("опечатка в виде заменяется видом по умолчанию", panel.style == "black", panel.style)
+
+    # Две ступени хода: распознавание, затем обработка. Ступень видна не по
+    # подписи, а по заполнению — поэтому проверяется доля, а не текст.
+    panel.update("transcribing", "12 сек · ~8 сек осталось", 0.5)
+    time.sleep(0.5)
+    check(
+        "идёт первая ступень",
+        panel._progress > 0.4 and not panel._transcribe_done,
+        f"{panel._progress:.2f}",
+    )
+    panel.mark_transcribed()
+    panel.update("processing", "жду ответа модели…")
+    time.sleep(0.5)
+    check("первая ступень дозалилась", panel._shown > 0.9, f"{panel._shown:.2f}")
+    check("вторая ступень в работе", panel._transcribe_done and panel._ai_result is None)
+    check(
+        "вторая ступень пошла вперёд без вестей о доле",
+        panel._ai_shown > 0.02,
+        f"{panel._ai_shown:.2f}",
+    )
+    panel.set_ai_finished(recovered=True)
+    time.sleep(0.4)
+    check("вторая ступень заполнилась", panel._ai_result is True and panel._ai_shown == 1.0)
+
+    panel.update("idle")
+    time.sleep(0.3)
+    check("панель спрятана в простое", window is not None and not window.winfo_viewable())
+
+    panel.stop()
+    time.sleep(0.3)
 
 
 def test_ai_ready_mark() -> None:
-    """Отметка настраиваемости: панель говорит, когда обрабатывать нечем."""
+    """Отметка настраиваемости: кнопка говорит, когда обрабатывать нечем.
+
+    Человек включает обработку, диктовка вставляется необработанной, и без
+    отметки это выглядит как поломка. Кнопка обязана сказать, что не готово.
+    """
     print("отметка настройки ИИ:")
-    panel = StatusPanel(ai_enabled=False, ai_ready=False, style="black", theme="dark")
+    panel = StatusPanel(ai_enabled=False, ai_ready=False)
+    time.sleep(0.4)
+    button = panel._ai_btn
     try:
+        check("ползунок построен", button is not None)
         check("без ключа обработка не настроена", not panel.ai_ready())
+        check(
+            "на ползунке сказано про недонастройку",
+            button is not None and "не настроен" in button.text,
+            button.text if button else "",
+        )
         check(
             "подсказка называет место, где лежит ключ",
             "config.local.json" in panel.ai_hint(),
             panel.ai_hint(),
         )
-        # Панель без записи окно убирает с глаз, и страница тогда спит.
-        # Держим её в записи, чтобы спросить, что она помнит.
-        panel.update("recording")
-        wait_for(lambda: panel._shown_window, 6.0)
-        state = page_state(panel)
-        print("       вид страницы:", json.dumps(state, ensure_ascii=False)[:200])
-        check("страница знает про недонастройку", state.get("ai_ready") is False, repr(state))
+
         panel.set_ai_ready(True)
+        time.sleep(0.4)
         check("с ключом обработка настроена", panel.ai_ready())
+        check(
+            "надпись стала обычной",
+            button is not None and "не настроен" not in button.text,
+            button.text if button else "",
+        )
         check("подсказка пуста", panel.ai_hint() == "", panel.ai_hint())
+
         panel.set_ai_error("ключ отклонён")
-        check("ошибка запроса видна", "ключ отклонён" in panel.ai_hint(), panel.ai_hint())
-        check("страница получила ошибку", page_flag(panel, "ai_error") == "ключ отклонён")
+        time.sleep(0.4)
+        check(
+            "ошибка запроса видна на ползунке",
+            button is not None and "ошибка" in button.text,
+            button.text if button else "",
+        )
+        check(
+            "подсказка объясняет ошибку",
+            "ключ отклонён" in panel.ai_hint(),
+            panel.ai_hint(),
+        )
+
         panel.set_ai_error(None)
-        check("после удачи ошибка снята", panel.ai_hint() == "", panel.ai_hint())
-        panel.update("idle")
+        time.sleep(0.4)
+        check(
+            "после удачной обработки ошибка снята",
+            button is not None and "ошибка" not in button.text,
+            button.text if button else "",
+        )
+
+        panel.set_ai_ready(False)
+        panel.set_ai_default(True)
+        time.sleep(0.4)
+        check("без ключа ползунок снова предупреждает", "не настроен" in (button.text if button else ""))
     finally:
         panel.stop()
-    time.sleep(0.3)
+        time.sleep(0.3)
 
 
-# --- окно промпта ------------------------------------------------------------
+def test_panel_failure_is_logged() -> None:
+    """Панель не поднялась — причина в журнале, приложение живо.
 
-# Проверка окна промпта живёт в отдельном процессе: его перерисовка требует
-# времени, а панель после остановки может забрать процесс окон с собой.
+    Окно панели строится в своём потоке. Исключение из него питоном
+    печатается как поломка процесса. Проверяем, что причина уходит в журнал
+    строкой и что приложение продолжает работать без панели.
+    """
+    print("сбой панели:")
+    global _PANEL_CANVAS
+    import dictation.status_panel as status_panel_module  # noqa: PLC0415
 
+    messages: list[str] = []
+    original_fonts = status_panel_module._fonts
+    original_logger = status_panel_module._log
 
-def test_prompt_editor() -> None:
-    print("окно промпта:")
-    from dictation.prompt_editor import PromptEditor
+    def broken_fonts(*_args, **_kwargs):
+        raise RuntimeError("шрифты не нашлись")
 
-    saved: list[str] = []
-    stored = {"value": "исходный промпт"}
-    editor = PromptEditor(
-        load=lambda: stored["value"],
-        save=lambda text: (saved.append(text), stored.update(value=text)),
-    )
+    status_panel_module.set_logger(messages.append)
+    status_panel_module._fonts = broken_fonts
     try:
-        check("страница промпта поднялась", editor._page.ok)
-        editor.open()
-        check("окно промпта считает себя открытым", editor.is_open())
-
-        text = page_text(editor)
-        check("в поле доехал текущий промпт", bool(text) and text.startswith("исходный промпт"), repr(text))
-
-        editor._on_restore()
-        check("восстановление записало дефолт", saved and saved[-1].strip() == DEFAULT_PROMPT.strip(), repr(saved[-1:]))
-        text = page_text(editor)
-        check("восстановление видно в поле", bool(text) and text.strip() == DEFAULT_PROMPT.strip(), repr(text[:40]))
-
-        editor._on_save("мой текст")
-        check("сохранение записало правку", saved[-1].strip() == "мой текст", repr(saved[-1:]))
-        hint = page_hint(editor)
-        check("подсказка о сохранении показана", "Сохранено" in hint, hint)
-
-        before = len(saved)
-        editor._on_save("   ")
-        check("пустой промпт не сохраняется", len(saved) == before, str(len(saved)))
-        hint = page_hint(editor)
-        check("про пустой промпт сказано", "не сохраняется" in hint, hint)
-
-        editor.close()
-        check("закрытое окно промпта считает себя закрытым", not editor.is_open())
+        panel = status_panel_module.StatusPanel(ai_enabled=False)
+        check("панель отвечает, что окна нет", panel._root is None)
+        check(
+            "причина сбоя записана в журнал",
+            any("не поднялась" in message for message in messages),
+            repr(messages),
+        )
+        panel.update("recording", "проверка")
+        panel.set_theme("light")
+        panel.set_style("frost")
+        panel.set_ai_default(True)
+        panel.set_ai_ready(False)
+        panel.set_ai_error("проверка")
+        panel.mark_transcribed()
+        panel.set_ai_finished(False)
+        panel.set_level(0.4)
+        panel.reset_session()
+        print("       состояние без окна:", panel.page_state()["activity"], panel.page_state()["style"])
+        check("запросы без окна не роняют приложение", True)
+        panel.stop()
     finally:
-        editor.stop()
-    time.sleep(0.3)
+        status_panel_module._fonts = original_fonts
+        status_panel_module._log = original_logger
 
 
-# --- связь со страницей ------------------------------------------------------
+def press(panel: StatusPanel, name: str, canvas) -> None:
+    """Нажать кнопку панели в потоке её окна так, как это делает человек.
 
-
-def pane_reachable(panel: StatusPanel) -> bool:
-    """Дверь окна отвечает: страница жива и готова принять вызов."""
-    return panel._page.ok and web_lane._lane is not None
-
-
-def press(panel: StatusPanel, name: str, value: object) -> None:
-    """Нажать то, что человек нажимает на странице, в обход самой страницы.
-
-    Страница зовёт дверь окна; здесь зовём ту же дверь напрямую, чтобы не
-    ждать, пока движок отрисует кнопку.
+    Живой клик приходит событием мыши: панель сама смотрит, куда он попал,
+    и зовёт свой обработчик. Здесь событие такое же, поэтому проверяется
+    настоящий путь нажатия, а не вызов обработчика в обход.
     """
-    handler = web_lane._dispatchers.get(panel._page.uid)
-    if handler is not None:
-        handler(name, value)
+    box = panel._hit_stop if name == "stop" else panel._hit_abort
+    panel._on_mouse_down(_click(box, canvas))
 
 
-def page_state(panel: StatusPanel) -> dict:
-    """Всё, что страница помнит про состояние, одним ответом.
+def _click(box: tuple[int, int, int, int] | None, canvas):
+    """Нажатие по середине области панели: так же приходит живой клик."""
+    if box is None:
+        raise AssertionError("у панели нет области для этого нажатия")
+    left, top, right, bottom = box
 
-    Первый вопрос может застать страницу до первой отрисовки: окно к этому
-    времени ещё не пустило её в работу. Поэтому спрашиваем до ответа или до
-    срока, а не однажды.
+    class _Event:
+        x = (left + right) // 2
+        y = (top + bottom) // 2
+        x_root = x
+        y_root = y
+        widget = canvas
+
+    return _Event()
+
+
+_SECOND_PANEL_CODE = None
+
+
+def run_panel_checks() -> int:
+    """Проверки одной панели: запускаются в отдельном процессе.
+
+    Корень Tk у процесса один; второй корень делит с первым картинки и
+    стартует не всегда. Поэтому каждая проверка панели идёт своим процессом.
     """
-    script = "window.DSH && window.DSH.state ? JSON.stringify(window.DSH.state()) : null"
-    deadline = time.monotonic() + 8.0
-    while time.monotonic() < deadline:
-        value = panel._page.ask_value(script)
-        if value and value != "null":
-            return json.loads(value)
-        time.sleep(0.1)
-    return {}
-
-
-def page_flag(panel: StatusPanel, name: str) -> object:
-    """Что страница знает про состояние: спросить её напрямую.
-
-    Так проверка видит не то, что Python отправил, а то, что страница
-    действительно получила и запомнила. Страница обновляется по кадру,
-    поэтому спрашиваем до ответа или до срока.
-    """
-    deadline = time.monotonic() + 6.0
-    value: object = None
-    while time.monotonic() < deadline:
-        state = page_state(panel)
-        if state:
-            value = state.get(name)
-            if value is not None:
-                return value
-        time.sleep(0.1)
-    return value
-
-
-def page_text(editor) -> str:
-    return str(editor._page.ask_value("window.EX ? window.EX.text() : ''") or "")
-
-
-def page_hint(editor) -> str:
-    return str(editor._page.ask_value("window.EX ? window.EX.hint() : ''") or "")
-
-
-# --- запуск -------------------------------------------------------------------
-
-
-def run_checks_with_panel() -> int:
-    events: list[tuple[str, object]] = []
-    # Сначала отметка настройки: панель живёт в том же процессе окон, что и
-    # у остановленной панели, и после её закрытия страница уже не отвечает.
+    test_status_panel()
     test_ai_ready_mark()
-    test_panel(events)
     return 1 if FAILURES else 0
 
 
-def run_checks_with_editor() -> int:
+def main() -> int:
     test_prompt_editor()
-    return 1 if FAILURES else 0
+    # Панели проверяются в отдельных процессах: у процесса один корень Tk.
+    for run_number in (1, 2):
+        status = run_panel_checks_subprocess()
+        if status != 0:
+            check(f"проверка панели, процесс {run_number}", False, str(status))
+        else:
+            check(f"проверка панели, процесс {run_number}", True)
+    print()
+    if FAILURES:
+        print(f"ПРОВАЛЕНО: {len(FAILURES)}")
+        for name in FAILURES:
+            print(f"  - {name}")
+        return 1
+    print("Всё прошло.")
+    return 0
 
 
-def run_in_process(mode: str) -> int:
+def run_panel_checks_subprocess() -> int:
     import subprocess  # noqa: PLC0415
 
     root = Path(__file__).resolve().parent.parent
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), mode],
+        [sys.executable, str(Path(__file__).resolve()), "--panel"],
         cwd=str(root),
         capture_output=True,
         text=True,
@@ -305,33 +534,7 @@ def run_in_process(mode: str) -> int:
     return result.returncode
 
 
-def main() -> int:
-    print("движок окон:", "есть" if web_lane.available() else "нет")
-    status = run_in_process("--panel")
-    check("проверка панели", status == 0, str(status))
-    status = run_in_process("--editor")
-    check("проверка окна промпта", status == 0, str(status))
-    print()
-    if FAILURES:
-        print(f"ПРОВАЛЕНО: {len(FAILURES)}")
-        for name in FAILURES:
-            print(f"  - {name}")
-        return 1
-    print("Всё прошло.")
-    return 0
-
-
 if __name__ == "__main__":
-    # Журнал проверки бывает перенаправлен в файл, а у консоли Windows
-    # кодировка не всегда русская: без этого строки с русскими буквами
-    # роняют саму проверку на печати.
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
     if "--panel" in sys.argv:
-        raise SystemExit(run_checks_with_panel())
-    if "--editor" in sys.argv:
-        raise SystemExit(run_checks_with_editor())
+        raise SystemExit(run_panel_checks())
     raise SystemExit(main())

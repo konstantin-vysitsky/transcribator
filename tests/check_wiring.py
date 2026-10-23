@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -159,9 +160,18 @@ def test_panel_click_is_saved() -> None:
             saved.append(enabled)
 
         panel = StatusPanel(on_toggle_ai=on_toggle_and_record, ai_enabled=False)
-        # Нажатие без окна: так же, как кнопка страницы, когда окно ещё не
-        # поднялось. Проверяется, что нажатие доходит до настроек.
-        panel._on_toggle_ai()
+        # Нажатие ставим в очередь потока окна и ждём, пока оно отработает:
+        # без ожидания проверка прочла бы старое состояние.
+        root = panel._root
+        assert root is not None
+        pressed = threading.Event()
+
+        def _press() -> None:
+            panel._on_toggle_ai()
+            pressed.set()
+
+        root.after(0, _press)
+        pressed.wait(timeout=3.0)
         for _ in range(50):
             if saved:
                 break
@@ -173,7 +183,13 @@ def test_panel_click_is_saved() -> None:
 
         again = StatusPanel(ai_enabled=config.load_config()["ai_enabled"])
         check("после перезапуска обработка включена", again.ai_enabled())
-        again._on_toggle_ai()
+        again_root = again._root
+        assert again_root is not None
+        again_root.after(0, again._on_toggle_ai)
+        for _ in range(50):
+            if not again.ai_enabled():
+                break
+            time.sleep(0.05)
         check("кнопка выключила", not again.ai_enabled())
         again.stop()
     finally:
