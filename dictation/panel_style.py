@@ -34,14 +34,6 @@ THEME_LABELS: Mapping[str, str] = {
     "dark": "Тёмная",
     "light": "Светлая",
 }
-# Размер панели: 0 — по масштабу экрана, иначе ровно число.
-SCALE_LABELS: Mapping[str, float] = {
-    "Как в системе": 0.0,
-    "1 · как в макете": 1.0,
-    "2 · вдвое крупнее": 2.0,
-    "3 · втрое крупнее": 3.0,
-}
-
 _PALETTES: dict[tuple[str, str], dict[str, object]] = {
     # ---------- 1 · Тихое свечение: графит, цвет только у точки и «Готово» ---
     ("glow", "dark"): {
@@ -455,15 +447,4 @@ def apply_theme(value: object) -> str:
     return theme
 
 
-def apply_scale(value: object) -> float:
-    """Записать размер панели в `config.json` и вернуть принятый размер."""
-    from dictation import config  # noqa: PLC0415
 
-    try:
-        scale = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        scale = 0.0
-    data = config.load_config()
-    data["panel_scale"] = scale
-    config.save_config(data)
-    return float(config.load_config()["panel_scale"])

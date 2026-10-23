@@ -24,11 +24,8 @@ def capture(
     theme: str = "auto",
     state: str = "recording",
     style: str | None = None,
-    scale: float = 0.0,
 ) -> Path:
-    panel = StatusPanel(
-        ai_enabled=True, ai_ready=True, style=style, theme=theme, scale=scale
-    )
+    panel = StatusPanel(ai_enabled=True, ai_ready=True, style=style, theme=theme)
     panel.update(state, "12 из 34 с", 0.38)
 
     window = panel._window
@@ -138,5 +135,4 @@ if __name__ == "__main__":
     theme = sys.argv[2] if len(sys.argv) > 2 else "auto"
     state = sys.argv[3] if len(sys.argv) > 3 else "recording"
     style = sys.argv[4] if len(sys.argv) > 4 else None
-    scale = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
-    capture(label, theme, state, style, scale)
+    capture(label, theme, state, style)

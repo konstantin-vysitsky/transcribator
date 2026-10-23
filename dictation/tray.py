@@ -145,7 +145,6 @@ class TrayApp:
         self._autostart_enabled = autostart.is_autostart_enabled()
         self._panel_style = panel_style.normalize_style(cfg.get("panel_style"))
         self._panel_theme = panel_style.normalize_theme(cfg.get("panel_theme"))
-        self._panel_scale = float(cfg.get("panel_scale") or 0.0)
         self._status_panel = StatusPanel(
             on_abort=self._handle_abort,
             on_stop_recording=self._handle_stop_recording,
@@ -154,7 +153,6 @@ class TrayApp:
             ai_ready=bool(str(cfg.get("ai_api_key", "")).strip()),
             style=self._panel_style,
             theme=self._panel_theme,
-            scale=self._panel_scale,
         )
         self._prompt_editor: PromptEditor | None = None
 
@@ -455,20 +453,6 @@ class TrayApp:
                 ),
             ),
             pystray.MenuItem(
-                "Размер панели",
-                pystray.Menu(
-                    *[
-                        pystray.MenuItem(
-                            label,
-                            self._select_panel_scale(value),
-                            checked=lambda _item, v=value: abs(self._panel_scale - v) < 0.01,
-                            radio=True,
-                        )
-                        for label, value in panel_style.SCALE_LABELS.items()
-                    ]
-                ),
-            ),
-            pystray.MenuItem(
                 "Запуск с Windows",
                 self._toggle_autostart,
                 checked=lambda _item: self._autostart_enabled,
@@ -499,18 +483,6 @@ class TrayApp:
                 return
             self._panel_theme = panel_style.apply_theme(theme)
             self._status_panel.set_theme(self._panel_theme)
-            self._refresh_menu()
-
-        return _handler
-
-    def _select_panel_scale(self, scale: float) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
-        """Размер панели: мелкий текст на большом экране уменьшает и клетку."""
-
-        def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-            if abs(self._panel_scale - scale) < 0.01:
-                return
-            self._panel_scale = panel_style.apply_scale(scale)
-            self._status_panel.set_scale(self._panel_scale)
             self._refresh_menu()
 
         return _handler
