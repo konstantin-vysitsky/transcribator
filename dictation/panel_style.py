@@ -45,8 +45,8 @@ SCALE_LABELS: Mapping[str, float] = {
 _PALETTES: dict[tuple[str, str], dict[str, object]] = {
     # ---------- 1 · Тихое свечение: графит, цвет только у точки и «Готово» ---
     ("glow", "dark"): {
-        "bg": "#13171de6",
-        "border": "#2b323cf0",
+        "bg": "#13171d",
+        "border": "#2b323c",
         "top_glow": "#1b2330",
         "title": "#eef1f5",
         "title_font": ("Segoe UI", 10, "bold"),
@@ -83,8 +83,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
         "sw_on_knob": "#ffffff",
     },
     ("glow", "light"): {
-        "bg": "#f4f7fbe6",
-        "border": "#d3dbe5f0",
+        "bg": "#f4f7fb",
+        "border": "#d3dbe5",
         "top_glow": "#e8f0fa",
         "title": "#1a2430",
         "title_font": ("Segoe UI", 10, "bold"),
@@ -124,8 +124,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
     # Светлая тема — тот же плотный корпус, но графитовый: чёрное стекло
     # остаётся тёмным, и два вида не сливаются в один серый.
     ("black", "dark"): {
-        "bg": "#0b0e13f2",
-        "border": "#26303cf0",
+        "bg": "#0b0e13",
+        "border": "#26303c",
         "top_glow": "#1a2734",
         "title": "#f7f9fc",
         "title_font": ("Segoe UI", 10, "bold"),
@@ -162,8 +162,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
         "sw_on_knob": "#ffffff",
     },
     ("black", "light"): {
-        "bg": "#5b6675f0",
-        "border": "#7d8a9af0",
+        "bg": "#5b6675",
+        "border": "#7d8a9a",
         "top_glow": "#6b7787",
         "title": "#ffffff",
         "title_font": ("Segoe UI", 10, "bold"),
@@ -201,8 +201,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
     },
     # ---------- 3 · Дымчатое с акцентом: кромка, два цвета ползунков --------
     ("smoke", "dark"): {
-        "bg": "#17131fe6",
-        "border": "#332c44f0",
+        "bg": "#17131f",
+        "border": "#332c44",
         "top_glow": "#211a2e",
         "accent_left": "#ff8a66",
         "accent_right": "#9d7bff",
@@ -248,8 +248,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
         "sw2_on_knob": "#ffffff",
     },
     ("smoke", "light"): {
-        "bg": "#faf7fde6",
-        "border": "#ded7eaf0",
+        "bg": "#faf7fd",
+        "border": "#ded7ea",
         "top_glow": "#f1ecf8",
         "accent_left": "#f07a52",
         "accent_right": "#8266e8",
@@ -295,8 +295,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
     },
     # ---------- 4 · Светлое стекло: белое, сильное закругление -------------
     ("frost", "light"): {
-        "bg": "#fffffff0",
-        "border": "#e2e8eff0",
+        "bg": "#ffffff",
+        "border": "#e2e8ef",
         "top_glow": "#f6f9fc",
         "title": "#1d2733",
         "title_font": ("Segoe UI", 10, "bold"),
@@ -333,8 +333,8 @@ _PALETTES: dict[tuple[str, str], dict[str, object]] = {
         "sw_on_knob": "#ffffff",
     },
     ("frost", "dark"): {
-        "bg": "#161a20f2",
-        "border": "#2a3038f0",
+        "bg": "#161a20",
+        "border": "#2a3038",
         "top_glow": "#1f262f",
         "title": "#eef2f6",
         "title_font": ("Segoe UI", 10, "bold"),
