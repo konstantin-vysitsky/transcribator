@@ -9,12 +9,11 @@
   "sound_feedback": true,
   "min_utterance_s": 0.3,
   "autostart": true,
-  "ai_enabled": true,
+  "ai_enabled": false,
   "ai_base_url": "https://api.deepseek.com/v1",
-  "ai_api_key": "",
   "ai_model": "deepseek-flash",
   "ai_timeout_s": 30.0,
   "panel_style": "black",
-  "panel_theme": "auto",
+  "panel_theme": "dark",
   "panel_scale": 0.0
 }
