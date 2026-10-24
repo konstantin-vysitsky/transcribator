@@ -9,12 +9,13 @@ from typing import Literal
 
 import pyperclip
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from dictation import autostart, config, panel_style
 from dictation.prompt import load_prompt, save_prompt
 from dictation.prompt_editor import PromptEditor
 from dictation.status_panel import PAGE_STYLES, StatusPanel
+from dictation.tray_icon import make_icon
 
 ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 _HISTORY_SIZE = 3
@@ -22,61 +23,8 @@ _PREVIEW_LEN = 48
 
 
 def _make_icon(size: int = 64) -> Image.Image:
-    """Микрофон: капсула, дужка, стойка и плита на ней.
-
-    Линии не тоньше одной точки на крошечной иконке: в трее она
-    показывается в 16 точек. Тонкая стойка там пропадает между дужкой и
-    плитой, и микрофон остаётся без ножки — горизонтальные дужка и плита
-    есть, а вертикали между ними нет.
-    """
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    blue = (66, 133, 244, 255)
-    # Толщину считаем от 16 точек, а не от роста картинки: при крупной
-    # картинке линия выходит долей точки и на показе исчезает.
-    stroke = max(1, round(size * 2 / 16))
-    cx = size / 2
-    pad = max(1, round(size / 16))
-    body_w = max(6, round(size * 0.4))
-    body_top = pad
-    body_bottom = round(size * 0.5)
-    draw.rounded_rectangle(
-        (cx - body_w / 2, body_top, cx + body_w / 2, body_bottom),
-        radius=body_w / 2,
-        fill=blue,
-    )
-    # Дужка вокруг капсулы: полукруг от левого бока к правому, ноги дужки
-    # сходятся к стойке. Концы подняты выше середины капсулы: там её бока,
-    # и дужка читается скобкой вокруг капсулы, а не щупальцами внизу.
-    cup = max(4, round(size * 0.34))
-    arms_bottom = round(size * 0.78)
-    hoop_top = body_bottom - cup * 1.1
-    draw.arc(
-        (cx - cup, hoop_top, cx + cup, hoop_top + cup * 2),
-        start=0,
-        end=180,
-        fill=blue,
-        width=stroke,
-    )
-    cup_x = pad + stroke / 2
-    # Концы дужки: короткие вертикальные плечи от дуги вниз, до середины
-    # между дугой и низом картинки. До самого низа их не тянуть: дужка
-    # слилась бы с плитой в одну широкую блямбу.
-    draw.rectangle((cup_x, body_bottom, cup_x + stroke, arms_bottom), fill=blue)
-    draw.rectangle((size - cup_x - stroke, body_bottom, size - cup_x, arms_bottom), fill=blue)
-    # Стойка от низа дужки до плиты: без неё микрофон висит в воздухе.
-    draw.rectangle(
-        (cx - stroke / 2, arms_bottom - stroke, cx + stroke / 2, size - pad + 1),
-        fill=blue,
-    )
-    # Плита: шире стойки, чтобы микрофон стоял на чём-то прочном.
-    plate_h = max(stroke, round(size * 0.09))
-    half = max(stroke, round(size * 0.22))
-    draw.rectangle(
-        (cx - half, size - pad - plate_h + 1, cx + half, size - pad + 1),
-        fill=blue,
-    )
-    return img
+    """Значок трея: готовый рисунок микрофона (см. `tray_icon`)."""
+    return make_icon(size)
 
 
 class _LeftClickIcon(pystray.Icon):
