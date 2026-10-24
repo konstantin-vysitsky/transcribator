@@ -905,20 +905,32 @@ class _TkStatusPanel:
         else:
             # Под чертой в этих состояниях пусто, поэтому и черты нет: без
             # двух промежутков, которыми она отбивалась от строк, окно ниже.
-            # Две ступени хода. У второй сверху и снизу есть место под мягкое
-            # пятно: без него свечение срезалось бы краем полосы.
+            # Ступени хода друг под другом. Ступень обработки заводится, только
+            # когда она показана: выключенная обработка молчит совсем, и окно
+            # не держит под неё пустоту.
             clear = self._spec(_STAGE_CLEAR)
-            gap = self._spec(3)
             bar_h = self._spec(_BAR_H)
+            gap = self._spec(2)
             out["stage1_top"] = y + clear
-            out["stage2_top"] = y + clear + bar_h + gap + clear * 2
+            out["stage2_top"] = out["stage1_top"] + bar_h + gap
             out["bar_h"] = bar_h
             out["progress_top"] = out["stage1_top"]
             out["progress_h"] = bar_h
-            out["detail_top"] = out["stage2_top"] + bar_h + clear + self._spec(6)
+            lowest = out["stage2_top"] if self._show_stage2() else out["stage1_top"]
+            out["detail_top"] = lowest + bar_h + self._spec(10)
             out["detail_h"] = self._spec(16) if self._detail else 0
             out["bottom"] = out["detail_top"] + out["detail_h"] + pad_y
         return out
+
+    def _show_stage2(self) -> bool:
+        """Показывать ли ступень обработки.
+
+        Выключенная обработка не имеет хода, и полоса под неё — пустая
+        закорючка. Показываем ступень, только если обработка включена или
+        уже есть её итог: человек должен увидеть перечёркнутую ступень, когда
+        модель не ответила, даже если ползунок успели выключить.
+        """
+        return self._ai_enabled or self._ai_result is not None
 
     def _render(self) -> None:
         """Собрать рисунок панели и показать уменьшенным.
@@ -1131,12 +1143,13 @@ class _TkStatusPanel:
             self._reposition()
 
     def _draw_progress(self, d: ImageDraw.ImageDraw, lay: dict[str, int]) -> None:
-        """Две ступени хода работы: распознавание и обработка через ИИ.
+        """Ступени хода работы: распознавание и, если включена, обработка.
 
         Ступени различаются меткой перед полосой, а не порядком: квадрат с
         числом — распознавание, ромб с блеском — ИИ. Без метки две полоски
-        друг под другом читались бы как одна длинная. Пока ступень не
-        началась, она стоит погашенной: видно, что впереди ещё работа.
+        друг под другом читались бы как одна длинная. Ступень без итога стоит
+        ровно такой же, как соседняя, только пустой: на её фоне полоса её
+        хода видна целиком.
         """
         px = lay["pad_x"]
         bar_w = lay["content_w"]
@@ -1145,19 +1158,16 @@ class _TkStatusPanel:
         note = ""
         if self._ai_result is not None:
             note = "готово" if self._ai_result else "без обработки"
-        elif self._transcribe_done:
-            note = _seconds_note(self._ai_elapsed)
 
-        stages = [
-            ("1", self._shown, {"active": True}, "готово" if self._transcribe_done else ""),
-            ("ai", self._ai_shown,
-             {"active": ai_on, "done": self._ai_result is True,
-              "failed": self._ai_result is False, "doc": self._state == "processing"},
-             note),
-        ]
-        for index, (mark, value, mode, tail) in enumerate(stages):
-            top = lay["stage1_top"] if index == 0 else lay["stage2_top"]
-            self._stage(d, px, top, bar_w, bar_h, mark, value, mode, tail)
+        self._stage(d, px, lay["stage1_top"], bar_w, bar_h, "1", self._shown,
+                    {"active": True, "done": self._transcribe_done},
+                    "готово" if self._transcribe_done else "")
+        if self._show_stage2():
+            self._stage(d, px, lay["stage2_top"], bar_w, bar_h, "ai", self._ai_shown,
+                        {"active": ai_on, "done": self._ai_result is True,
+                         "failed": self._ai_result is False,
+                         "doc": self._state == "processing"},
+                        note)
 
     def _stage(
         self,
@@ -1171,88 +1181,77 @@ class _TkStatusPanel:
         mode: dict[str, bool],
         tail: str,
     ) -> None:
-        """Одна ступень: метка, полоса, подпись справа."""
+        """Одна ступень: метка, полоса, подпись справа. Середина у ряда одна."""
         s = self._ss
         pal = self._palette
         fonts = self._fonts
         active = bool(mode.get("active"))
         done = bool(mode.get("done"))
         failed = bool(mode.get("failed"))
+        doc = bool(mode.get("doc", False))
         frac = max(0.0, min(1.0, float(value) if active else 0.0))
         if done:
             frac = 1.0
 
-        mark_box = self._spec(16)
+        mark_box = self._spec(14)
         gap = self._spec(8)
         bar_x = px + mark_box + gap
+        cy = top + height // 2
         tail_w = 0
         if tail:
             face = fonts.tiny[0]
             tail_w = int(_text_size(face, tail)[0] / s) + self._spec(8)
         bar_w = max(self._spec(40), width - mark_box - gap - tail_w)
-        cy = top + height // 2
 
-        # Метка ступени: квадрат с числом у первой, ромб у второй.
+        # Метка ступени: квадрат с числом у первой, ромб у второй. В работе
+        # и у перечёркнутой — одинаковое место и одинаковый размер.
         if mark == "1" or failed:
             _rounded(d, (px * s, (cy - mark_box // 2) * s, (px + mark_box) * s,
-                         (cy + mark_box // 2) * s), self._spec(5) * s,
+                         (cy + mark_box // 2) * s), self._spec(4) * s,
                      fill=str(pal["stage_mark"]))
             self._text(d, (px * s) + (mark_box * s) // 2, cy * s,
                        "\u2715" if failed else mark, fonts.tiny,
                        str(pal["dot"]) if failed else str(pal["title"]), "mm")
         else:
-            diamond = self._diamond(mark_box, str(pal["stage_mark"]))
+            # Ромб у включённой ступени яркий, у невключённой — того же цвета,
+            # что её полоса: он часть метки, а не реклама впереди.
+            diamond = self._diamond(mark_box, str(pal["stage_mark"]) if active
+                                    else str(pal["bar_bg"]))
             if diamond is not None:
-                d._image.paste(diamond, ((px + mark_box // 2) * s, cy * s), diamond)
+                side = diamond.size[0]
+                d._image.paste(diamond, (int((px + (mark_box * s - side) / 2)),
+                                         int(cy * s - side / 2)), diamond)
 
-        # Полоса: лоток, заливка, мягкое пятно у её конца и бегущий отсвет.
+        # Полоса: лоток, заливка и мягкое пятно у её конца. Отсвет бежит,
+        # только пока ступень идёт: собранная ступень не должна звать.
         _rounded(d, (bar_x * s, top * s, (bar_x + bar_w) * s, (top + height) * s),
                  height * s // 2, fill=str(pal["bar_bg"]))
         fill_w = max(height, frac * bar_w) if frac > 0 else 0.0
-        doc = bool(mode.get("doc", False))
         bar_color = self._doc_color() if doc else self._bar_color(
             fraction=frac, done=done, failed=failed)
-        bar_halo = self._doc_halo() if doc else str(pal["bar_halo"])
         if fill_w:
-            # Пятно лежит на лотке, заливка — поверх пятна: иначе ореол
-            # закрасил бы конец полосы и она оборвалась бы на просвет.
+            # Пятно лежит на лотке, заливка — поверх: иначе ореол закрасил бы
+            # конец полосы и она оборвалась бы на просвет. Заливка начинается
+            # вплотную к лотку и кончается ровно долей: без пятна и без
+            # заглушки по краям оба конца выглядят одинаково.
             spot, at = self._stage_glow(
                 int(bar_x + fill_w - height // 2), int(cy),
-                height // 2 + self._spec(4), bar_halo, 0.9 if doc else 0.42,
+                height // 2 + self._spec(3), str(pal["bar_halo"]), 0.42,
             )
             d._image.paste(spot, at, spot)
             _rounded(d, (bar_x * s, top * s, (bar_x + fill_w) * s, (top + height) * s),
                      height * s // 2, fill=bar_color)
-            if doc and frac < 0.995:
-                self._sheen(d, bar_x, top, fill_w, height,
-                            self._spec(_SHEEN_STRIP))
-            if not doc:
-                self._dim_stage(d, bar_x, top, bar_w, height)
+            if doc and fill_w > height:
+                self._sheen(d, bar_x, top, fill_w, height, self._spec(_SHEEN_STRIP))
         if tail:
             tx = bar_x + bar_w + self._spec(8)
             self._text(d, tx * s, cy * s, tail, fonts.tiny,
                        str(pal["dot"]) if failed else str(pal["title"]), "lm")
 
-    def _dim_stage(self, d: ImageDraw.ImageDraw, bar_x: int, top: int,
-                   bar_w: int, height: int) -> None:
-        """Притушить погашенную ступень: не начавшаяся работа не должна звать."""
-        s = self._ss
-        bg = _rgba(str(self._palette["bg"]), 0.62)
-        left = bar_x - self._spec(22)
-        right = bar_x + bar_w + self._spec(4)
-        dim = Image.new("RGBA", ((right - left) * s, (height + 4) * s), (0, 0, 0, 0))
-        dd = ImageDraw.Draw(dim)
-        dd.rectangle((0, 0, (right - left) * s, (height + 4) * s), fill=bg)
-        d._image.paste(dim, (left * s, (top - 2) * s), dim)
-
     def _doc_color(self) -> str:
         """Цвет второй ступени: узнаётся по цвету, без чтения подписи."""
         pal = self._palette
         return mix(str(pal["bar_fill"]), str(pal.get("dot", pal["bar_fill"])), 0.28)
-
-    def _doc_halo(self) -> str:
-        return mix(str(self._palette.get("bar_halo", "#ffffff")),
-                   str(self._palette.get("dot", "#ffffff")), 0.35)
 
     def _bar_color(self, *, fraction: float, done: bool, failed: bool) -> str:
         """Цвет заливки: две ступени узнаются по цвету, а не по подписи."""
@@ -1365,7 +1364,7 @@ class _TkStatusPanel:
             return None
         img = Image.new("RGBA", (side, side), (0, 0, 0, 0))
         dd = ImageDraw.Draw(img)
-        pad = 1 * s
+        pad = 2 * s
         dd.polygon(
             [(side / 2, pad), (side - pad, side / 2), (side / 2, side - pad), (pad, side / 2)],
             fill=color,
@@ -2133,7 +2132,7 @@ class _TkStatusPanel:
         note = ""
         if self._ai_result is not None:
             note = "готово" if self._ai_result else "без обработки"
-        elif self._transcribe_done:
+        elif self._ai_enabled and self._transcribe_done:
             note = _seconds_note(self._ai_elapsed)
         return {
             "mode": "work" if state in ("transcribing", "processing") else "recording",
