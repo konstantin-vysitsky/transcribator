@@ -493,9 +493,9 @@ class _GlassWindow:
             self.reason = f"окно не нашлось: {error}"
             return False
         self._installed = True
-        if not _transparency_on():
-            self.reason = "прозрачность выключена в Windows"
-            return False
+        # Прозрачность в оформлении Windows панели не нужна: она плотная.
+        # Прежняя проверка здесь оставляла окно обычным, с рамкой Windows, а
+        # рамка и приносила справа полосу прокрутки.
 
         # Панель плотная. Слоёное окно ей не годится: на нём Windows рисует
         # из окна одно место, и на экране остаётся пустой прямоугольник —
@@ -530,23 +530,17 @@ class _GlassWindow:
         user32.SetWindowLongW.argtypes = [w.HWND, ctypes.c_int, ctypes.c_long]
 
     def reapply(self) -> bool:
-        """Снять с окна полупрозрачность после показа: Tk её возвращает.
+        """Поставить окну «без рамки и без прозрачности» после показа.
 
-        Слоёное окно на этой системе показывает из панели только место под
-        рисунок. После каждого показа окна стиль ставится заново, чтобы
-        полоса прозрачности в него не вернулась.
+        Показанное окно Tk одевает в рамку Windows и может сделать слоёным.
+        Рамка держит справа 17 точек под полосу прокрутки, и на панели
+        появляется голая белая полоса: рисунок туда не доходит. Поэтому
+        после каждого показа окно снова просят жить без рамки и без
+        прозрачности, а размер ставится после этого.
         """
         if not self.ok:
             return False
-        try:
-            window = self._wintypes.HWND(self._hwnd)
-            self._user32.SetWindowLongW(window, -20,
-                                        self._user32.GetWindowLongW(window, -20) & ~0x00080000)
-            self._user32.SetWindowLongW(window, -16,
-                                        self._user32.GetWindowLongW(window, -16))
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        return self._apply()
 
     def _apply(self) -> bool:
         w = self._wintypes
@@ -2087,12 +2081,24 @@ class _TkStatusPanel:
         # Окно и размер ставим вместе с показом: одно окно в процессе — обычный
         # случай, второе (в проверке) иначе вышло бы без места на экране.
         self._window.deiconify()
+        # Показанное окно Tk одевает в рамку Windows и сама же просит её
+        # снять: рамка держит справа 17 точек под полосу прокрутки. Между
+        # двумя просьбами окно не перерисовывается, иначе размер затвердеет
+        # вместе с рамкой и точка-другая останется белой.
+        try:
+            self._window.overrideredirect(False)
+            self._window.update_idletasks()
+            self._window.overrideredirect(True)
+        except tk.TclError:
+            pass
+        self._window.geometry(f"{self._size[0]}x{self._size[1]}")
+        self._window.update_idletasks()
         self._window.geometry(f"{self._size[0]}x{self._size[1]}")
         self._reposition()
-        self._window.lift()
-        # Показанное окно Tk снова делает слоёным. Панель плотная — значит
-        # и окно плотное: снимаем прозрачность и рисуем картинку снова.
+        # Без рамки и без прозрачности: панель плотная и занимает все свои точки.
         self._glass.reapply()
+        self._window.lift()
+        self._render()
         self._request_render()
 
     def update(
