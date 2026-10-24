@@ -1083,7 +1083,8 @@ class _TkStatusPanel:
             self._draw_progress(d, lay)
             if self._detail:
                 self._text(d, px * s, lay["detail_top"] * s, self._detail, fonts.small,
-                           mix(str(pal["title"]), bg, 0.45), "la")
+                           mix(str(pal["title"]), bg, 0.45), "la",
+                           max_width=(lay["content_w"] - self._spec(4)) * s)
 
         small = img.resize((w, h), Image.LANCZOS)
         self._image = small
@@ -1481,7 +1482,7 @@ class _TkStatusPanel:
             self._fonts.small,
             colors["fg"],
             "lm",
-            max_width=(x2 - (left + track_w + self._spec(7)) - self._spec(6)),
+            max_width=(x2 - (left + track_w + self._spec(7)) - self._spec(6)) * s,
         )
 
     def _draw_dot(
@@ -1534,12 +1535,22 @@ class _TkStatusPanel:
         anchor: str = "la",
         max_width: int | None = None,
     ) -> None:
+        """Подпись слоем: на прозрачном фоне, поверх рисунка.
+
+        Прямо в рисунок текст не пишется: буквы с прозрачным краем лежат на
+        фоне рисунка, и при уменьшении их края гасятся. Меняется подпись —
+        весь рисунок идёт в окно заново, и подписи с краями читались бы как
+        мелькание. Слоем текст ложится на рисунок уже уменьшенным, поэтому
+        перерисовывается только то, что поменялось.
+        """
         if not text:
             return
         face, _size = font
         if max_width is not None:
-            text = self._fit(face, text, max_width * self._ss)
-        d.text((x, y), text, font=face, fill=color, anchor=anchor)
+            text = self._fit(face, text, max_width)
+        layer = Image.new("RGBA", d._image.size, (0, 0, 0, 0))
+        ImageDraw.Draw(layer).text((x, y), text, font=face, fill=color, anchor=anchor)
+        d._image.alpha_composite(layer)
 
     def _fit(
         self,
