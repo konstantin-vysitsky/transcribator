@@ -231,6 +231,9 @@ _DONE_H = 32
 _ABORT = 32
 _DOT_SLOT = 20
 _DOT = 10
+# Насколько кружок записи выходит за свои 10 точек: кольца волн до 12, ореол
+# с мягким краем до 8.8. Шире этого слоя под кружок не нужно.
+_DOT_VISIBLE = 13.0
 _SWITCH_H = 34
 _SWITCH_PAD_R = 12
 _TRACK_W = 44
@@ -501,12 +504,39 @@ class _GlassWindow:
             self.reason = "прозрачность выключена в Windows"
             return False
 
+        # Панель плотная, значит и окно должно быть плотным: без этой
+        # пометки Windows держит окно полупрозрачным по своим настройкам, а
+        # сама Tk из-за этого отдаёт холсту меньше точек, чем нужно картинке.
+        try:
+            user32.SetWindowLongW(
+                wintypes.HWND(self._hwnd), -20,
+                user32.GetWindowLongW(wintypes.HWND(self._hwnd), -20) | 0x00000020,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
         self.ok = self._apply()
         if self.ok:
             self.mode = "alpha"
         if not self.ok:
             self.reason = self.reason or "система отказала"
         return self.ok
+
+    def make_opaque(self) -> None:
+        """Снять с окна полупрозрачность совсем: панель плотная.
+
+        Слоёное окно с прозрачностью Tk мерит по-своему: картинке нужно 396
+        точек, а холст получает 379, и на нём появляется полоса прокрутки.
+        Панель рисуется плотной, поэтому окно тоже делается плотным.
+        """
+        if not self._installed or self._user32 is None:
+            return
+        window = self._wintypes.HWND(self._hwnd)
+        try:
+            extended = self._user32.GetWindowLongW(window, -20)
+            self._user32.SetWindowLongW(window, -20, extended & ~0x00080000)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _setup_calls(self) -> None:
         """Размеры и формы вызовов: 32-битные числа и указатели надо объявлять."""
@@ -628,6 +658,11 @@ class _TkStatusPanel:
         self._photo: ImageTk.PhotoImage | None = None
         self._image: Image.Image | None = None
         self._glass = _GlassWindow()
+
+        # Сколько точек окна Tk отнимает у холста (полоса прокрутки), и для
+        # какой ширины это посчитано: за одну ширину прибавка берётся раз.
+        self._fit_for: tuple[int, int] | None = None
+        self._fit_extra = 0
 
         # Границы нажатий в точках экрана: по ним определяем, куда пришёл клик.
         self._hit_stop: tuple[int, int, int, int] | None = None
@@ -849,8 +884,16 @@ class _TkStatusPanel:
         self._glass = _GlassWindow()
         self._glass.install(window)
 
-        canvas = tk.Canvas(window, highlightthickness=0, bd=0,
-                           bg=self._window_color())
+        canvas = tk.Canvas(window, width=self._size[0], height=self._size[1],
+                           highlightthickness=0, bd=0, bg=self._window_color())
+        # Холст не прокручивается: полосы прокрутки на панели не нужны, а
+        # когда картинка выходила за холст, Tk рисовал справа вертикальную
+        # полосу и сдвигал картину — панель съезжала вниз относительно окна.
+        canvas.configure(
+            scrollregion=(0, 0, 0, 0),
+            xscrollcommand=lambda *_: None,
+            yscrollcommand=lambda *_: None,
+        )
         canvas.pack()
         self._canvas = canvas
 
@@ -1022,9 +1065,13 @@ class _TkStatusPanel:
             # строки — одному центру. Раньше кружок поднимали отдельно, и он
             # висел выше строки.
             slot = self._spec(_DOT_SLOT)
+            # Слой ставится по центру места под кружок. Нижняя строка — та же
+            # формула: низ слоя и верх совпадают, чтобы при правке кружка не
+            # съехать.
             layer = self._dot_layer(px + slot // 2, cy)
             if layer is not None:
-                img.paste(layer, (px, cy - slot // 2), layer)
+                size_px = layer.size[0] // max(1, self._ss)
+                img.paste(layer, (px, cy - size_px // 2), layer)
             cx = px + slot + self._spec(4)
         title = {
             "recording": "Запись — говорите",
@@ -1085,8 +1132,11 @@ class _TkStatusPanel:
             self._image_item = canvas.create_image(0, 0, image=self._photo, anchor="nw")
         else:
             canvas.itemconfigure(self._image_item, image=self._photo)
-        canvas.configure(width=w, height=h)
+        width, height = self._size
+        canvas.configure(width=width, height=height, scrollregion=(0, 0, width, height))
         canvas.tag_raise(self._image_item)
+        # Холст не должен оказаться уже картинки: тогда Tk заводит прокрутку.
+        self._fit_window(width, height)
         self._window_size_changed(apply_geometry=self._state == "idle")
 
     def _window_color(self) -> str:
@@ -1109,6 +1159,87 @@ class _TkStatusPanel:
         solid = Image.new("RGB", image.size, _solid(str(self._palette.get("bg", "#000000"))))
         solid.paste(image, (0, 0), image if image.mode == "RGBA" else None)
         return solid
+
+    def _width_fix(self) -> int:
+        """Сколько точек окна Tk считает лишними: столько съедает прокрутка.
+
+        С прозрачностью окно держит слоёное окно системы, и Tk ведёт счёт
+        по-своему: просит 396, а холсту оставляет 379, уводя 17 точек на
+        невидимую полосу прокрутки. Крупный рисунок в такой холст не влезает,
+        и Tk заводит полосу справа уже по-настоящему, а картину сдвигает вниз.
+        Разницу считаем в момент, когда окно ещё не шире своей ширины:
+        столько у него отнимал невидимый запас. Одну ширину просим один раз
+        и прибавку больше не трогаем, иначе каждая правка окна её удваивает.
+        """
+        if self._window is None or not self._glass.ok or self._canvas is None:
+            return 0
+        if self._fit_for == (self._size[0], self._size[1]):
+            return self._fit_extra
+        try:
+            self._window.update_idletasks()
+            wanted = self._canvas.winfo_reqwidth()
+            actual = self._canvas.winfo_width()
+        except tk.TclError:
+            return 0
+        if actual >= wanted:
+            return 0
+        # Холст упирается в окно, а не режется своим же краем: сразу после
+        # показа Tk ещё мерит холст без окна, и там разница огромна. Меряем
+        # только там, где отняли немного — как раз точку-другую под полосу.
+        extra = wanted - actual
+        if extra > 2 * self._spec(24):
+            return 0
+        self._fit_for = (self._size[0], self._size[1])
+        self._fit_extra = extra
+        return extra
+
+    def _canvas_gap(self) -> int:
+        """На сколько точек холст уже своего размера: прибавку окну не считаем.
+
+        В слоёном окне Tk расходится со своей же записью о размерах, и просить
+        прибавку по этому расхождению значит плодить её вдвое. Поэтому холст
+        ставится прямо в размер панели, а окно — в холст с прибавкой.
+        """
+        if self._window is None or self._canvas is None or not self._glass.ok:
+            return 0
+        try:
+            self._window.update_idletasks()
+            return max(0, self._canvas.winfo_reqwidth() - self._canvas.winfo_width())
+        except tk.TclError:
+            return 0
+
+    def _fit_window(self, width: int, height: int) -> None:
+        """Поставить окну настоящий размер: лишнюю точку-другую отдать холсту.
+
+        Окно показывает панель в заданный размер, а холст Tk оставляет уже:
+        на картинку шире холста Tk заводит справа полосу прокрутки и сдвигает
+        картину вниз. Раз прибавка известна, окно просит лишние точки; если
+        Tk всё равно отнял их у холста, за окно берёмся ещё раз, когда оно уже
+        на экране. Прибавку это не копит: для каждой ширины она считается раз.
+        """
+        if self._window is None:
+            return
+        extra = self._width_fix()
+        if extra > 0:
+            self._window.geometry(f"{width + extra}x{height}")
+        self._after(16, lambda: self._widen_canvas(width, height))
+
+    def _widen_canvas(self, width: int, height: int) -> None:
+        """Второй заход после показа: отдать холсту точки, которые отнял Tk."""
+        if self._window is None or self._canvas is None or self._state == "idle":
+            return
+        if self._fit_for != (width, height) or self._fit_extra <= 0:
+            return
+        extra = self._fit_extra
+        try:
+            self._canvas.configure(width=width + extra)
+            self._canvas.update_idletasks()
+            # Если Tk снова отнял точки, окну прибавляем ещё столько же.
+            short = width - self._canvas.winfo_width()
+        except tk.TclError:
+            return
+        if short > 0:
+            self._window.geometry(f"{width + short + extra}x{height}")
 
     def _window_size_changed(self, *, apply_geometry: bool) -> None:
         if self._window is None:
@@ -1479,12 +1610,17 @@ class _TkStatusPanel:
         pal = self._palette
         s = self._ss
         scale = self._spec(1) * self._ss  # доля точки в рисунке
-        slot = self._spec(_DOT_SLOT)
-        c = slot / 2 * s
-        cy = slot / 2 * s
+        # Слой ровно по видимой части кружка. Раньше слой был квадратом в 20
+        # точек, а кружок занимал в нём середину: пустой край сверху не виден,
+        # но слой ложился по своему верху, и кружок выходил на 5 точек выше
+        # строки с подписью.
+        visible = 2 * _DOT_VISIBLE * self._spec(1)
+        side = max(2, int(math.ceil(visible))) * s
+        c = side / 2
+        cy = side / 2
         elapsed = time.monotonic() - self._pulse_started
         beat = (elapsed % _PULSE_BEAT_S) / _PULSE_BEAT_S
-        overlay = Image.new("RGBA", (slot * s, slot * s), (0, 0, 0, 0))
+        overlay = Image.new("RGBA", (side, side), (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
         wave_alpha = float(pal["dot_glow_alpha"])
         for shift in (0.0, 0.5):
@@ -1650,7 +1786,7 @@ class _TkStatusPanel:
         width, height = self._size
         x = self._root.winfo_screenwidth() - width - self._spec(_MARGIN_X)
         y = self._root.winfo_screenheight() - height - self._spec(_MARGIN_Y)
-        self._window.geometry(f"{width}x{height}+{x}+{y}")
+        self._window.geometry(f"{width + self._width_fix()}x{height}+{x}+{y}")
 
     def _begin_local_grab(self) -> None:
         """Локальный захват: панель остаётся перетаскиваемой, другие окна не блокируются.
