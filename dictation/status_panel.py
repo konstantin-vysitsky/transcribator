@@ -691,10 +691,9 @@ class _TkStatusPanel:
         self._flash_until = 0.0
         # Начало записи: по нему считается время, которое видно в `page_state`.
         self._recording_since: float | None = None
-        # Окно панели: показано ли оно на экране и какого размера. Чередование
-        # ступеней и доли распознавания не должны переставлять окно.
-        self._shown = False
-        self._shown_size: tuple[int, int] | None = None
+        # Окно панели: стоит ли оно на экране. Чередование ступеней и доли
+        # распознавания не должны переставлять окно.
+        self._window_shown = False
 
         self._skip_auto_enter = threading.Event()
         # `_alive` гаснет при остановке: после выхода из цикла окна очередь
@@ -2110,40 +2109,32 @@ class _TkStatusPanel:
             self._stop_pulse()
         self._start_bar()
 
-        self._render()
-        # Окно уже на экране (чередование «распознаю» ↔ «обрабатываю», доли
-        # распознавания по полсекунды) — его не трогаем: показанный раз окно
-        # не перепоказывается и не мелькает на каждом шаге хода. Но рисунок,
-        # нарисованный выше, выводим без перестановки окна: сброс долей
-        # делается ровно к этому сроку, и иначе сброс ждал бы конца хода, а
-        # панель всё это время показывала бы ход прошлой диктовки.
-        if self._shown:
-            self._force_paint()
-            self._shown_size = self._size
-            return
-        self._show_window()
+        # Окно уже на экране — его не переставляем: показанное раз окно не
+        # перепоказывается и не мелькает на каждом шаге хода. Рисунок дошлём
+        # без перестановки, иначе сброс долей ждал бы конца хода.
+        if self._window_shown:
+            self._window.update_idletasks()
+            self._window.update()
+        else:
+            self._render()
+            self._present()
 
-    def _show_window(self) -> None:
+    def _present(self) -> None:
         """Вывести окно на экран готовым: размер, место, без рамки, с рисунком.
 
         Показанное окно Tk одевает в рамку Windows, и дерево виджетов уходит
         в Windows таким, каким было до показа: на экране мелькает голое окно
         с рамкой и пустым нутром. Поэтому сперва размер, потом просьба о
         показе, потом досылка виджетов и рисунка, и только потом окно выходит
-        на экран (deiconify) — без рамки, сразу с панелью.
+        на экран.
 
-        Окно на экране и нужно — его не трогают совсем: ни размер, ни место
-        не меняются от доли хода к доле, а всякое переставление окна видно
-        глазом.
+        Рисунок к моменту показа уже нарисован: панель рисует картинку в
+        `_render`, а не в этом методе. Иначе на экране на миг висела бы
+        картинка прошлой диктовки — с полосой под конец.
         """
         if self._window is None:
             return
         width, height = self._size
-        if self._shown and (width, height) == self._shown_size:
-            self._render()
-            return
-        self._hold_window_off_screen()
-        self._render()
         try:
             self._window.withdraw()
             self._window.geometry(f"{width}x{height}")
@@ -2156,21 +2147,21 @@ class _TkStatusPanel:
             pass
         self._glass.reapply()
         self._reposition()
+        # Рисунок — до показа: тогда окно выходит сразу с панелью нужного
+        # состояния, а не с той, что осталась от прошлого раза.
+        self._render()
         self._window.deiconify()
-        # Без рамки и без прозрачности: панель плотная и занимает все свои точки.
         self._glass.reapply()
         self._window.lift()
-        self._render()
         self._force_paint()
-        self._shown = True
-        self._shown_size = self._size
+        self._window_shown = True
 
     def _hide_window(self) -> None:
         """Убрать панель с экрана. Окно не пересобирается: оно одно на запуск."""
         if self._window is None:
             return
         self._window.withdraw()
-        self._shown = False
+        self._window_shown = False
 
     def _hold_window_off_screen(self) -> None:
         """Свести прозрачность окна в ноль, пока оно переставляется."""
@@ -2193,6 +2184,22 @@ class _TkStatusPanel:
         try:
             self._window.attributes("-alpha", 1.0)
             self._window.update_idletasks()
+            self._window.update()
+        except tk.TclError:
+            pass
+
+    def flush(self) -> None:
+        """Вывести на экран всё, что уже нарисовано, не дожидаясь событий Tk.
+
+        Сброс панели и её картинка ставятся в очередь Tk по одному вызову на
+        весть. `update_idletasks` доводит до конца только то, что на `idle`:
+        картинку в метке он выводит, но панель из-за перерисовок не
+        освобождается, а `idle` для смены собственной картинки панели Tk
+        держит занятым. Поэтому здесь `update`: он делает и это, и `idle`.
+        """
+        if self._window is None:
+            return
+        try:
             self._window.update()
         except tk.TclError:
             pass

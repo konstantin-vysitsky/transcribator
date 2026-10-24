@@ -22,33 +22,59 @@ _PREVIEW_LEN = 48
 
 
 def _make_icon(size: int = 64) -> Image.Image:
+    """Микрофон: капсула, дужка, стойка и плита на ней.
+
+    Линии не тоньше одной точки на крошечной иконке: в трее она
+    показывается в 16 точек. Тонкая стойка там пропадает между дужкой и
+    плитой, и микрофон остаётся без ножки — горизонтальные дужка и плита
+    есть, а вертикали между ними нет.
+    """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    cx = size // 2
-    body_w = size // 3
-    body_h = size // 2
-    top = size // 5
+    blue = (66, 133, 244, 255)
+    # Толщину считаем от 16 точек, а не от роста картинки: при крупной
+    # картинке линия выходит долей точки и на показе исчезает.
+    stroke = max(1, round(size * 2 / 16))
+    cx = size / 2
+    pad = max(1, round(size / 16))
+    body_w = max(6, round(size * 0.4))
+    body_top = pad
+    body_bottom = round(size * 0.5)
     draw.rounded_rectangle(
-        (cx - body_w // 2, top, cx + body_w // 2, top + body_h),
-        radius=body_w // 2,
-        fill=(66, 133, 244, 255),
+        (cx - body_w / 2, body_top, cx + body_w / 2, body_bottom),
+        radius=body_w / 2,
+        fill=blue,
     )
+    # Дужка вокруг капсулы: полукруг от левого бока к правому, ноги дужки
+    # сходятся к стойке. Концы подняты выше середины капсулы: там её бока,
+    # и дужка читается скобкой вокруг капсулы, а не щупальцами внизу.
+    cup = max(4, round(size * 0.34))
+    arms_bottom = round(size * 0.78)
+    hoop_top = body_bottom - cup * 1.1
     draw.arc(
-        (cx - body_w, top + body_h // 2, cx + body_w, top + body_h + body_w),
+        (cx - cup, hoop_top, cx + cup, hoop_top + cup * 2),
         start=0,
         end=180,
-        fill=(66, 133, 244, 255),
-        width=max(2, size // 16),
+        fill=blue,
+        width=stroke,
     )
-    draw.line(
-        (cx, top + body_h + body_w, cx, size - size // 6),
-        fill=(66, 133, 244, 255),
-        width=max(2, size // 16),
+    cup_x = pad + stroke / 2
+    # Концы дужки: короткие вертикальные плечи от дуги вниз, до середины
+    # между дугой и низом картинки. До самого низа их не тянуть: дужка
+    # слилась бы с плитой в одну широкую блямбу.
+    draw.rectangle((cup_x, body_bottom, cup_x + stroke, arms_bottom), fill=blue)
+    draw.rectangle((size - cup_x - stroke, body_bottom, size - cup_x, arms_bottom), fill=blue)
+    # Стойка от низа дужки до плиты: без неё микрофон висит в воздухе.
+    draw.rectangle(
+        (cx - stroke / 2, arms_bottom - stroke, cx + stroke / 2, size - pad + 1),
+        fill=blue,
     )
-    draw.line(
-        (cx - body_w // 2, size - size // 6, cx + body_w // 2, size - size // 6),
-        fill=(66, 133, 244, 255),
-        width=max(2, size // 16),
+    # Плита: шире стойки, чтобы микрофон стоял на чём-то прочном.
+    plate_h = max(stroke, round(size * 0.09))
+    half = max(stroke, round(size * 0.22))
+    draw.rectangle(
+        (cx - half, size - pad - plate_h + 1, cx + half, size - pad + 1),
+        fill=blue,
     )
     return img
 
@@ -258,6 +284,12 @@ class TrayApp:
     def set_microphone_level(self, level: float) -> None:
         """Громкость микрофона на панель: панель показывает, что слышно."""
         self._status_panel.set_level(level)
+
+    def flush(self) -> None:
+        """Вывести панель на экран сразу, не оставляя очередь на потом."""
+        flush = getattr(self._status_panel, "flush", None)
+        if flush is not None:
+            flush()
 
     def set_activity(
         self,
