@@ -691,6 +691,10 @@ class _TkStatusPanel:
         self._flash_until = 0.0
         # Начало записи: по нему считается время, которое видно в `page_state`.
         self._recording_since: float | None = None
+        # Окно панели: спрятано ли оно и какого размера на экране. Чередование
+        # ступеней и доли распознавания не должны перепоказывать окно.
+        self._panel_hidden = False
+        self._panel_shown_size: tuple[int, int] | None = None
 
         self._skip_auto_enter = threading.Event()
         # `_alive` гаснет при остановке: после выхода из цикла окна очередь
@@ -2067,7 +2071,7 @@ class _TkStatusPanel:
         if state == "idle":
             self._stop_pulse()
             self._stop_bar()
-            self._window.withdraw()
+            self._hide_window()
             return
 
         if state == "recording" and previous != "recording":
@@ -2077,14 +2081,32 @@ class _TkStatusPanel:
         self._start_bar()
 
         self._render()
-        # Окно и размер ставим вместе с показом: одно окно в процессе — обычный
-        # случай, второе (в проверке) иначе вышло бы без места на экране.
-        # Показанное окно Tk одевает в рамку Windows, и дерево виджетов уходит
-        # в Windows таким, каким было до показа: на экране мелькает голое окно
-        # с рамкой и пустым нутром. Поэтому размер и место ставятся до показа,
-        # виджеты досылаются сразу после просьбы о показе, и только потом окно
-        # выходит на экран (deiconify): к этому мигу рамку уже снимает
-        # системный вызов, а внутри стоит готовый рисунок.
+        # Окно уже на экране (чередование «распознаю» ↔ «обрабатываю», доли
+        # распознавания по полсекунды) — его не трогаем: показанный раз окно
+        # не перепоказывается и не мелькает на каждом шаге хода.
+        hidden = getattr(self, "_panel_hidden", False)
+        if hidden:
+            width, height = self._size
+            if (width, height) == getattr(self, "_panel_shown_size", None):
+                self._panel_hidden = False
+                return
+        self._show_window()
+
+    def _show_window(self) -> None:
+        """Вывести окно на экран готовым: размер, место, без рамки, с рисунком.
+
+        Показанное окно Tk одевает в рамку Windows, и дерево виджетов уходит
+        в Windows таким, каким было до показа: на экране мелькает голое окно
+        с рамкой и пустым нутром. Поэтому размер и место ставятся до показа,
+        виджеты досылаются сразу после просьбы о показе, и только потом окно
+        выходит на экран (deiconify): к этому мигу рамку уже снимает
+        системный вызов, а внутри стоит готовый рисунок. На время пересборки
+        окно прозрачно: пока Windows не перерисовала своё, показывать нечего.
+        """
+        if self._window is None:
+            return
+        self._hold_window_off_screen()
+        self._render()
         width, height = self._size
         self._window.withdraw()
         try:
@@ -2103,7 +2125,75 @@ class _TkStatusPanel:
         self._glass.reapply()
         self._window.lift()
         self._render()
-        self._request_render()
+        self._force_paint()
+        self._panel_hidden = False
+        self._panel_shown_size = self._size
+
+    def _hide_window(self) -> None:
+        """Убрать панель с экрана.
+
+        Просто `withdraw` мало: показанное окно Tk держит в Windows свою
+        маску, и после спрятать-показать оно выходит пустым прямоугольником.
+        Поэтому в паре с прятаньем окно пересобирается заново — как при
+        самом первом показе.
+        """
+        if self._window is None:
+            return
+        self._window.withdraw()
+        self._build_window()
+
+    def _build_window(self) -> None:
+        """Создать окно панели заново: спрятанным и прозрачным."""
+        if self._root is None:
+            return
+        window = tk.Toplevel(self._root)
+        window.withdraw()
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.geometry(f"{self._size[0]}x{self._size[1]}")
+        window.attributes("-alpha", 0.0)
+        window.configure(bg=self._window_color())
+        window.bind("<Button-1>", self._on_mouse_down, add="+")
+        window.bind("<B1-Motion>", self._on_drag_move, add="+")
+        window.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
+        window.bind("<Motion>", self._on_motion, add="+")
+        window.bind("<Leave>", lambda _e: self._set_hover(None), add="+")
+        self._window = window
+        self._label = tk.Label(window, bd=0, highlightthickness=0, padx=0, pady=0,
+                               anchor="nw", bg=self._window_color())
+        self._label.place(x=0, y=0, width=self._size[0], height=self._size[1])
+        self._glass = _GlassWindow()
+        self._glass.install(window)
+        self._panel_hidden = True
+
+    def _hold_window_off_screen(self) -> None:
+        """Свести прозрачность окна в ноль на время пересборки.
+
+        Пока окно пересобирается, новая маска Windows пустая: без этого на
+        экране миг висит голый прямоугольник.
+        """
+        if self._window is None:
+            return
+        try:
+            self._window.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+
+    def _force_paint(self) -> None:
+        """Дослать рисунок в Windows и убрать заслонку прозрачности."""
+        if self._window is None:
+            return
+        try:
+            self._window.update_idletasks()
+            self._window.update()
+        except tk.TclError:
+            return
+        try:
+            self._window.attributes("-alpha", 1.0)
+            self._window.update_idletasks()
+            self._window.update()
+        except tk.TclError:
+            pass
 
     def update(
         self,

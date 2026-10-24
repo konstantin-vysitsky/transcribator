@@ -101,7 +101,10 @@ def main() -> None:
         stop_event.set()
 
     def reset_tray_idle() -> None:
-        if tray_app is not None:
+        # Во время распознавания и обработки панель продолжает показывать ход
+        # работы. Её окно раньше звали на экран заново на каждом шаге, и оно
+        # мелькало. Поэтому «простой» ставится, только когда работы нет.
+        if tray_app is not None and not busy.is_set():
             tray_app.set_activity("idle")
 
     def finish_recording_from_ui() -> None:
