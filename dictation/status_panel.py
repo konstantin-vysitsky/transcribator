@@ -587,7 +587,11 @@ class _GlassWindow:
             # нужно, чтобы альфа окна вообще действовала.
             extended = self._user32.GetWindowLongW(window, -20)
             self._user32.SetWindowLongW(window, -16, (style | 0x00200000) & ~0x00080000)
-            self._user32.SetWindowLongW(window, -20, (extended | 0x00080000) & ~0x00000080)
+            # Прозрачность окна делится на всю картинку: при 0,8 и буквы, и
+            # рисунок бледнеют, а на светлом фоне панель пропадает совсем.
+            # Поэтому нарисованное идёт в полную силу, а прозрачность берётся
+            # только у самого окна и только если её просят меньше единицы.
+            self._user32.SetWindowLongW(window, -20, extended | 0x00080000)
         except Exception as error:  # noqa: BLE001
             self.reason = f"стиль окна: {error}"
             return False
@@ -653,16 +657,10 @@ class _TkStatusPanel:
         self._notify_toggle_ai = on_toggle_ai
         self._root: tk.Tk | None = None
         self._window: tk.Toplevel | None = None
-        self._canvas: tk.Canvas | None = None
-        self._image_item: int | None = None
+        self._label: tk.Label | None = None
         self._photo: ImageTk.PhotoImage | None = None
         self._image: Image.Image | None = None
         self._glass = _GlassWindow()
-
-        # Сколько точек окна Tk отнимает у холста (полоса прокрутки), и для
-        # какой ширины это посчитано: за одну ширину прибавка берётся раз.
-        self._fit_for: tuple[int, int] | None = None
-        self._fit_extra = 0
 
         # Границы нажатий в точках экрана: по ним определяем, куда пришёл клик.
         self._hit_stop: tuple[int, int, int, int] | None = None
@@ -802,13 +800,15 @@ class _TkStatusPanel:
         # он должен смениться вместе с рисунком. У стекла окно служит только
         # подложкой под картинку.
         window = getattr(self, "_window", None)
-        canvas = getattr(self, "_canvas", None)
-        if window is not None and canvas is not None and not self._glass.ok:
-            try:
-                window.configure(bg=self._window_color())
-                canvas.configure(bg=self._window_color())
-            except tk.TclError:
-                pass
+        label = getattr(self, "_label", None)
+        color = self._window_color()
+        try:
+            if window is not None:
+                window.configure(bg=color)
+            if label is not None:
+                label.configure(bg=color)
+        except tk.TclError:
+            pass
 
     def _light(self) -> bool:
         return float(self._palette.get("__luma", 0)) > 0.5
@@ -884,21 +884,18 @@ class _TkStatusPanel:
         self._glass = _GlassWindow()
         self._glass.install(window)
 
-        canvas = tk.Canvas(window, width=self._size[0], height=self._size[1],
-                           highlightthickness=0, bd=0, bg=self._window_color())
-        # Холст не прокручивается: полосы прокрутки на панели не нужны, а
-        # когда картинка выходила за холст, Tk рисовал справа вертикальную
-        # полосу и сдвигал картину — панель съезжала вниз относительно окна.
-        canvas.configure(
-            scrollregion=(0, 0, 0, 0),
-            xscrollcommand=lambda *_: None,
-            yscrollcommand=lambda *_: None,
-        )
-        canvas.pack()
-        self._canvas = canvas
+        # Рисунок кладётся прямо на окно. Холст Tk для этого не годится: окно
+        # без рамки бывает на 17 точек уже своей ширины, и на узком холсте Tk
+        # заводит справа серую полосу прокрутки, а картину сдвигает вниз.
+        # Рисовать в окне негде, кроме метки — она и держит картинку.
+        label = tk.Label(window, bd=0, highlightthickness=0, padx=0, pady=0,
+                         anchor="nw", bg=self._window_color())
+        # Окно не пересобирается под метку: оно ровно того размера, что и
+        # рисунок. Место в нём занимает и место, оставшееся по краям окна.
+        label.place(x=0, y=0)
+        self._label = label
 
         self._size = (self._spec(_PANEL_W), self._spec(170))
-        canvas.configure(width=self._size[0], height=self._size[1])
 
         self._render()
         self._ready.set()
@@ -969,7 +966,7 @@ class _TkStatusPanel:
         исключение из него пишется в журнал как поломка всего приложения.
         Окно при этом просто остаётся прежним.
         """
-        if self._root is None or self._canvas is None:
+        if self._root is None or self._label is None:
             return
         try:
             self._render_inner()
@@ -1125,17 +1122,10 @@ class _TkStatusPanel:
         # Картинка уходит отдельным пятном на прозрачном фоне: сквозь пустые
         # клетки видно то, что за панелью, а край выходит мягким.
         self._photo = ImageTk.PhotoImage(self._shown_image(small).convert("RGBA"))
-        canvas = self._canvas
-        if not self._glass.ok:
-            canvas.configure(bg=self._window_color())
-        if self._image_item is None:
-            self._image_item = canvas.create_image(0, 0, image=self._photo, anchor="nw")
-        else:
-            canvas.itemconfigure(self._image_item, image=self._photo)
+        label = self._label
+        if label is not None:
+            label.configure(image=self._photo, width=w, height=h)
         width, height = self._size
-        canvas.configure(width=width, height=height, scrollregion=(0, 0, width, height))
-        canvas.tag_raise(self._image_item)
-        # Холст не должен оказаться уже картинки: тогда Tk заводит прокрутку.
         self._fit_window(width, height)
         self._window_size_changed(apply_geometry=self._state == "idle")
 
@@ -1160,86 +1150,17 @@ class _TkStatusPanel:
         solid.paste(image, (0, 0), image if image.mode == "RGBA" else None)
         return solid
 
-    def _width_fix(self) -> int:
-        """Сколько точек окна Tk считает лишними: столько съедает прокрутка.
-
-        С прозрачностью окно держит слоёное окно системы, и Tk ведёт счёт
-        по-своему: просит 396, а холсту оставляет 379, уводя 17 точек на
-        невидимую полосу прокрутки. Крупный рисунок в такой холст не влезает,
-        и Tk заводит полосу справа уже по-настоящему, а картину сдвигает вниз.
-        Разницу считаем в момент, когда окно ещё не шире своей ширины:
-        столько у него отнимал невидимый запас. Одну ширину просим один раз
-        и прибавку больше не трогаем, иначе каждая правка окна её удваивает.
-        """
-        if self._window is None or not self._glass.ok or self._canvas is None:
-            return 0
-        if self._fit_for == (self._size[0], self._size[1]):
-            return self._fit_extra
-        try:
-            self._window.update_idletasks()
-            wanted = self._canvas.winfo_reqwidth()
-            actual = self._canvas.winfo_width()
-        except tk.TclError:
-            return 0
-        if actual >= wanted:
-            return 0
-        # Холст упирается в окно, а не режется своим же краем: сразу после
-        # показа Tk ещё мерит холст без окна, и там разница огромна. Меряем
-        # только там, где отняли немного — как раз точку-другую под полосу.
-        extra = wanted - actual
-        if extra > 2 * self._spec(24):
-            return 0
-        self._fit_for = (self._size[0], self._size[1])
-        self._fit_extra = extra
-        return extra
-
-    def _canvas_gap(self) -> int:
-        """На сколько точек холст уже своего размера: прибавку окну не считаем.
-
-        В слоёном окне Tk расходится со своей же записью о размерах, и просить
-        прибавку по этому расхождению значит плодить её вдвое. Поэтому холст
-        ставится прямо в размер панели, а окно — в холст с прибавкой.
-        """
-        if self._window is None or self._canvas is None or not self._glass.ok:
-            return 0
-        try:
-            self._window.update_idletasks()
-            return max(0, self._canvas.winfo_reqwidth() - self._canvas.winfo_width())
-        except tk.TclError:
-            return 0
-
     def _fit_window(self, width: int, height: int) -> None:
-        """Поставить окну настоящий размер: лишнюю точку-другую отдать холсту.
+        """Поставить окну настоящий размер, а метке — картинку во всю ширину.
 
-        Окно показывает панель в заданный размер, а холст Tk оставляет уже:
-        на картинку шире холста Tk заводит справа полосу прокрутки и сдвигает
-        картину вниз. Раз прибавка известна, окно просит лишние точки; если
-        Tk всё равно отнял их у холста, за окно берёмся ещё раз, когда оно уже
-        на экране. Прибавку это не копит: для каждой ширины она считается раз.
+        Окно без рамки бывает шире своей картинки: Tk держит запас под
+        скругляемый край. Тогда метку видно не по центру. Поэтому окну
+        ставится ровно размер картинки.
         """
         if self._window is None:
             return
-        extra = self._width_fix()
-        if extra > 0:
-            self._window.geometry(f"{width + extra}x{height}")
-        self._after(16, lambda: self._widen_canvas(width, height))
+        self._window.geometry(f"{width}x{height}")
 
-    def _widen_canvas(self, width: int, height: int) -> None:
-        """Второй заход после показа: отдать холсту точки, которые отнял Tk."""
-        if self._window is None or self._canvas is None or self._state == "idle":
-            return
-        if self._fit_for != (width, height) or self._fit_extra <= 0:
-            return
-        extra = self._fit_extra
-        try:
-            self._canvas.configure(width=width + extra)
-            self._canvas.update_idletasks()
-            # Если Tk снова отнял точки, окну прибавляем ещё столько же.
-            short = width - self._canvas.winfo_width()
-        except tk.TclError:
-            return
-        if short > 0:
-            self._window.geometry(f"{width + short + extra}x{height}")
 
     def _window_size_changed(self, *, apply_geometry: bool) -> None:
         if self._window is None:
@@ -1733,7 +1654,7 @@ class _TkStatusPanel:
 
     def _on_mouse_down(self, event: tk.Event) -> None:
         widget = getattr(event, "widget", None)
-        if widget is not None and widget is not self._canvas:
+        if widget is not None and widget is not self._label:
             return
         x, y = int(event.x), int(event.y)
         hit = self._hit(x, y)
@@ -1758,7 +1679,7 @@ class _TkStatusPanel:
         self._on_drag_release(event)
 
     def _on_motion(self, event: tk.Event) -> None:
-        if getattr(event, "widget", None) is not self._canvas:
+        if getattr(event, "widget", None) is not self._label:
             return
         self._set_hover(self._hit(int(event.x), int(event.y)))
 
@@ -1786,7 +1707,7 @@ class _TkStatusPanel:
         width, height = self._size
         x = self._root.winfo_screenwidth() - width - self._spec(_MARGIN_X)
         y = self._root.winfo_screenheight() - height - self._spec(_MARGIN_Y)
-        self._window.geometry(f"{width + self._width_fix()}x{height}+{x}+{y}")
+        self._window.geometry(f"{width}x{height}+{x}+{y}")
 
     def _begin_local_grab(self) -> None:
         """Локальный захват: панель остаётся перетаскиваемой, другие окна не блокируются.

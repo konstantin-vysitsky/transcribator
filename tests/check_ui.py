@@ -211,8 +211,8 @@ def test_status_panel() -> None:
     panel.set_level(0.7)
     check("громкость микрофона принимается", True)
 
-    canvas = panel._canvas
-    check("холст панели есть", canvas is not None)
+    canvas = panel._label
+    check("место под рисунок панели есть", canvas is not None)
     run_on_ui(lambda: press(panel, "stop", canvas))
     check("кнопка «Готово» доходит до Python", clicks == ["done"], repr(clicks))
     run_on_ui(lambda: press(panel, "abort", canvas))
