@@ -231,9 +231,10 @@ _DONE_H = 32
 _ABORT = 32
 _DOT_SLOT = 20
 _DOT = 10
-# Насколько кружок записи выходит за свои 10 точек: кольца волн до 12, ореол
-# с мягким краем до 8.8. Шире этого слоя под кружок не нужно.
-_DOT_VISIBLE = 13.0
+# Запас вокруг рисунка: окно без рамки бывает на 17 точек уже картинки, и без
+# запаса правый край рисунка срезался бы краем окна. Запас лежит внутри окна,
+# поэтому на экране ничего не прибавляется.
+_CANVAS_MARGIN = 8
 _SWITCH_H = 34
 _SWITCH_PAD_R = 12
 _TRACK_W = 44
@@ -266,10 +267,6 @@ _SHEEN_STRIP = 72
 _STAGE_CLEAR = 9    # место вокруг полосы: мягкое пятно у её конца не должно срезаться
 _COLOR_STEPS = 8
 _COLOR_MS = 20
-# Насколько панель прозрачна: 1 — плотная, как нарисована. Панель плотная:
-# человек читает её, а не смотрит, что за ней.
-_GLASS_ALPHA = 1.0
-
 _ICON_ABORT = "\ue711"
 _ICON_FALLBACK = "\u2715"
 
@@ -555,36 +552,19 @@ class _GlassWindow:
         except Exception:  # noqa: BLE001
             return False
 
-    def opacity(self, window: tk.Toplevel, alpha: float) -> bool:
-        """Показать панель целиком в долю от нарисованного: стекло для Tk.
-
-        Путь, где прозрачность ставится напрямую, на этой Windows оставляет
-        видимым ровно один цвет: окно закрывается им целиком. Поэтому
-        работает этот путь: рисунок рисуется в своих цветах, а Tk показывает
-        окно в его долю — и рисунок становится тонким и полупрозрачным.
-        """
-        try:
-            window.attributes("-alpha", max(0.3, min(1.0, alpha)))
-            return True
-        except tk.TclError as error:
-            self.reason = f"прозрачность окна: {error}"
-            return False
-
     def _apply(self) -> bool:
         w = self._wintypes
         window = w.HWND(self._hwnd)
         try:
             style = self._user32.GetWindowLongW(window, -16)
-            # Tk запоминает стиль окна сам и при следующей настройке вернёт
-            # старый: подгоняем оба, иначе прозрачность слетит. Слоёное окно
-            # нужно, чтобы альфа окна вообще действовала.
             extended = self._user32.GetWindowLongW(window, -20)
-            self._user32.SetWindowLongW(window, -16, (style | 0x00200000) & ~0x00080000)
-            # Прозрачность окна делится на всю картинку: при 0,8 и буквы, и
-            # рисунок бледнеют, а на светлом фоне панель пропадает совсем.
-            # Поэтому нарисованное идёт в полную силу, а прозрачность берётся
-            # только у самого окна и только если её просят меньше единицы.
-            self._user32.SetWindowLongW(window, -20, extended | 0x00080000)
+            # Окно без рамки. Прозрачности нет ни в стиле, ни в расширенном
+            # стиле, поэтому Tk не заводит ни полос прокрутки, ни слоёного
+            # окна — а именно слоёное окно и портило панель.
+            style = (style | 0x00200000) & ~0x00080000 & ~0x00040000
+            extended = extended & ~0x00080000 & ~0x00000080
+            self._user32.SetWindowLongW(window, -16, style)
+            self._user32.SetWindowLongW(window, -20, extended)
         except Exception as error:  # noqa: BLE001
             self.reason = f"стиль окна: {error}"
             return False
@@ -880,10 +860,7 @@ class _TkStatusPanel:
         # Рисунок кладётся прямо на окно. Холст Tk для этого не годится: окно
         # без рамки бывает на 17 точек уже своей ширины, и на узком холсте Tk
         # заводит справа серую полосу прокрутки, а картину сдвигает вниз.
-        # Рисовать в окне негде, кроме метки — она и держит картинку.
-        # Панель рисуется меткой во всё окно. Кнопка текста у неё
-        # отключается: у кнопки бьётся вставка одним цветом, и сквозь неё
-        # ничего не видно.
+        # Метка места под картинку не просит: ею окно не пересобирается.
         label = tk.Label(window, bd=0, highlightthickness=0, padx=0, pady=0,
                          anchor="nw", bg=self._window_color())
         label.place(x=0, y=0, width=self._size[0], height=self._size[1])
@@ -1052,17 +1029,10 @@ class _TkStatusPanel:
         cx = px
         cy = lay["status_top"] + lay["status_h"] // 2
         if self._state == "recording":
-            # Кружок записи стоит в строке с подписью, как и буквы: верх и низ
-            # строки — одному центру. Раньше кружок поднимали отдельно, и он
-            # висел выше строки.
+            # Кружок записи рисуется прямо на рисунке, в центре строки, где и
+            # подпись: центру строки подчиняются все окружности кружка.
             slot = self._spec(_DOT_SLOT)
-            # Слой ставится по центру места под кружок. Нижняя строка — та же
-            # формула: низ слоя и верх совпадают, чтобы при правке кружка не
-            # съехать.
-            layer = self._dot_layer(px + slot // 2, cy)
-            if layer is not None:
-                size_px = layer.size[0] // max(1, self._ss)
-                img.paste(layer, (px, cy - size_px // 2), layer)
+            self._draw_dot(d, px + slot // 2, cy)
             cx = px + slot + self._spec(4)
         title = {
             "recording": "Запись — говорите",
@@ -1124,7 +1094,8 @@ class _TkStatusPanel:
             # с шириной она теряет высоту, и метка выходит тонкой полосой.
             label.configure(image=self._photo)
             label.place_configure(x=0, y=0, width=width, height=height)
-        self._fit_window(width, height)
+        else:
+            self._window.geometry(f"{width}x{height}")
         self._window_size_changed(apply_geometry=self._state == "idle")
 
     def _window_color(self) -> str:
@@ -1149,11 +1120,13 @@ class _TkStatusPanel:
         return solid
 
     def _fit_window(self, width: int, height: int) -> None:
-        """Поставить окну настоящий размер, а метке — картинку во всю ширину.
+        """Поставить окну размер картинки и убрать с него полосу прокрутки.
 
-        Окно без рамки бывает шире своей картинки: Tk держит запас под
-        скругляемый край. Тогда метку видно не по центру. Поэтому окну
-        ставится ровно размер картинки.
+        Ширину окна Tk считает по-своему и бывает на 17 точек уже картинки:
+        правый край рисунка тогда срезан, а по краю видно серую полосу
+        прокрутки. Полосу прячет сам Tk, оставляя запас у окна без рамки;
+        запас убираем, пока окно ещё не на экране, — иначе полоска успеет
+        мелькнуть.
         """
         if self._window is None:
             return
@@ -1518,49 +1491,44 @@ class _TkStatusPanel:
             max_width=(x2 - (left + track_w + self._spec(7)) - self._spec(6)),
         )
 
-    def _dot_layer(self, center_x: int, center_y: int, *, size: float | None = None) -> Image.Image:
-        """Слой с точкой записи: мигает и выпускает мягкие волны.
+    def _draw_dot(
+        self,
+        d: ImageDraw.ImageDraw,
+        center_x: int,
+        center_y: int,
+    ) -> None:
+        """Кружок записи прямо на рисунке: мигает, выпускает волны и ореол.
 
-        Точка живёт на отдельном слое с прозрачностью и накладывается на
-        картинку целиком: рисуй её прямо на фоне — ореол закрасил бы фон
-        квадратом. Рисунок уже крупный, поэтому кольца выходят гладкими.
-        Размер места под точку берётся общий для всех состояний.
+        Раньше кружок лежал отдельным слоем и накладывался на картинку. Слой
+        занимал 20 точек, а кружок в нём — середину: пустой верх слоя и
+        сдвигал кружок выше строки. Здесь каждая окружность рисуется в своих
+        координатах от центра строки, поэтому съехать ей некуда.
         """
         pal = self._palette
         s = self._ss
-        scale = self._spec(1) * self._ss  # доля точки в рисунке
-        # Слой ровно по видимой части кружка. Раньше слой был квадратом в 20
-        # точек, а кружок занимал в нём середину: пустой край сверху не виден,
-        # но слой ложился по своему верху, и кружок выходил на 5 точек выше
-        # строки с подписью.
-        visible = 2 * _DOT_VISIBLE * self._spec(1)
-        side = max(2, int(math.ceil(visible))) * s
-        c = side / 2
-        cy = side / 2
+        scale = self._spec(1) * self._ss  # точка на экране в клетках рисунка
+        cxl, cyl = center_x * s, center_y * s
         elapsed = time.monotonic() - self._pulse_started
         beat = (elapsed % _PULSE_BEAT_S) / _PULSE_BEAT_S
-        overlay = Image.new("RGBA", (side, side), (0, 0, 0, 0))
-        od = ImageDraw.Draw(overlay)
         wave_alpha = float(pal["dot_glow_alpha"])
         for shift in (0.0, 0.5):
             t = (beat + shift) % 1.0
             radius = (3 + 9 * math.sqrt(t)) * scale
-            a = (1 - t) ** 2 * wave_alpha
-            if a <= 0.01:
+            alpha = (1 - t) ** 2 * wave_alpha
+            if alpha <= 0.01:
                 continue
-            od.ellipse((c - radius, cy - radius, c + radius, cy + radius),
-                       outline=_rgba(str(pal["dot_wave"]), a), width=s)
+            d.ellipse((cxl - radius, cyl - radius, cxl + radius, cyl + radius),
+                      outline=_rgba(str(pal["dot_wave"]), alpha), width=s)
         if beat < _PULSE_PEAK_MS / 1000:
             pulse = 1.0
         else:
             pulse = max(0.45, 1.0 - 0.55 * (beat - 0.11) / 0.89)
         halo = 8.5 * scale
-        od.ellipse((c - halo, cy - halo, c + halo, cy + halo),
-                   fill=_rgba(str(pal["dot_glow"]), min(1.0, 0.55 * pulse * wave_alpha)))
+        d.ellipse((cxl - halo, cyl - halo, cxl + halo, cyl + halo),
+                  fill=_rgba(str(pal["dot_glow"]), min(1.0, 0.55 * pulse * wave_alpha)))
         core = 5 * scale
-        od.ellipse((c - core, cy - core, c + core, cy + core),
-                   fill=_rgba(mix(str(pal["dot"]), str(pal["bg"]), (1 - pulse) * 0.75), 1.0))
-        return overlay
+        d.ellipse((cxl - core, cyl - core, cxl + core, cyl + core),
+                  fill=_rgba(mix(str(pal["dot"]), str(pal["bg"]), (1 - pulse) * 0.75), 1.0))
 
     def _text(
         self,
