@@ -504,31 +504,19 @@ class _GlassWindow:
             self.reason = "прозрачность выключена в Windows"
             return False
 
-        # Панель плотная, значит и окно должно быть плотным: без этой
-        # пометки Windows держит окно полупрозрачным по своим настройкам, а
-        # сама Tk из-за этого отдаёт холсту меньше точек, чем нужно картинке.
-        try:
-            user32.SetWindowLongW(
-                wintypes.HWND(self._hwnd), -20,
-                user32.GetWindowLongW(wintypes.HWND(self._hwnd), -20) | 0x00000020,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
+        # Панель плотная. Слоёное окно ей не годится: на нём Windows рисует
+        # из окна одно место, и на экране остаётся пустой прямоугольник —
+        # ни рисунка, ни кнопок. Без него окно плотное и показывает себя
+        # целиком. Поэтому окно только без рамки и поверх других.
         self.ok = self._apply()
         if self.ok:
-            self.mode = "alpha"
+            self.mode = "plain"
         if not self.ok:
             self.reason = self.reason or "система отказала"
         return self.ok
 
     def make_opaque(self) -> None:
-        """Снять с окна полупрозрачность совсем: панель плотная.
-
-        Слоёное окно с прозрачностью Tk мерит по-своему: картинке нужно 396
-        точек, а холст получает 379, и на нём появляется полоса прокрутки.
-        Панель рисуется плотной, поэтому окно тоже делается плотным.
-        """
+        """Снять с окна полупрозрачность совсем: панель плотная."""
         if not self._installed or self._user32 is None:
             return
         window = self._wintypes.HWND(self._hwnd)
@@ -549,13 +537,18 @@ class _GlassWindow:
         user32.SetWindowLongW.argtypes = [w.HWND, ctypes.c_int, ctypes.c_long]
 
     def reapply(self) -> bool:
-        """Поставить стиль окна заново после показа: показанное окно его теряет."""
+        """Снять с окна полупрозрачность после показа: Tk её возвращает.
+
+        Слоёное окно на этой системе показывает из панели только место под
+        рисунок. После каждого показа окна стиль ставится заново, чтобы
+        полоса прозрачности в него не вернулась.
+        """
         if not self.ok:
             return False
         try:
             window = self._wintypes.HWND(self._hwnd)
             self._user32.SetWindowLongW(window, -20,
-                                        self._user32.GetWindowLongW(window, -20) | 0x00080000)
+                                        self._user32.GetWindowLongW(window, -20) & ~0x00080000)
             self._user32.SetWindowLongW(window, -16,
                                         self._user32.GetWindowLongW(window, -16))
             return True
@@ -888,11 +881,12 @@ class _TkStatusPanel:
         # без рамки бывает на 17 точек уже своей ширины, и на узком холсте Tk
         # заводит справа серую полосу прокрутки, а картину сдвигает вниз.
         # Рисовать в окне негде, кроме метки — она и держит картинку.
+        # Панель рисуется меткой во всё окно. Кнопка текста у неё
+        # отключается: у кнопки бьётся вставка одним цветом, и сквозь неё
+        # ничего не видно.
         label = tk.Label(window, bd=0, highlightthickness=0, padx=0, pady=0,
                          anchor="nw", bg=self._window_color())
-        # Окно не пересобирается под метку: оно ровно того размера, что и
-        # рисунок. Место в нём занимает и место, оставшееся по краям окна.
-        label.place(x=0, y=0)
+        label.place(x=0, y=0, width=self._size[0], height=self._size[1])
         self._label = label
 
         self._size = (self._spec(_PANEL_W), self._spec(170))
@@ -1123,9 +1117,13 @@ class _TkStatusPanel:
         # клетки видно то, что за панелью, а край выходит мягким.
         self._photo = ImageTk.PhotoImage(self._shown_image(small).convert("RGBA"))
         label = self._label
-        if label is not None:
-            label.configure(image=self._photo, width=w, height=h)
         width, height = self._size
+        if label is not None:
+            # Картинка и место под неё — одного размера. На место при показе
+            # окно пересобирается, а картинка в метке своей высоты не знает:
+            # с шириной она теряет высоту, и метка выходит тонкой полосой.
+            label.configure(image=self._photo)
+            label.place_configure(x=0, y=0, width=width, height=height)
         self._fit_window(width, height)
         self._window_size_changed(apply_geometry=self._state == "idle")
 
@@ -2128,12 +2126,9 @@ class _TkStatusPanel:
         self._window.geometry(f"{self._size[0]}x{self._size[1]}")
         self._reposition()
         self._window.lift()
-        # Показанное окно готово принять прозрачность, а рисунок после него
-        # рисуем заново: холст у показанной панели уже имеет свой размер.
-        if self._glass.mode == "alpha":
-            self._glass.opacity(self._window, _GLASS_ALPHA)
-        else:
-            self._glass.reapply()
+        # Показанное окно Tk снова делает слоёным. Панель плотная — значит
+        # и окно плотное: снимаем прозрачность и рисуем картинку снова.
+        self._glass.reapply()
         self._request_render()
 
     def update(
