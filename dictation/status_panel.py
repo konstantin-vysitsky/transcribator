@@ -691,10 +691,10 @@ class _TkStatusPanel:
         self._flash_until = 0.0
         # Начало записи: по нему считается время, которое видно в `page_state`.
         self._recording_since: float | None = None
-        # Окно панели: спрятано ли оно и какого размера на экране. Чередование
-        # ступеней и доли распознавания не должны перепоказывать окно.
-        self._panel_hidden = False
-        self._panel_shown_size: tuple[int, int] | None = None
+        # Окно панели: показано ли оно на экране и какого размера. Чередование
+        # ступеней и доли распознавания не должны переставлять окно.
+        self._shown = False
+        self._shown_size: tuple[int, int] | None = None
 
         self._skip_auto_enter = threading.Event()
         # `_alive` гаснет при остановке: после выхода из цикла окна очередь
@@ -1910,7 +1910,27 @@ class _TkStatusPanel:
     def _apply_reset_session(self) -> None:
         self._skip_auto_enter.clear()
         self._auto_enter_btn.progress = 1.0
+        self._clear_stages()
         self._apply_reset_session_ai()
+        self._state = "recording"
+        self._render()
+
+    def _clear_stages(self) -> None:
+        """Ступени с нуля, без оглядки на прежнее состояние.
+
+        Зовётся при каждом нажатии, до всякой вести о ходе работы. Иначе
+        панель успевала нарисоваться от прошлой диктовки — с полосой под
+        конец — и только потом ползла назад к нулю.
+        """
+        self._transcribe_done = False
+        self._ai_result = None
+        self._progress = 0.0
+        self._shown = 0.0
+        self._ai_progress = 0.0
+        self._ai_shown = 0.0
+        self._ai_note = ""
+        self._ai_elapsed = 0.0
+        self._ai_started = time.monotonic()
 
     def reset_session(self) -> None:
         if self._alive and self._root is not None:
@@ -1924,20 +1944,19 @@ class _TkStatusPanel:
     # --- ход работы: две ступени и плавная заливка --------------------------
 
     def _reset_stages(self, state: ActivityState) -> None:
-        """Новая диктовка — ступени с нуля.
+        """Смена состояния: что описывает старый ход, то стираем.
 
         Доли сбрасывать обязательно: иначе вторая диктовка начиналась бы с
-        заполненной до половины полосы от прошлой.
+        заполненной до половины полосы от прошлой. Смена «распознаю» ↔
+        «обрабатываю» — это переход между ступенями, а не новая диктовка:
+        доли тут остаются, их ведёт метка ступени.
         """
         self._transcribe_done = False
         self._ai_result = None
         self._ai_progress = 0.0
         self._ai_note = ""
         self._ai_elapsed = 0.0
-        if state == "recording":
-            return
-        # Смена «распознаю» ↔ «обрабатываю» — это переход между ступенями,
-        # а не новая диктовка. Доли тут не трогаем: их ведёт метка ступени.
+        # Смена «распознаю» ↔ «обрабатываю» — переход между ступенями.
         if state in ("transcribing", "processing"):
             return
         self._progress = 0.0
@@ -2094,13 +2113,14 @@ class _TkStatusPanel:
         self._render()
         # Окно уже на экране (чередование «распознаю» ↔ «обрабатываю», доли
         # распознавания по полсекунды) — его не трогаем: показанный раз окно
-        # не перепоказывается и не мелькает на каждом шаге хода.
-        hidden = getattr(self, "_panel_hidden", False)
-        if hidden:
-            width, height = self._size
-            if (width, height) == getattr(self, "_panel_shown_size", None):
-                self._panel_hidden = False
-                return
+        # не перепоказывается и не мелькает на каждом шаге хода. Но рисунок,
+        # нарисованный выше, выводим без перестановки окна: сброс долей
+        # делается ровно к этому сроку, и иначе сброс ждал бы конца хода, а
+        # панель всё это время показывала бы ход прошлой диктовки.
+        if self._shown:
+            self._force_paint()
+            self._shown_size = self._size
+            return
         self._show_window()
 
     def _show_window(self) -> None:
@@ -2108,19 +2128,24 @@ class _TkStatusPanel:
 
         Показанное окно Tk одевает в рамку Windows, и дерево виджетов уходит
         в Windows таким, каким было до показа: на экране мелькает голое окно
-        с рамкой и пустым нутром. Поэтому размер и место ставятся до показа,
-        виджеты досылаются сразу после просьбы о показе, и только потом окно
-        выходит на экран (deiconify): к этому мигу рамку уже снимает
-        системный вызов, а внутри стоит готовый рисунок. На время пересборки
-        окно прозрачно: пока Windows не перерисовала своё, показывать нечего.
+        с рамкой и пустым нутром. Поэтому сперва размер, потом просьба о
+        показе, потом досылка виджетов и рисунка, и только потом окно выходит
+        на экран (deiconify) — без рамки, сразу с панелью.
+
+        Окно на экране и нужно — его не трогают совсем: ни размер, ни место
+        не меняются от доли хода к доле, а всякое переставление окна видно
+        глазом.
         """
         if self._window is None:
             return
+        width, height = self._size
+        if self._shown and (width, height) == self._shown_size:
+            self._render()
+            return
         self._hold_window_off_screen()
         self._render()
-        width, height = self._size
-        self._window.withdraw()
         try:
+            self._window.withdraw()
             self._window.geometry(f"{width}x{height}")
             self._window.update_idletasks()
             self._window.overrideredirect(False)
@@ -2137,52 +2162,18 @@ class _TkStatusPanel:
         self._window.lift()
         self._render()
         self._force_paint()
-        self._panel_hidden = False
-        self._panel_shown_size = self._size
+        self._shown = True
+        self._shown_size = self._size
 
     def _hide_window(self) -> None:
-        """Убрать панель с экрана.
-
-        Просто `withdraw` мало: показанное окно Tk держит в Windows свою
-        маску, и после спрятать-показать оно выходит пустым прямоугольником.
-        Поэтому в паре с прятаньем окно пересобирается заново — как при
-        самом первом показе.
-        """
+        """Убрать панель с экрана. Окно не пересобирается: оно одно на запуск."""
         if self._window is None:
             return
         self._window.withdraw()
-        self._build_window()
-
-    def _build_window(self) -> None:
-        """Создать окно панели заново: спрятанным и прозрачным."""
-        if self._root is None:
-            return
-        window = tk.Toplevel(self._root)
-        window.withdraw()
-        window.overrideredirect(True)
-        window.attributes("-topmost", True)
-        window.geometry(f"{self._size[0]}x{self._size[1]}")
-        window.attributes("-alpha", 0.0)
-        window.configure(bg=self._window_color())
-        window.bind("<Button-1>", self._on_mouse_down, add="+")
-        window.bind("<B1-Motion>", self._on_drag_move, add="+")
-        window.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
-        window.bind("<Motion>", self._on_motion, add="+")
-        window.bind("<Leave>", lambda _e: self._set_hover(None), add="+")
-        self._window = window
-        self._label = tk.Label(window, bd=0, highlightthickness=0, padx=0, pady=0,
-                               anchor="nw", bg=self._window_color())
-        self._label.place(x=0, y=0, width=self._size[0], height=self._size[1])
-        self._glass = _GlassWindow()
-        self._glass.install(window)
-        self._panel_hidden = True
+        self._shown = False
 
     def _hold_window_off_screen(self) -> None:
-        """Свести прозрачность окна в ноль на время пересборки.
-
-        Пока окно пересобирается, новая маска Windows пустая: без этого на
-        экране миг висит голый прямоугольник.
-        """
+        """Свести прозрачность окна в ноль, пока оно переставляется."""
         if self._window is None:
             return
         try:
