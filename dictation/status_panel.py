@@ -2079,21 +2079,26 @@ class _TkStatusPanel:
         self._render()
         # Окно и размер ставим вместе с показом: одно окно в процессе — обычный
         # случай, второе (в проверке) иначе вышло бы без места на экране.
-        self._window.deiconify()
-        # Показанное окно Tk одевает в рамку Windows и сама же просит её
-        # снять: рамка держит справа 17 точек под полосу прокрутки. Между
-        # двумя просьбами окно не перерисовывается, иначе размер затвердеет
-        # вместе с рамкой и точка-другая останется белой.
+        # Показанное окно Tk одевает в рамку Windows, и дерево виджетов уходит
+        # в Windows таким, каким было до показа: на экране мелькает голое окно
+        # с рамкой и пустым нутром. Поэтому размер и место ставятся до показа,
+        # виджеты досылаются сразу после просьбы о показе, и только потом окно
+        # выходит на экран (deiconify): к этому мигу рамку уже снимает
+        # системный вызов, а внутри стоит готовый рисунок.
+        width, height = self._size
+        self._window.withdraw()
         try:
+            self._window.geometry(f"{width}x{height}")
+            self._window.update_idletasks()
             self._window.overrideredirect(False)
+            self._window.geometry(f"{width}x{height}")
             self._window.update_idletasks()
             self._window.overrideredirect(True)
         except tk.TclError:
             pass
-        self._window.geometry(f"{self._size[0]}x{self._size[1]}")
-        self._window.update_idletasks()
-        self._window.geometry(f"{self._size[0]}x{self._size[1]}")
+        self._glass.reapply()
         self._reposition()
+        self._window.deiconify()
         # Без рамки и без прозрачности: панель плотная и занимает все свои точки.
         self._glass.reapply()
         self._window.lift()
