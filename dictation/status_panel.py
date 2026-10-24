@@ -224,7 +224,7 @@ _PANEL_W = 396
 _PANEL_PAD_X = 16
 _PANEL_PAD_Y = 14
 _CONTENT_W = 364
-_RADIUS = 20          # у чёрного стекла — 24
+_RADIUS = 0           # края прямые: скругления у панели нет
 _STATUS_ROW_H = 34
 _DONE_W = 64
 _DONE_H = 32
@@ -263,8 +263,9 @@ _SHEEN_STRIP = 72
 _STAGE_CLEAR = 9    # место вокруг полосы: мягкое пятно у её конца не должно срезаться
 _COLOR_STEPS = 8
 _COLOR_MS = 20
-# Насколько панель прозрачна: 1 — плотная, как нарисована, 0,5 — половина.
-_GLASS_ALPHA = 0.8
+# Насколько панель прозрачна: 1 — плотная, как нарисована. Панель плотная:
+# человек читает её, а не смотрит, что за ней.
+_GLASS_ALPHA = 1.0
 
 _ICON_ABORT = "\ue711"
 _ICON_FALLBACK = "\u2715"
@@ -337,9 +338,15 @@ def _load_font(paths: tuple[str, ...], size: int) -> ImageFont.FreeTypeFont | Im
     return ImageFont.load_default()
 
 
+# Весь текст панели крупнее макета на пятую часть: мелкие подписи на
+# пёстром фоне читались плохо. Растёт и значок крестика — иначе он терялся
+# бы рядом с крупной подписью.
+_TEXT_GAIN = 1.2
+
+
 def _fonts(scale: float, supersample: int = _SUPERSAMPLE_MAX) -> _Fonts:
     def size(points: float) -> int:
-        return max(8, round(points * scale * supersample))
+        return max(8, round(points * _TEXT_GAIN * scale * supersample))
 
     return _Fonts(
         body=(_load_font(_FONT_BODY, size(9.5)), size(9.5)),
@@ -895,6 +902,8 @@ class _TkStatusPanel:
             out["switch_h"] = self._spec(_SWITCH_H)
             out["bottom"] = out["switch_top"] + out["switch_h"] + pad_y
         else:
+            # Под чертой в этих состояниях пусто, поэтому и черты нет: без
+            # двух промежутков, которыми она отбивалась от строк, окно ниже.
             # Две ступени хода. У второй сверху и снизу есть место под мягкое
             # пятно: без него свечение срезалось бы краем полосы.
             clear = self._spec(_STAGE_CLEAR)
@@ -946,8 +955,6 @@ class _TkStatusPanel:
         img = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         radius = self._spec(_RADIUS)
-        if self._style == "black":
-            radius = round(radius * 1.2)
         r2 = radius * ss
         w2 = w * ss
         h2 = h * ss
@@ -960,37 +967,49 @@ class _TkStatusPanel:
         # через Tk рисует корпус плотно, а тонкость даёт прозрачность окна.
         # Без стекла прозрачность клеток сплющивается на плотный цвет.
         body = _hex_rgba(bg) if self._glass.mode == "alpha" else (*_hex_rgba(bg)[:3], 255)
-        d.rounded_rectangle((0, 0, w2 - 1, h2 - 1), radius=r2, fill=body)
+        corners = (0, 0, w2 - 1, h2 - 1)
+        if r2 > 0:
+            d.rounded_rectangle(corners, radius=r2, fill=body)
+        else:
+            # Края прямые: при нулевом скруглении Pillow рисует углы срезанными.
+            d.rectangle(corners, fill=body)
         # Свет сверху: полупрозрачная полоса от верха корпуса. Заливать её
         # непрозрачным цветом нельзя — панель вышла бы двухцветной.
         overlay = Image.new("RGBA", (w2, h2), (0, 0, 0, 0))
         od = ImageDraw.Draw(overlay)
-        od.rounded_rectangle(
-            (2 * ss, ss, w2 - 2 * ss, int(h2 / 2.2)),
-            radius=max(2, r2 - 2 * ss),
-            fill=_rgba(str(pal.get("top_glow", bg)), 0.5),
-        )
+        glow_box = (2 * ss, ss, w2 - 2 * ss, int(h2 / 2.2))
+        glow = _rgba(str(pal.get("top_glow", bg)), 0.5)
+        if r2 > 0:
+            od.rounded_rectangle(glow_box, radius=max(2, r2 - 2 * ss), fill=glow)
+        else:
+            od.rectangle(glow_box, fill=glow)
         img.paste(overlay, (0, 0), overlay)
-        d.rounded_rectangle(
-            (0, 0, w2 - 1, h2 - 1), radius=r2, outline=border, width=ss
-        )
+        if r2 > 0:
+            d.rounded_rectangle(corners, radius=r2, outline=border, width=ss)
+        else:
+            d.rectangle(corners, outline=border, width=ss)
         if self._style == "smoke":
-            # Кромка идёт по высоте корпуса. Верх и низ скругляются по тому
-            # же радиусу, что и корпус: иначе снаружи торчали бы прямые углы.
+            # Кромка идёт по высоте корпуса. Края у корпуса прямые, и полоса
+            # стоит прямой: скруглять её было бы не по чему.
             top = lay["pad_y"]
             bottom = h - lay["pad_y"]
             bar_w = max(2, self._spec(3))
             mid = (top + bottom) // 2
             self._accent_bar(d, (0, top, bar_w, mid), str(pal["accent_left"]),
-                             top_round=True, bottom_round=False)
+                             top_round=False, bottom_round=False)
             self._accent_bar(d, (0, mid, bar_w, bottom), str(pal["accent_right"]),
-                             top_round=False, bottom_round=True)
+                             top_round=False, bottom_round=False)
 
-        # Хром между строками.
+        # Разделитель между строкой состояния и ползунками. Он нужен, только
+        # когда под ним что-то есть: ползунки в записи. В остальных состояниях
+        # под чертой пусто, и линия висела бы без пары.
         if self._state == "recording":
+            divider = Image.new("RGBA", (w2, h2), (0, 0, 0, 0))
+            dd = ImageDraw.Draw(divider)
             dy = lay["divider_y"]
-            d.line((lay["pad_x"] * ss, dy * ss, (w - lay["pad_x"]) * ss, dy * ss),
-                   fill=border, width=ss)
+            dd.line((lay["pad_x"] * ss, dy * ss, (w - lay["pad_x"]) * ss, dy * ss),
+                    fill=_rgba(border, 0.55), width=ss)
+            img.alpha_composite(divider)
 
         s = ss
         px = lay["pad_x"]
@@ -999,8 +1018,9 @@ class _TkStatusPanel:
         cx = px
         cy = lay["status_top"] + lay["status_h"] // 2
         if self._state == "recording":
-            # Точка с волнами и ореолом рисуется отдельным слоем с
-            # прозрачностью: иначе ореол закрасил бы фон квадратом.
+            # Кружок записи стоит в строке с подписью, как и буквы: верх и низ
+            # строки — одному центру. Раньше кружок поднимали отдельно, и он
+            # висел выше строки.
             slot = self._spec(_DOT_SLOT)
             layer = self._dot_layer(px + slot // 2, cy)
             if layer is not None:
