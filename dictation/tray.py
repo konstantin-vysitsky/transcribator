@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -20,11 +21,39 @@ from dictation.tray_icon import make_icon
 ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 _HISTORY_SIZE = 3
 _PREVIEW_LEN = 48
+# Расширенный вид окна и признак «служебное окно»: такое окно Windows не
+# показывает на панели задач отдельной кнопкой.
+_GWL_EXSTYLE = -20
+_WS_EX_TOOLWINDOW = 0x00000080
 
 
 def _make_icon(size: int = 64) -> Image.Image:
     """Значок трея: готовый рисунок микрофона (см. `tray_icon`)."""
     return make_icon(size)
+
+
+def _as_service_window(hwnd: int) -> int:
+    """Пометить окно служебным: на панели задач места ему не будет.
+
+    Окно, которое Windows видит на рабочем столе, получает и место на панели
+    задач — с кнопкой питоновского скрипта. Признак «служебное окно»
+    (`WS_EX_TOOLWINDOW`) снимает место, не мешая ни значку, ни меню.
+
+    Смена вида окна запускает пересчёт панели задач: без неё уже занятое
+    место остаётся висеть до следующего пересчёта.
+    """
+    if sys.platform != "win32":
+        return hwnd
+    try:
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.restype = ctypes.c_long
+        extended = user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
+        if not extended & _WS_EX_TOOLWINDOW:
+            user32.SetWindowLongW(hwnd, _GWL_EXSTYLE, extended | _WS_EX_TOOLWINDOW)
+            user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0027)
+    except Exception:  # noqa: BLE001
+        pass
+    return hwnd
 
 
 class _LeftClickIcon(pystray.Icon):
@@ -82,6 +111,16 @@ class _LeftClickIcon(pystray.Icon):
             self._show_popup_menu()
             return
         super()._on_notify(wparam, lparam)
+
+    def _create_window(self, atom):  # type: ignore[no-untyped-def]
+        """Служебное окно значка не показывать на панели задач.
+
+        pystray заводит его как обычное окно поверх рабочего стола. Из-за
+        такого окна Windows отводит процессу место на панели задач, и
+        питоновский скрипт появляется там кнопкой. Признак «служебное окно»
+        убирает это место, не мешая значку и меню.
+        """
+        return _as_service_window(super()._create_window(atom))
 
 
 class TrayApp:
@@ -254,10 +293,6 @@ class TrayApp:
 
         if state == "recording":
             self._icon.title = "● Запись — говорите"
-            try:
-                self._icon.notify("Диктовка", "Запись — говорите")
-            except Exception:
-                pass
         elif state == "transcribing":
             title = "Распознаю…"
             if detail:
@@ -282,45 +317,29 @@ class TrayApp:
         Молчать об этом нельзя: человек увидит в поле ввода необработанный
         текст и решит, что промпт плохой или модель не работает, — а причина
         в ключе, связи или балансе.
+
+        Всплывающего уведомления нет намеренно: причина остаётся на кнопке
+        панели до следующей удачной обработки.
         """
-        if self._icon is None:
-            return
-        try:
-            self._icon.notify("Обработка через ИИ не удалась", reason)
-        except Exception:
-            pass
+        return
 
     def notify_ai_not_ready(self) -> None:
-        """Обработку включили, а ключа нет. Сказать об этом сразу, а не после диктовки."""
-        if self._icon is None:
-            return
-        try:
-            self._icon.notify(
-                "ИИ не настроен",
-                "Ключа нет. Заведите его в кабинете федота.рф и вставьте "
-                "в config.local.json рядом с config.json.",
-            )
-        except Exception:
-            pass
+        """Обработку включили, а ключа нет. Сказать об этом сразу, а не после диктовки.
+
+        Всплывающего уведомления нет: «ИИ не настроен» уже написано на кнопке
+        панели, а где взять ключ — в меню и в README.
+        """
+        return
 
     def notify_hotkey_failed(self) -> None:
         """Сказать, что горячая клавиша не работает.
 
         Молчать нельзя: человек нажимает клавишу, ничего не происходит, и
         выглядит это как поломка приложения, а не как перехват ввода чужим
-        процессом.
+        процессом. Подсказка значка несёт эту причину вместо всплывающего
+        уведомления.
         """
         self.set_tooltip("Диктовка: горячая клавиша НЕ работает")
-        if self._icon is None:
-            return
-        try:
-            self._icon.notify(
-                "Горячая клавиша не работает",
-                "Нажатия не доходят до диктовки. Обычно мешает приложение, "
-                "запущенное от администратора.",
-            )
-        except Exception:
-            pass
 
     def add_transcription(self, text: str) -> None:
         if not text.strip():
@@ -330,16 +349,17 @@ class TrayApp:
         self._refresh_menu()
 
     def _copy_history_item(self, text: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
+        """Скопировать строку из «Последних».
+
+        Всплывающего «Скопировано» нет: копирование не нуждается в
+        подтверждении, а уведомление Windows показывает поверх всего экрана.
+        """
+
         def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
             try:
                 pyperclip.copy(text)
             except Exception:
                 return
-            if self._icon is not None:
-                try:
-                    self._icon.notify("Скопировано", self._preview(text))
-                except Exception:
-                    pass
 
         return _handler
 
@@ -461,15 +481,6 @@ class TrayApp:
                 return
             self._panel_style = panel_style.apply_style(style)
             self._status_panel.set_style(self._panel_style)
-            if self._panel_style not in PAGE_STYLES and self._icon is not None:
-                try:
-                    self._icon.notify(
-                        "Вид панели",
-                        "Этот вид ещё не перенесён на страницу: панель покажет "
-                        "заглушку. Перенесён «Чёрное стекло».",
-                    )
-                except Exception:
-                    pass
             self._refresh_menu()
 
         return _handler
@@ -506,15 +517,8 @@ class TrayApp:
             cfg = config.load_config()
             cfg["cpu_threads"] = threads
             config.save_config(cfg)
+            # Что число применится после перезапуска, сказано в самом пункте меню.
             self._refresh_menu()
-            if self._icon is not None:
-                try:
-                    self._icon.notify(
-                        "Потоки CPU",
-                        f"Установлено {threads}. Перезагрузите приложение.",
-                    )
-                except Exception:
-                    pass
 
         return _handler
 

@@ -504,9 +504,24 @@ class _GlassWindow:
         self.ok = self._apply()
         if self.ok:
             self.mode = "plain"
+            # Сразу после создания окна Tk Windows могла уже отвести панели
+            # место на панели задач; после смены вида окна этот список
+            # пересчитывается, и панель из него пропадает.
+            self._hide_from_taskbar()
         if not self.ok:
             self.reason = self.reason or "система отказала"
         return self.ok
+
+    def _hide_from_taskbar(self) -> None:
+        """Пересчитать панель задач, чтобы служебное окно с неё пропало."""
+        if not self._installed:
+            return
+        try:
+            self._user32.SetWindowPos(
+                self._wintypes.HWND(self._hwnd), None, 0, 0, 0, 0, 0x0027
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def make_opaque(self) -> None:
         """Снять с окна полупрозрачность совсем: панель плотная."""
@@ -528,6 +543,9 @@ class _GlassWindow:
         user32.GetWindowLongW.argtypes = [w.HWND, ctypes.c_int]
         user32.SetWindowLongW.restype = ctypes.c_long
         user32.SetWindowLongW.argtypes = [w.HWND, ctypes.c_int, ctypes.c_long]
+        user32.SetWindowPos.restype = ctypes.c_bool
+        user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_uint]
 
     def reapply(self) -> bool:
         """Поставить окну «без рамки и без прозрачности» после показа.
@@ -552,13 +570,39 @@ class _GlassWindow:
             # стиле, поэтому Tk не заводит ни полос прокрутки, ни слоёного
             # окна — а именно слоёное окно и портило панель.
             style = (style | 0x00200000) & ~0x00080000 & ~0x00040000
-            extended = extended & ~0x00080000 & ~0x00000080
+            # Окно без рамки восстанавливается в стиль по умолчанию, и флаг
+            # «служебное окно» с него слетает. Без флага панель получает
+            # кнопку на панели задач рядом с питоновским процессом. Поэтому
+            # флаг ставится здесь же, при каждом показе окна.
+            extended = (extended & ~0x00080000) | 0x00000080
             self._user32.SetWindowLongW(window, -16, style)
             self._user32.SetWindowLongW(window, -20, extended)
         except Exception as error:  # noqa: BLE001
             self.reason = f"стиль окна: {error}"
             return False
         return True
+
+
+def _hide_from_taskbar(window: tk.Misc) -> None:
+    """Отметить окно Tk служебным: Windows не покажет его на панели задач.
+
+    У панели есть главное окно Tk, скрытое от глаз. Оно невидимо, но Windows
+    всё равно держит для процесса место на панели задач, и его получает
+    кнопка питоновского скрипта. Признак «служебное окно» такого места не даёт.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        window.update_idletasks()
+        user32 = ctypes.windll.user32
+        user32.GetWindowLongW.restype = ctypes.c_long
+        hwnd = int(user32.GetAncestor(int(window.winfo_id()), 2))
+        if not hwnd:
+            return
+        extended = user32.GetWindowLongW(hwnd, -20)
+        user32.SetWindowLongW(hwnd, -20, extended | 0x00000080)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _rounded(d: ImageDraw.ImageDraw, box: tuple[float, float, float, float],
@@ -827,6 +871,7 @@ class _TkStatusPanel:
     def _run(self) -> None:
         root = tk.Tk()
         root.withdraw()
+        _hide_from_taskbar(root)
         self._root = root
         scale = self._scale
         self._fonts = _fonts(scale)
