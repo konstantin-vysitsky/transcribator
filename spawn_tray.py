@@ -6,7 +6,9 @@ import sys
 import time
 from pathlib import Path
 
-from launch_helper import project_root, resolve_pythonw, venv_env
+from launch_helper import project_root, quiet_kwargs, venv_env, venv_python
+
+_RUN_MODULE = "dictation.main"
 
 LOG_NAME = "dictation.log"
 
@@ -47,8 +49,10 @@ def main() -> None:
     args = parser.parse_args()
 
     root = project_root()
-    interpreter = resolve_pythonw(root)
-    cmd = [str(interpreter), "-m", "dictation.main", "--tray"]
+    # Именно интерпретатор venv: базовый python идёт без моста venv, `-m` не
+    # находит пакеты проекта, и копия молча падает ещё до окна.
+    interpreter = venv_python(root)
+    cmd = [str(interpreter), "-m", _RUN_MODULE, "--tray"]
     if args.config:
         cmd.extend(["--config", args.config])
 
@@ -67,8 +71,7 @@ def main() -> None:
         "cwd": str(root),
         "env": env,
     }
-    if sys.platform == "win32":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    kwargs.update(quiet_kwargs())
 
     handle = subprocess.Popen(cmd, **kwargs)
     _log(root, f"процесс запущен, pid={handle.pid}")

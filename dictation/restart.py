@@ -1,16 +1,7 @@
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 import time
 from pathlib import Path
-
-
-def _pythonw(project_root: Path) -> Path:
-    from launch_helper import resolve_pythonw
-
-    return resolve_pythonw(project_root)
 
 
 def relaunch(
@@ -21,11 +12,10 @@ def relaunch(
     parent_pid: int | None = None,
 ) -> None:
     """Запускает новый экземпляр приложения и завершает текущий."""
+    from launch_helper import spawn_detached
+
     root = project_root.resolve()
-    launcher = (root / ".venv" / "Scripts" / "pythonw.exe").resolve()
-    if not launcher.is_file():
-        launcher = _pythonw(root)
-    cmd = [str(launcher), str(root / "spawn_tray.py")]
+    cmd = [str(root / ".venv" / "Scripts" / "pythonw.exe"), str(root / "spawn_tray.py")]
     if config_path is not None:
         cmd.extend(["--config", str(config_path.resolve())])
     if parent_pid is not None:
@@ -33,16 +23,7 @@ def relaunch(
 
     time.sleep(delay_s)
 
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-
-    from launch_helper import venv_env
-
-    subprocess.Popen(
-        cmd,
-        cwd=str(root),
-        env={**os.environ, **venv_env(root)},
-        creationflags=creationflags,
-        close_fds=True,
-    )
+    # Отсоединённый запуск (`DETACHED_PROCESS`) отнимает окна у новой копии
+    # целиком — и панель диктовки Windows начинает держать на панели задач
+    # отдельной кнопкой. `spawn_detached` скрывает окно, но оставляет консоль.
+    spawn_detached(cmd, root)
