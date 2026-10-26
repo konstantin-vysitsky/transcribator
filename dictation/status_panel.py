@@ -545,12 +545,18 @@ class _GlassWindow:
             return
         try:
             window = self._wintypes.HWND(self._hwnd)
+            style = self._user32.GetWindowLongW(window, -16)
             extended = self._user32.GetWindowLongW(window, -20)
-            if not extended & 0x00000080:
-                self._user32.SetWindowLongW(window, -20, extended | 0x00000080)
-                # Смена вида окна запускает пересчёт панели задач: без него
-                # уже занятое место остаётся висеть до следующего пересчёта.
-                self._user32.SetWindowPos(window, None, 0, 0, 0, 0, 0x0027)
+            wanted_style = style & ~0x00200000 & ~0x00100000
+            wanted_extended = extended | 0x00000080
+            if wanted_style == style and wanted_extended == extended:
+                return
+            self._user32.SetWindowLongW(window, -16, wanted_style)
+            self._user32.SetWindowLongW(window, -20, wanted_extended)
+            # Смена вида окна запускает пересчёт панели задач и убирает с
+            # окна полосу прокрутки: без пересчёта занятое место остаётся
+            # висеть, а белая полоса остаётся на своём месте.
+            self._user32.SetWindowPos(window, None, 0, 0, 0, 0, 0x0027)
         except Exception:  # noqa: BLE001
             pass
 
@@ -602,7 +608,13 @@ class _GlassWindow:
             # Окно без рамки. Прозрачности нет ни в стиле, ни в расширенном
             # стиле, поэтому Tk не заводит ни полос прокрутки, ни слоёного
             # окна — а именно слоёное окно и портило панель.
-            style = (style | 0x00200000) & ~0x00080000 & ~0x00040000
+            #
+            # Полосы прокрутки в самом стиле окна быть не должно: с ней окно
+            # шириной 396 точек отдаёт рисунку 379, а остальные 17 занимает
+            # белая полоса во всю высоту. Признак этот ставится не нами, а
+            # возвращается окну само; поэтому он снимается здесь каждый раз.
+            style = style & ~0x00200000 & ~0x00100000
+            style = style & ~0x00080000 & ~0x00040000
             # Окно без рамки восстанавливается в стиль по умолчанию, и флаг
             # «служебное окно» с него слетает. Без флага панель получает
             # кнопку на панели задач рядом с питоновским процессом. Поэтому
