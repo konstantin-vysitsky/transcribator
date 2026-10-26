@@ -484,6 +484,7 @@ class _GlassWindow:
 
         self._user32 = user32
         self._wintypes = wintypes
+        self._window = window
         self._setup_calls()
         try:
             window.update_idletasks()
@@ -504,22 +505,52 @@ class _GlassWindow:
         self.ok = self._apply()
         if self.ok:
             self.mode = "plain"
-            # Сразу после создания окна Tk Windows могла уже отвести панели
-            # место на панели задач; после смены вида окна этот список
-            # пересчитывается, и панель из него пропадает.
-            self._hide_from_taskbar()
+            self.mark_service_window()
         if not self.ok:
             self.reason = self.reason or "система отказала"
         return self.ok
 
-    def _hide_from_taskbar(self) -> None:
-        """Пересчитать панель задач, чтобы служебное окно с неё пропало."""
-        if not self._installed:
+    def _refresh_hwnd(self) -> bool:
+        """Перечитать системный номер окна: Tk его пересоздаёт.
+
+        Смена «без рамки» в Tk уничтожает прежнее окно и заводит новое с
+        новым номером. Прежний номер после этого недействителен: запросы к
+        нему молча возвращают пустоту, стиль не ставится, и на панели задач
+        появляется кнопка питоновского скрипта. Поэтому номер берётся заново
+        перед каждым изменением вида.
+        """
+        window = self._window
+        if window is None:
+            return False
+        try:
+            self._hwnd = int(
+                self._user32.GetAncestor(self._wintypes.HWND(int(window.winfo_id())), 2)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(self._hwnd)
+
+    def mark_service_window(self) -> None:
+        """Отметить окно служебным и убрать панель задач с экрана.
+
+        Панель обязана быть служебным окном всё время, пока она видна: иначе
+        Windows даёт процессу место на панели задач, и там появляется кнопка
+        питоновского скрипта. Признак слетает дважды — когда Tk пересоздаёт
+        окно на смену «без рамки» и когда сам Tk трогает вид окна ради
+        прозрачности. Поэтому метка ставится заново после каждого показа.
+        """
+        if not self._installed or self._user32 is None:
+            return
+        if not self._refresh_hwnd():
             return
         try:
-            self._user32.SetWindowPos(
-                self._wintypes.HWND(self._hwnd), None, 0, 0, 0, 0, 0x0027
-            )
+            window = self._wintypes.HWND(self._hwnd)
+            extended = self._user32.GetWindowLongW(window, -20)
+            if not extended & 0x00000080:
+                self._user32.SetWindowLongW(window, -20, extended | 0x00000080)
+                # Смена вида окна запускает пересчёт панели задач: без него
+                # уже занятое место остаётся висеть до следующего пересчёта.
+                self._user32.SetWindowPos(window, None, 0, 0, 0, 0, 0x0027)
         except Exception:  # noqa: BLE001
             pass
 
@@ -562,6 +593,8 @@ class _GlassWindow:
 
     def _apply(self) -> bool:
         w = self._wintypes
+        if not self._refresh_hwnd():
+            return False
         window = w.HWND(self._hwnd)
         try:
             style = self._user32.GetWindowLongW(window, -16)
@@ -2199,6 +2232,9 @@ class _TkStatusPanel:
         self._glass.reapply()
         self._window.lift()
         self._force_paint()
+        # Прозрачность, которой Tk гасит и зажигает окно, снимает с него
+        # признак служебного окна. Ставим его заново уже на показанном окне.
+        self._glass.mark_service_window()
         self._window_shown = True
 
     def _hide_window(self) -> None:
