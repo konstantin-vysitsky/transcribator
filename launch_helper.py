@@ -55,6 +55,36 @@ def venv_python(root: Path | None = None) -> Path:
     return Path(sys.executable).resolve()
 
 
+def crash_log_path(root: Path | None = None) -> Path:
+    """Куда писать поток вывода приложения, запущенного без консоли.
+
+    Отдельный файл, а не `dictation.log`: журнал пишется с отметкой времени
+    самим приложением, а здесь — всё, что выводится в stdout/stderr. Сюда
+    попадает в том числе traceback, который интерпретатор печатает перед
+    смертью процесса, если падение случится раньше, чем вступит в силу
+    `sys.excepthook`.
+    """
+    return (root or project_root()).resolve() / "dictation-stderr.log"
+
+
+def redirected_output(root: Path | None = None) -> dict:
+    """Открыть файл для вывода дочернего процесса.
+
+    Без этого stdout/stderr уходят в никуда: приложение стартует скрытым, и
+    падение дочернего процесса выглядит как «нажал F7 — ничего не
+    произошло». Файл открывается в режиме дозаписи и обрезается до разумного
+    предела, чтобы не расти бесконечно.
+    """
+    path = crash_log_path(root)
+    try:
+        if path.is_file() and path.stat().st_size > 2 * 1024 * 1024:
+            path.write_text("", encoding="utf-8")
+        handle = path.open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        return {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    return {"stdout": handle, "stderr": subprocess.STDOUT}
+
+
 def spawn_detached(cmd: list[str], root: Path | None = None) -> subprocess.Popen:
     """Запустить копию приложения, которая переживёт вызвавшего.
 

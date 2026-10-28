@@ -128,6 +128,15 @@ class HotkeyListener:
         if not self._all_targets_down() and self._on_record_stop and self._on_record_stop():
             self._recording = False
 
+    def is_active(self) -> bool:
+        """Думает ли слушатель, что запись идёт.
+
+        Без этого вопроса расхождение «микрофон пишет, а клавиша не знает»
+        невозможно увидеть: нажатие молча упирается в проверку записи, и
+        горячая клавиша перестаёт работать совсем.
+        """
+        return self._recording
+
     def reset_state(self) -> None:
         self._recording = False
         self._combo_triggered = False

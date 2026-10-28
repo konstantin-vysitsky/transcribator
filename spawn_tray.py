@@ -6,7 +6,13 @@ import sys
 import time
 from pathlib import Path
 
-from launch_helper import project_root, quiet_kwargs, venv_env, venv_python
+from launch_helper import (
+    project_root,
+    quiet_kwargs,
+    redirected_output,
+    venv_env,
+    venv_python,
+)
 
 _RUN_MODULE = "dictation.main"
 
@@ -72,6 +78,10 @@ def main() -> None:
         "env": env,
     }
     kwargs.update(quiet_kwargs())
+    # Вывод дочернего процесса — в файл. Раньше он уходил в никуда, и падение
+    # приложения (traceback от интерпретатора) не оставляло следов нигде: ни в
+    # журнале, ни в консоли, которой у него нет.
+    kwargs.update(redirected_output(root))
 
     handle = subprocess.Popen(cmd, **kwargs)
     _log(root, f"процесс запущен, pid={handle.pid}")

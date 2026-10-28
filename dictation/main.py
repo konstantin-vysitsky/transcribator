@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -39,10 +40,50 @@ def _log_line(project_root: Path, message: str) -> None:
     """
     try:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        # многострочные сообщения (traceback) пишутся с отступом под временем,
+        # иначе строки теряют привязку к событию и журнал читается как разные
+        lines = str(message).splitlines() or [""]
         with (project_root / LOG_NAME).open("a", encoding="utf-8") as handle:
-            handle.write(f"{stamp}  {message}\n")
+            handle.write(f"{stamp}  {lines[0]}\n")
+            for extra in lines[1:]:
+                handle.write(f"{' ' * 21}{extra}\n")
     except OSError:
         pass
+
+
+def _install_crash_logging(project_root: Path) -> None:
+    """Записать в журнал причину падения, а не оставить после себя тишину.
+
+    Приложение живёт в трее и консоли не имеет, а запускается оно через
+    `spawn_tray.py`, где stderr никто не читает. Поэтому необработанное
+    исключение раньше уносило процесс целиком, не оставив в журнале ни
+    строки: последняя запись — удачная диктовка, дальше обрыв, и по журналу
+    невозможно было понять ни что случилось, ни когда. Именно так диктовка
+    «спонтанно отключилась» в ночь на 28 октября.
+
+    Ловим оба пути: главный поток (sys.excepthook) и фоновые
+    (threading.excepthook) — распознавание идёт в отдельном потоке, и его
+    падение выглядело бы ровно так же.
+    """
+
+    def _format(exc_type, exc, tb, where: str) -> str:
+        text = "".join(traceback.format_exception(exc_type, exc, tb)).rstrip()
+        return f"СБОЙ {where}: {exc_type.__name__}: {exc}\n{text}"
+
+    def _main_hook(exc_type, exc, tb) -> None:
+        _log_line(project_root, _format(exc_type, exc, tb, "главного потока"))
+        # Прежнее поведение всё же не молчит там, где stderr всё-таки есть
+        # (запуск из консоли при разработке).
+        sys.__excepthook__(exc_type, exc, tb)
+
+    def _thread_hook(args) -> None:
+        if args.exc_type is SystemExit:
+            return
+        where = f"потока «{args.thread.name if args.thread else '?'}»"
+        _log_line(project_root, _format(args.exc_type, args.exc_value, args.exc_traceback, where))
+
+    sys.excepthook = _main_hook
+    threading.excepthook = _thread_hook
 
 
 def main() -> None:
@@ -56,6 +97,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.config is not None:
         config.CONFIG_PATH = args.config.resolve()
+
+    # До всего остального: иначе первое же исключение ниже унесёт процесс и
+    # не оставит в журнале ни строки (см. _install_crash_logging).
+    _install_crash_logging(config.CONFIG_PATH.parent)
 
     if not wait_single_instance():
         # Второй экземпляр молча выходит — а снаружи это выглядит как
@@ -163,6 +208,17 @@ def main() -> None:
         if recorder.is_recording():
             # Уже пишем: второе нажатие не должно начинать заново и стирать
             # записанное. Пусть решает обработчик остановки.
+            # В журнал — только когда горячая клавиша думает, что не пишет:
+            # это значит, что состояния разошлись, и молчание тут скрывает
+            # поломку целиком.
+            if hotkey is not None and not hotkey.is_active():
+                _log_line(
+                    project_root,
+                    "нажатие при «записи» в микрофоне, о которой клавиша не знает: сбрасываю",
+                )
+                recorder.stop()
+                busy.clear()
+                return False
             return False
         if busy.is_set():
             _log_line(project_root, "предыдущая диктовка ещё обрабатывается, запись не начата")
@@ -368,6 +424,28 @@ def main() -> None:
             busy.clear()
             reset_tray_idle()
 
+    def _process_audio_guarded(audio: np.ndarray, saved_path: Path | None = None) -> None:
+        """Распознать запись, что бы ни случилось.
+
+        `busy` снимается в `finally` у `process_audio`, но туда ещё надо
+        дойти: исключение до входа в `try` (например, при подсчёте длины или
+        оценке времени) оставляло флаг взведённым навсегда. Тогда приложение
+        больше не начинало ни одной записи — оно «слушало» и молчало, а
+        вылечить это можно было только перезапуском. Поэтому здесь последний
+        рубеж: любой сбой уходит в журнал, а флаг снимается всегда.
+        """
+        try:
+            process_audio(audio, saved_path)
+        except Exception as exc:  # noqa: BLE001 — приложение не должно замереть
+            message = f"сбой обработки диктовки: {type(exc).__name__}: {exc}"
+            print(message)
+            _log_line(project_root, message)
+        finally:
+            busy.clear()
+            if hotkey is not None:
+                hotkey.reset_state()
+            reset_tray_idle()
+
     def on_record_stop() -> bool:
         if not recorder.is_recording():
             return False
@@ -376,7 +454,18 @@ def main() -> None:
                 quiet_beep_stop()
             except Exception:
                 pass
-        audio = recorder.stop()
+        try:
+            audio = recorder.stop()
+        except Exception as exc:
+            # Микрофон отвалился посреди записи — звук уже не вернуть, но
+            # приложение обязано остаться живым. Без этого `busy` оставался
+            # взведённым, и дальше ни одно нажатие не начинало запись:
+            # снаружи это «включается, слушает и перестаёт работать».
+            print(f"Ошибка остановки записи: {exc}")
+            _log_line(project_root, f"ошибка остановки записи: {exc}")
+            busy.clear()
+            reset_tray_idle()
+            return False
         if audio is None:
             busy.clear()
             reset_tray_idle()
@@ -388,7 +477,7 @@ def main() -> None:
             _log_line(project_root, f"запись сохранена: {saved.name}")
             store.trim()
         threading.Thread(
-            target=process_audio,
+            target=_process_audio_guarded,
             args=(audio, saved),
             daemon=True,
             name="process-audio",

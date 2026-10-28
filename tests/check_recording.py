@@ -177,11 +177,58 @@ def test_hotkey_toggle_does_not_stick() -> None:
     )
 
 
+def test_failed_stream_does_not_jam() -> None:
+    """Микрофон перестал открываться — приложение не должно навсегда замолкнуть.
+
+    Так и выглядел отказ, из-за которого диктовка «включалась, слушала и
+    переставала работать»: поток звука не поднялся, а флаг записи остался
+    поднятым. Снаружи каждое следующее нажатие упиралось в «уже пишу» и
+    молчало, и спасал только перезапуск.
+    """
+    print("сбой открытия микрофона:")
+
+    class DeadStream:
+        active = False
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def start(self) -> None:
+            raise RuntimeError("PortAudio: device unavailable")
+
+        def stop(self) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+    recorder = Recorder(min_duration_s=0.0, preroll=False)
+    dead = DeadStream()
+    recorder._stream = dead
+
+    raised = False
+    try:
+        recorder.start()
+    except RuntimeError:
+        raised = True
+    check("сбой потока доходит наружу", raised)
+    check("запись не осталась включённой", recorder.is_recording() is False)
+    check("испорченный поток выброшен", recorder._stream is None)
+    check("испорченный поток закрыт", dead.closed)
+
+    # Главное: следующее нажатие снова пытается записать, а не молчит.
+    check("следующая запись начинается", recorder.start() is True)
+    check("слушатель видит идущую запись", recorder.is_recording() is True)
+    recorder._recording = False
+    recorder.close()
+
+
 def main() -> int:
     test_repeated_start_keeps_audio()
     test_audio_survives_crash()
     test_pending_and_trim()
     test_hotkey_toggle_does_not_stick()
+    test_failed_stream_does_not_jam()
     print()
     if FAILURES:
         print(f"ПРОВАЛЕНО: {len(FAILURES)}")

@@ -67,16 +67,36 @@ class Recorder:
                     preroll = preroll[-PREROLL_SAMPLES:]
                 self._chunks.append(preroll)
             self._recording = True
-            if self._stream is None:
-                self._stream = sd.InputStream(
-                    samplerate=SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype=DTYPE,
-                    callback=self._callback,
-                )
-                self._stream.start()
-            elif not self._stream.active:
-                self._stream.start()
+            try:
+                if self._stream is None:
+                    self._stream = sd.InputStream(
+                        samplerate=SAMPLE_RATE,
+                        channels=CHANNELS,
+                        dtype=DTYPE,
+                        callback=self._callback,
+                    )
+                    self._stream.start()
+                elif not self._stream.active:
+                    self._stream.start()
+            except Exception:
+                # Поток не пошёл — микрофон пропал, устройство занято, звук
+                # сменился. Флаг записи снимаем и поток выбрасываем целиком:
+                # поток, который не запустился, уже не годится, и держать его
+                # значит обречь на ту же ошибку каждое следующее нажатие.
+                # Без этого `is_recording()` навсегда отдаёт True, приложение
+                # считает, что уже пишет, и молча ничего не делает — это и был
+                # отказ «включается, слушает, а потом перестаёт работать».
+                self._recording = False
+                self._chunks = []
+                self._ring.clear()
+                stream = self._stream
+                self._stream = None
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                raise
         return True
 
     def is_recording(self) -> bool:
