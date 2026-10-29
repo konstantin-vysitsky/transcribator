@@ -461,6 +461,13 @@ def main() -> None:
         вылечить это можно было только перезапуском. Поэтому здесь последний
         рубеж: любой сбой уходит в журнал, а флаг снимается всегда.
         """
+        # Парные отметки «начал» и «закончил» с длительностью. Без второй
+        # строки повисшая обработка неотличима от идущей: в журнале видно,
+        # что работа началась, и больше ничего. По паре строк причина
+        # видна глазами — где оборвалось и сколько шло.
+        started = time.monotonic()
+        _log_line(project_root, "обработка начата")
+        failure: str | None = None
         try:
             process_audio(audio, saved_path)
         except BaseException as exc:  # noqa: BLE001 — приложение не должно замереть
@@ -468,7 +475,8 @@ def main() -> None:
             # «не ошибки» тоже проходят здесь, и оставлять после них признак
             # занятости взведённым нельзя. Раньше флаг переживал такой сбой, и
             # каждое следующее нажатие молча упиралось в «занято».
-            message = f"сбой обработки диктовки: {type(exc).__name__}: {exc}"
+            failure = f"{type(exc).__name__}: {exc}"
+            message = f"сбой обработки диктовки: {failure}"
             print(message)
             _log_line(project_root, message)
         finally:
@@ -477,6 +485,13 @@ def main() -> None:
             if hotkey is not None:
                 hotkey.reset_state()
             reset_tray_idle()
+            elapsed = time.monotonic() - started
+            # Сбой уже записан строкой выше — повторять «закончил» за ним
+            # незачем: выйдет две записи об одном событии.
+            if failure is None:
+                _log_line(project_root, f"обработка закончена за {elapsed:.1f} с")
+            else:
+                _log_line(project_root, f"обработка прервана через {elapsed:.1f} с")
 
     def on_record_stop() -> bool:
         if not recorder.is_recording():
@@ -506,7 +521,12 @@ def main() -> None:
         # только в памяти, и любой сбой стирал её без следа.
         saved = store.save(audio, time.strftime("%Y-%m-%d_%H-%M-%S"))
         if saved is not None:
-            _log_line(project_root, f"запись сохранена: {saved.name}")
+            # Длительность рядом с именем: по одной строке видно, сколько
+            # человек говорил, и не надо открывать файл, чтобы это понять.
+            _log_line(
+                project_root,
+                f"запись сохранена: {saved.name} ({len(audio) / SAMPLE_RATE:.1f} с)",
+            )
             store.trim()
         worker = threading.Thread(
             target=_process_audio_guarded,

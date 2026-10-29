@@ -20,17 +20,63 @@ def wait_single_instance(timeout_s: float = 15.0) -> bool:
     Раньше новая копия сразу сдавалась и выходила — снаружи это выглядело как
     «перезапустил, а приложения нет». Ждём, пока запрет отпустят; если его
     держит живой экземпляр, не ждём вовсе.
+
+    Один запрет на всех держится объектом ядра: он исчезает вместе со своим
+    владельцем, и после аварийного выхода файл с pid остаётся врать. Поэтому
+    «нас опередили» — это не «в файле есть pid», а «по этому pid действительно
+    живо приложение диктовки».
     """
     deadline = time.monotonic() + timeout_s
     while True:
         if acquire_single_instance():
             return True
-        holder = _read_lock_pid()
-        if holder is not None and _is_alive(holder):
+        if _holder_is_dictation():
             return False
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.3)
+
+
+def _holder_is_dictation() -> bool:
+    """Держит ли запрет именно приложение, а не просто чужой живой pid.
+
+    Файл с pid переживает аварийное падение владельца, а сам pid после
+    перезагрузки может достаться другой программе. Проверяем командную строку
+    процесса: если это не `dictation.main`, запрет считаем брошенным и не ждём.
+    """
+    holder = _read_lock_pid()
+    if holder is None or not _is_alive(holder):
+        return False
+    command = _process_command_line(holder)
+    if command is None:
+        # Командную строку не узнать (нет прав) — верим файлу.
+        return True
+    return "dictation" in command.lower()
+
+
+def _process_command_line(pid: int) -> str | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\")"
+                ".CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (result.stdout or "").strip()
+    return text or None
 
 
 def acquire_single_instance() -> bool:
