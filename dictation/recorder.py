@@ -14,6 +14,19 @@ PREROLL_MS = 200
 PREROLL_SAMPLES = int(SAMPLE_RATE * PREROLL_MS / 1000)
 
 
+def _default_input_signature() -> str:
+    """Опознать микрофон, который сейчас выбран в системе.
+
+    Сравнивается имя, а не номер устройства: номера присваиваются заново,
+    когда микрофон втыкают или вынимают, и один и тот же номер после
+    переподключения может указывать на другое железо. Имя остаётся именем.
+    """
+    try:
+        return str(sd.query_devices(kind="input")["name"])
+    except (sd.PortAudioError, ValueError, TypeError):
+        return ""
+
+
 class Recorder:
     def __init__(self, min_duration_s: float = 0.3, preroll: bool = True) -> None:
         self._min_duration_s = min_duration_s
@@ -22,6 +35,9 @@ class Recorder:
         self._chunks: list[np.ndarray] = []
         self._ring: deque[np.ndarray] = deque(maxlen=max(1, PREROLL_SAMPLES // 1024 + 1))
         self._stream: sd.InputStream | None = None
+        # К какому микрофону привязан открытый поток. По этому признаку
+        # замечается смена устройства между записями.
+        self._opened_signature: str = ""
         self._recording = False
         # Куда сообщать громкость: панель показывает, что её слышно. Звать
         # необязательно, а без него запись работает как прежде.
@@ -68,6 +84,25 @@ class Recorder:
                 self._chunks.append(preroll)
             self._recording = True
             try:
+                # Поток переиспользуется между записями, но привязан он к
+                # устройству на момент открытия. Микрофон могут выдернуть из
+                # USB, вставить обратно, Windows — переключить устройство по
+                # умолчанию. Тогда старый поток пишет тишину либо с чужого
+                # железа, и снаружи это «диктовка перестала понимать».
+                # Поэтому сравниваем, что выбрано сейчас, и при расхождении
+                # открываем поток заново уже на новом устройстве.
+                desired = _default_input_signature()
+                # Пустой признак означает, что поток открыт не нами (его
+                # подставили снаружи) либо признак ещё не снят. Судить о смене
+                # устройства по нему нельзя — выбрасывать чужой поток без
+                # причины незачем.
+                if (
+                    self._stream is not None
+                    and self._opened_signature
+                    and desired
+                    and desired != self._opened_signature
+                ):
+                    self._discard_stream()
                 if self._stream is None:
                     self._stream = sd.InputStream(
                         samplerate=SAMPLE_RATE,
@@ -76,8 +111,10 @@ class Recorder:
                         callback=self._callback,
                     )
                     self._stream.start()
+                    self._opened_signature = desired
                 elif not self._stream.active:
                     self._stream.start()
+                    self._opened_signature = desired
             except Exception:
                 # Поток не пошёл — микрофон пропал, устройство занято, звук
                 # сменился. Флаг записи снимаем и поток выбрасываем целиком:
@@ -89,15 +126,26 @@ class Recorder:
                 self._recording = False
                 self._chunks = []
                 self._ring.clear()
-                stream = self._stream
-                self._stream = None
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
+                self._discard_stream()
                 raise
         return True
+
+    def _discard_stream(self) -> None:
+        """Закрыть поток целиком: он больше не годится.
+
+        Поток, привязанный к пропавшему устройству, не оживает сам и держит
+        микрофон занятым. Если оставить его, каждое следующее нажатие
+        упирается в ту же ошибку, и запись перестаёт начинаться насовсем.
+        """
+        stream = self._stream
+        self._stream = None
+        self._opened_signature = ""
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     def is_recording(self) -> bool:
         with self._lock:
@@ -134,9 +182,12 @@ class Recorder:
     def close(self) -> None:
         with self._lock:
             self._recording = False
-            if self._stream is not None:
-                self._stream.stop()
-                self._stream.close()
-                self._stream = None
+            stream = self._stream
+            if stream is not None:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+            self._discard_stream()
             self._chunks = []
             self._ring.clear()
