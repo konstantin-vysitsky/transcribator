@@ -103,6 +103,23 @@ class Recorder:
         with self._lock:
             return self._recording
 
+    def input_device_name(self) -> str:
+        """Имя устройства, с которого идёт запись.
+
+        Нужно ради журнала: когда микрофон отключают от USB, Windows молча
+        берёт другое устройство по умолчанию — обычно веб-камеру, которая
+        пишет тишину. Без имени устройства такая подмена не видна, и поломка
+        выглядит как «диктовка перестала понимать».
+        """
+        stream = self._stream
+        if stream is None:
+            return ""
+        try:
+            index = stream.device
+            return str(sd.query_devices(index)["name"])
+        except (sd.PortAudioError, ValueError, TypeError):
+            return ""
+
     def stop(self) -> np.ndarray | None:
         with self._lock:
             self._recording = False

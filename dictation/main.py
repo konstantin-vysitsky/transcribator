@@ -282,7 +282,14 @@ def main() -> None:
                 if tray_app is not None:
                     tray_app.set_activity("recording")
                 return False
-            _log_line(project_root, "запись начата")
+            # Какое устройство открыто: при пропаже микрофона Windows берёт
+            # другой, и он может молчать. Строка при записи экономит разбор:
+            # по ней видно, слушали ли fifine или веб-камеру.
+            device_name = recorder.input_device_name()
+            _log_line(
+                project_root,
+                f"запись начата: {device_name}" if device_name else "запись начата",
+            )
             return True
         except BaseException as exc:
             # Любой выход, даже не «ошибка», обязан оставить приложение
@@ -495,6 +502,11 @@ def main() -> None:
 
     def on_record_stop() -> bool:
         if not recorder.is_recording():
+            # Молчать здесь нельзя: снаружи это «нажимаю — ничего». Так уже
+            # было 29 октября, когда микрофон отключился от USB: запись
+            # считалась начатой, а остановка тихо выходила, и в журнале не
+            # оставалось ни строки о поломке.
+            _log_line(project_root, "остановка: запись уже не идёт, останавливать нечего")
             return False
         if cfg.get("sound_feedback"):
             try:
@@ -514,6 +526,14 @@ def main() -> None:
             reset_tray_idle()
             return False
         if audio is None:
+            # Пусто: сказанного не хватило на минуту разборчивой записи.
+            # Самая частая причина — микрофон отключился или выбран тот, что
+            # молчит. Без строки в журнале это неотличимо от нормальной паузы.
+            _log_line(
+                project_root,
+                "запись пуста: микрофон ничего не собрал "
+                "(отключён или выбран молчащий)",
+            )
             busy.clear()
             reset_tray_idle()
             return True
