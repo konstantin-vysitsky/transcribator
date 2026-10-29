@@ -139,6 +139,17 @@ def main() -> None:
     recorder = Recorder(min_duration_s=cfg["min_utterance_s"])
     store = RecordingStore(project_root)
     record_target_hwnd: int | None = None
+    # Поток, который сейчас разбирает запись. Нужен, чтобы отличить честную
+    # занятость от залипшего признака: если поток уже кончился, а флаг остался,
+    # приложение навсегда перестаёт начинать запись.
+    processing_thread: list[threading.Thread | None] = [None]
+
+    def _set_processing_thread(thread: threading.Thread | None) -> None:
+        processing_thread[0] = thread
+
+    def _processing_thread_alive() -> bool:
+        thread = processing_thread[0]
+        return thread is not None and thread.is_alive()
 
     def request_restart() -> None:
         nonlocal restart_requested
@@ -221,8 +232,21 @@ def main() -> None:
                 return False
             return False
         if busy.is_set():
-            _log_line(project_root, "предыдущая диктовка ещё обрабатывается, запись не начата")
-            return False
+            if not _processing_thread_alive():
+                # Признак занятости сам признаёт, что работы нет: поток
+                # обработки кончился, а флаг остался. Такое уже случалось —
+                # приложение «слушало» и молча ничего не делало, и лечилось
+                # только перезапуском. Снимаем флаг и работаем дальше.
+                message = "признак занятости залип, поток обработки уже завершился: снимаю"
+                print(message)
+                _log_line(project_root, message)
+                busy.clear()
+                if hotkey is not None:
+                    hotkey.reset_state()
+                reset_tray_idle()
+            else:
+                _log_line(project_root, "предыдущая диктовка ещё обрабатывается, запись не начата")
+                return False
         # Настройки перечитываются перед каждой записью: ключ к сервису
         # обработки правят руками в файле, а приложение живёт без окна.
         # С загрузки прошли часы, и старое значение врало бы дальше.
@@ -260,11 +284,14 @@ def main() -> None:
                 return False
             _log_line(project_root, "запись начата")
             return True
-        except Exception as exc:
+        except BaseException as exc:
+            # Любой выход, даже не «ошибка», обязан оставить приложение
+            # готовым: иначе признак занятости переживёт сбой, и запись больше
+            # не начнётся без перезапуска.
             busy.clear()
             reset_tray_idle()
             print(f"Ошибка записи: {exc}")
-            _log_line(project_root, f"ошибка записи: {exc}")
+            _log_line(project_root, f"ошибка записи: {type(exc).__name__}: {exc}")
             return False
 
     def process_audio(audio: np.ndarray, saved_path: Path | None = None) -> None:
@@ -436,12 +463,17 @@ def main() -> None:
         """
         try:
             process_audio(audio, saved_path)
-        except Exception as exc:  # noqa: BLE001 — приложение не должно замереть
+        except BaseException as exc:  # noqa: BLE001 — приложение не должно замереть
+            # Именно BaseException, а не Exception: выход из системы и прочие
+            # «не ошибки» тоже проходят здесь, и оставлять после них признак
+            # занятости взведённым нельзя. Раньше флаг переживал такой сбой, и
+            # каждое следующее нажатие молча упиралось в «занято».
             message = f"сбой обработки диктовки: {type(exc).__name__}: {exc}"
             print(message)
             _log_line(project_root, message)
         finally:
             busy.clear()
+            _set_processing_thread(None)
             if hotkey is not None:
                 hotkey.reset_state()
             reset_tray_idle()
@@ -476,12 +508,14 @@ def main() -> None:
         if saved is not None:
             _log_line(project_root, f"запись сохранена: {saved.name}")
             store.trim()
-        threading.Thread(
+        worker = threading.Thread(
             target=_process_audio_guarded,
             args=(audio, saved),
             daemon=True,
             name="process-audio",
-        ).start()
+        )
+        _set_processing_thread(worker)
+        worker.start()
         return True
 
     hotkey = HotkeyListener(

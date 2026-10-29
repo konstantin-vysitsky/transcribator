@@ -95,6 +95,19 @@ class HotkeyListener:
         return kid is not None and kid in self._hotkey_ids
 
     def _on_press(self, key: Key | KeyCode | None) -> None:
+        try:
+            self._handle_press(key)
+        except Exception:
+            # Падение внутри обработчика уносит поток слушателя, и нажатия
+            # перестают приходить вовсе: снаружи это «клавиша перестала
+            # работать», без следа в журнале. Причина уйдёт в общий перехват
+            # потоков, а набор зажатых клавиш чистим, чтобы следующее нажатие
+            # не упёрлось в «клавиша уже зажата».
+            self._keys_down.clear()
+            self._combo_triggered = False
+            raise
+
+    def _handle_press(self, key: Key | KeyCode | None) -> None:
         kid = _key_id(key)
         if kid is None or kid in self._keys_down:
             return
@@ -118,6 +131,14 @@ class HotkeyListener:
                 self._recording = False
 
     def _on_release(self, key: Key | KeyCode | None) -> None:
+        try:
+            self._handle_release(key)
+        except Exception:
+            self._keys_down.clear()
+            self._combo_triggered = False
+            raise
+
+    def _handle_release(self, key: Key | KeyCode | None) -> None:
         kid = _key_id(key)
         if kid is not None:
             self._keys_down.discard(kid)
