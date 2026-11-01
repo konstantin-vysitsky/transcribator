@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 import sounddevice as sd
@@ -12,6 +13,19 @@ CHANNELS = 1
 DTYPE = "float32"
 PREROLL_MS = 200
 PREROLL_SAMPLES = int(SAMPLE_RATE * PREROLL_MS / 1000)
+
+# Пороги громкости в процентах от полной шкалы: ниже — тишина, выше — звук.
+# В тех же процентах показывает уровень звукозапись Windows. 20 % — шум
+# тихой комнаты у веб-камеры C922, 40 % уверенно слышная речь.
+SILENCE_PERCENT = 20.0
+SPEECH_PERCENT = 40.0
+
+# Окно пробы «слышно ли хоть что-нибудь». Короткое намеренно: проба идёт
+# внутри обработки диктовки, и человек ждёт её ответа.
+PROBE_WINDOW_S = 0.05
+
+# Сколько тишины оставить до и после голоса, когда обрезаются края записи.
+MARGIN_S = 0.5
 
 
 def _default_input_signature() -> str:
@@ -25,6 +39,122 @@ def _default_input_signature() -> str:
         return str(sd.query_devices(kind="input")["name"])
     except (sd.PortAudioError, ValueError, TypeError):
         return ""
+
+
+def _loud(samples: np.ndarray, noise: np.ndarray | None = None) -> bool:
+    """Есть ли в куске звук громче шума.
+
+    Просто «громче порога тишины» не годится: у веб-камеры C922 шум громче
+    этого порога, и тогда звучащим оказалось бы каждое окно. Порог берётся
+    по шуму самого устройства и не опускается ниже порога тишины.
+    """
+    peak = float(np.max(np.abs(samples))) * 100.0
+    floor = SILENCE_PERCENT
+    if noise is not None and len(noise):
+        quiet = float(np.percentile(np.abs(noise), 10)) * 100.0
+        floor = max(floor, quiet * 2.0)
+    return peak > floor
+
+
+def loud_windows(data: np.ndarray, noise: np.ndarray | None = None) -> int:
+    """Сколько окон в куске звука было громче шума.
+
+    `data` — звук в тех же единицах, что у модели: от -1 до 1. `noise` —
+    кусок тишины с того же устройства, если он есть.
+    """
+    if len(data) == 0:
+        return 0
+    window = max(4, int(SAMPLE_RATE * PROBE_WINDOW_S))
+    loud = 0
+    for start in range(0, len(data) - window + 1, window):
+        if _loud(data[start:start + window], noise):
+            loud += 1
+    return loud
+
+
+def ping_sources(window_s: float = 0.3) -> dict[str, Any]:
+    """Послушать микрофон и сказать, сколько окон было не тишиной.
+
+    Нужно ради записи, которая кончилась пустой. Тогда непонятно, кто виноват:
+    микрофон молчит сам (провод, драйвер, другое приложение), или молчал
+    человек. Одно звучание сразу отличает одно от другого. Слушаются два
+    источника: тот, с которого пишет диктовка, и microsoft sound mapper —
+    так в Windows зовётся «системный» вход. Если молчат оба, дело в
+    микрофоне, а не в том, как его открыли.
+    """
+    result: dict[str, Any] = {}
+    index: int | None = None
+    try:
+        found = sd.query_devices(kind="input")
+        index = int(found["index"])
+        result["имя"] = found["name"]
+    except (sd.PortAudioError, ValueError, TypeError, KeyError):
+        pass
+    for label, device in (
+        ("диктовка", index),
+        ("sound mapper", None),
+    ):
+        kwargs: dict[str, object] = {}
+        if device is not None:
+            kwargs["device"] = device
+        try:
+            data = sd.rec(
+                int(window_s * SAMPLE_RATE),
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="int16",
+                blocking=True,
+                **kwargs,
+            )
+        except Exception:  # noqa: BLE001 — проба не должна ронять запись
+            continue
+        sound = data[:, 0].astype(np.float32) / 32768.0
+        if len(sound):
+            # Число строкой: в журнале нужно увидеть, сколько было слышно,
+            # а не разбираться, насколько оно велико по сравнению с порогом.
+            result[label] = round(float(np.max(np.abs(sound))) * 100.0, 1)
+        else:
+            result[label] = 0.0
+    return result
+
+
+def speech_rooms(audio: np.ndarray) -> int:
+    """Сколько мест в записи были громче шума.
+
+    Слишком короткая или пустая запись отбрасывалась и раньше. Но запись
+    нормальной длины, в которой нет ни одного громкого места, чаще всего
+    значит, что микрофон молчал: распознавать в ней нечего, и звать модель
+    значит спрятать причину. Человек при этом мог просто промолчать — это
+    и нельзя отличить, поэтому запись остаётся на диске, а в журнале
+    сказано, что в ней тишина.
+    """
+    if len(audio) == 0:
+        return 0
+    return loud_windows(np.clip(audio, -1.0, 1.0).astype(np.float32))
+
+
+def trim_silence(audio: np.ndarray, noise: np.ndarray | None = None) -> np.ndarray:
+    """Обрезать тихие края записи, не трогая середину.
+
+    Запись начинается раньше, чем человек заговорил, и кончается позже —
+    хвост и начало обычно тишина. Модели они отдаются зря, а на коротком
+    «раз два три» тишина вокруг занимает почти всю запись. Внутри записи
+    не выбрасывается ничего: пауза между словами — тоже речь.
+    """
+    if len(audio) == 0:
+        return audio
+    window = max(4, int(SAMPLE_RATE * PROBE_WINDOW_S))
+    loud_starts = [
+        start
+        for start in range(0, len(audio) - window + 1, window)
+        if _loud(audio[start:start + window], noise)
+    ]
+    if not loud_starts:
+        return audio
+    margin = int(MARGIN_S * SAMPLE_RATE)
+    begin = max(0, loud_starts[0] - margin)
+    finish = min(len(audio), loud_starts[-1] + window + margin)
+    return audio[begin:finish]
 
 
 class Recorder:
@@ -173,11 +303,15 @@ class Recorder:
             self._recording = False
             if not self._chunks:
                 return None
-            audio = np.concatenate(self._chunks)
+            recorded = np.concatenate(self._chunks)
             self._chunks = []
-        if len(audio) < int(self._min_duration_s * SAMPLE_RATE):
+            # Тишина с прелюдией — шум комнаты того же устройства. По нему
+            # видно, где кончается шум и начинается голос: у разных
+            # микрофонов этот шум разной громкости.
+            noise = np.concatenate(list(self._ring)) if self._ring else None
+        if len(recorded) < int(self._min_duration_s * SAMPLE_RATE):
             return None
-        return audio
+        return trim_silence(recorded, noise)
 
     def close(self) -> None:
         with self._lock:

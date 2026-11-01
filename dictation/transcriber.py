@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from dictation.chunking import join_texts, split
+from dictation.chunking import format_text, join_texts, split
 from dictation.cleanup import load_fillers, remove_fillers
 from dictation.recorder import SAMPLE_RATE
 from transcribe import load_model, transcribe_gigaam
@@ -53,13 +53,16 @@ class Transcriber:
             pieces = split(audio, SAMPLE_RATE)
             if not pieces:
                 return ""
+            # Текст строчными буквами возвращает сама модель, поэтому
+            # предложения собираются здесь: иначе вставленная диктовка
+            # выглядит как одна сплошная строчка без заглавных и точек.
             if len(pieces) == 1:
-                return self._postprocess(transcribe_gigaam(self._model, pieces[0]))
+                return self._postprocess(format_text(transcribe_gigaam(self._model, pieces[0])))
 
             parts: list[str] = []
             total = len(pieces)
             for index, piece in enumerate(pieces, start=1):
-                parts.append(transcribe_gigaam(self._model, piece))
+                parts.append(format_text(transcribe_gigaam(self._model, piece)))
                 if on_progress is not None:
                     try:
                         on_progress(index, total)

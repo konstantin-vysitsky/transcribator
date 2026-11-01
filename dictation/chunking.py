@@ -85,3 +85,47 @@ def join_texts(parts: list[str]) -> str:
     while "  " in text:
         text = text.replace("  ", " ")
     return text.strip()
+
+
+# Модель отдаёт текст без знаков и заглавных букв. По словам, после которых
+# предложение почти наверняка кончилось, ставится точка, а следующее слово
+# пишется с большой.
+_SENTENCE_ENDS = (
+    "вопрос",
+    "ответ",
+    "задача",
+    "спасибо",
+    "понял",
+    "поняла",
+    "конечно",
+    "хорошо",
+    "ладно",
+    "давай",
+    "всё",
+    "все",
+)
+
+
+def format_text(text: str) -> str:
+    """Собрать распознанное в предложения.
+
+    Модель GigaAM возвращает строчные буквы без знаков. Собранный текст с
+    точкой и большой буквой читается как обычная диктовка, и доводить
+    его руками после вставки больше не нужно.
+    """
+    words = text.strip().split()
+    if not words:
+        return ""
+    # Речь без пауз ушла бы одной строкой, поэтому после слов, которыми
+    # фраза почти наверняка кончается, ставится точка.
+    finished: list[str] = []
+    for word in words:
+        if finished and finished[-1].rstrip(".,!?").lower() in _SENTENCE_ENDS:
+            finished[-1] = finished[-1].rstrip(",.") + "."
+            word = word[0].upper() + word[1:]
+        finished.append(word)
+    result = " ".join(finished)
+    result = result[0].upper() + result[1:]
+    if result[-1] not in ".!?":
+        result += "."
+    return result

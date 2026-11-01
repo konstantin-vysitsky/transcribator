@@ -17,7 +17,7 @@ from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
 from dictation.prompt import load_prompt
 from dictation.prompt_editor import set_logger as set_editor_logger
-from dictation.recorder import SAMPLE_RATE, Recorder
+from dictation.recorder import SAMPLE_RATE, Recorder, speech_rooms
 from dictation.recording_store import RecordingStore
 from dictation.sounds import quiet_beep_start, quiet_beep_stop
 from dictation.status_panel import set_logger as set_panel_logger
@@ -29,6 +29,13 @@ from dictation.timing import (
 from dictation.transcriber import Transcriber
 
 LOG_NAME = "dictation.log"
+# Сколько кусков по 50 мс в записи должны быть громче шума, чтобы признать,
+# что человек говорил. Один-два — обычно щелчок или скрип стула.
+MIN_SPEECH_ROOMS = 4
+# Что вставляется вместо текста, когда в записи одна тишина. Невидимый
+# markdown-пробел: заметка о случившемся есть, а лишнего символа в чужие
+# данные не попадает.
+SILENT_MARK = "&#8203;"
 
 
 def _log_line(project_root: Path, message: str) -> None:
@@ -548,6 +555,34 @@ def main() -> None:
                 f"запись сохранена: {saved.name} ({len(audio) / SAMPLE_RATE:.1f} с)",
             )
             store.trim()
+        if speech_rooms(audio) < MIN_SPEECH_ROOMS:
+            # В записи нет ни одного громкого места: человек, скорее всего,
+            # молчал. Модели там делать нечего — она вернула бы пустоту, и
+            # снаружи это «нажимаю — ничего не вставляется». Зато видно,
+            # что нажатие дошло: невидимая отметка встаёт вместо текста, а
+            # запись остаётся на диске — её можно послушать и понять, было
+            # ли там что-то.
+            _log_line(
+                project_root,
+                f"в записи тишина, распознавать нечего: {saved.name if saved else 'файл не сохранён'}",
+            )
+            # Вместо текста — невидимая отметка, а не точка: мусорный знак
+            # в чужом сообщении хуже, чем отсутствие отметки. В разметке
+            # видно «&#8203;», в самом тексте её нет.
+            text = SILENT_MARK
+            pasted, enter_sent = paste_text(
+                text,
+                append_space=False,
+                auto_enter=False,
+                target_hwnd=record_target_hwnd,
+            )
+            if not pasted:
+                _log_line(project_root, "не удалось вставить отметку о тишине")
+            if tray_app is not None:
+                tray_app.set_activity("processing", "в записи тишина")
+            busy.clear()
+            reset_tray_idle()
+            return
         worker = threading.Thread(
             target=_process_audio_guarded,
             args=(audio, saved),
