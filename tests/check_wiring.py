@@ -235,13 +235,13 @@ def test_tray_menu() -> None:
     check("пункта вида панели нет", "Вид панели" not in texts)
     check("пункта темы панели нет", "Тема панели" not in texts)
 
-    # Выбор микрофона: список строится при открытии меню, а не при запуске.
+    # Выбор микрофона: обычное подменю, как «Режим клавиши». Подменю,
+    # собранное функцией, pystray на Windows молча не показывает — на этом
+    # пункт уже один раз не реагировал.
     check("пункт микрофона есть", "Микрофон" in texts)
     mic_item = next(item for item in menu.items if str(item.text) == "Микрофон")
-    # У меню, которое строится при открытии, pystray держит функцию в _action.
-    mic_menu = mic_item.submenu or mic_item._action
-    check("микрофоны подгружаются при открытии", callable(mic_menu))
-    submenu = mic_menu(None, mic_item)
+    check("у микрофона подменю", isinstance(mic_item.submenu, pystray.Menu))
+    submenu = mic_item.submenu
     labels = [str(i.text) for i in submenu.items if i.__name__ != "SEPARATOR"]
     print(f"       микрофоны: {labels}")
     check("есть выбор «как в Windows»", labels and labels[0].startswith("Как в Windows"), labels)
@@ -343,10 +343,12 @@ def test_microphone_choice() -> None:
         app._select_microphone("") (None, None)
         check("возврат к Windows записан", config.load_config()["microphone"] == "")
 
-        mic_item = next(i for i in app._build_menu().items if str(i.text) == "Микрофон")
+        # Меню пересобирается на каждое открытие, поэтому подпись «не
+        # подключён» берётся из свежего меню, а не из прежнего.
         app._select_microphone("Микрофон, которого нет")(None, None)
-        submenu = (mic_item.submenu or mic_item._action)(None, mic_item)
-        labels = [str(i.text) for i in submenu.items]
+        mic_item = next(i for i in app._build_menu().items if str(i.text) == "Микрофон")
+        check("у микрофона подменю", mic_item.submenu is not None)
+        labels = [str(i.text) for i in mic_item.submenu.items] if mic_item.submenu else []
         check(
             "пропавший микрофон виден пометкой",
             any("не подключён" in label for label in labels),

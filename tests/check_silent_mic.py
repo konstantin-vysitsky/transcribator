@@ -92,12 +92,15 @@ def test_menu_microphone() -> None:
             texts = [str(item.text) for item in menu.items]
             check("пункт микрофона есть", "Микрофон" in texts, texts)
             mic_item = next(item for item in menu.items if str(item.text) == "Микрофон")
-            submenu = (mic_item.submenu or mic_item._action)(None, mic_item)
-            labels = [str(i.text) for i in submenu.items if i.__name__ != "SEPARATOR"]
+            # Подменю должно быть настоящим: собранное функцией pystray
+            # на Windows молча не показывает, и пункт «не реагирует».
+            submenu = mic_item.submenu
+            check("у микрофона настоящее подменю", isinstance(submenu, pystray.Menu))
+            labels = [str(i.text) for i in submenu.items if i.__name__ != "SEPARATOR"] if submenu else []
             print(f"       микрофоны: {labels}")
             check("есть выбор «как в Windows»", labels and labels[0].startswith("Как в Windows"))
             check("список микрофонов не пуст", len(labels) > 1, labels)
-            if len(submenu.items) > 2:
+            if submenu is not None and len(submenu.items) > 2:
                 target = submenu.items[2]
                 target._action(None, target)
                 saved = config.load_config()["microphone"]

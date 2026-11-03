@@ -441,7 +441,7 @@ class TrayApp:
             pystray.MenuItem("Промпт обработки…", self._edit_prompt),
             pystray.MenuItem(
                 "Микрофон",
-                self._build_microphone_menu,
+                pystray.Menu(*self._microphone_menu_items()),
             ),
             pystray.MenuItem(
                 "Запуск с Windows",
@@ -455,11 +455,13 @@ class TrayApp:
     def microphone(self) -> str:
         return self._microphone
 
-    def _build_microphone_menu(self, _item: pystray.MenuItem) -> pystray.Menu:
-        """Список микрофонов, который читается заново при каждом открытии меню.
+    def _microphone_menu_items(self) -> list[pystray.MenuItem]:
+        """Пункты подменю «Микрофон» на момент открытия меню.
 
-        Список строится не при запуске, а каждый раз по нажатию: микрофон
-        могут вынуть из USB или вставить новый, и статичный пункт врал бы.
+        Меню трея пересобирается на каждое нажатие правой кнопкой, поэтому
+        список микрофонов берётся здесь: вынутый из USB микрофон из списка
+        пропадает, вставленный появляется. Отдельный подпункт-функция
+        не годится: pystray такое подменю молча не показывает.
         """
         items = [
             pystray.MenuItem(
@@ -495,7 +497,7 @@ class TrayApp:
                     radio=True,
                 )
             )
-        return pystray.Menu(*items)
+        return items
 
     def _microphone_is(self, name: str) -> Callable[[pystray.MenuItem], bool]:
         return lambda _item: self._microphone == name
