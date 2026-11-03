@@ -17,13 +17,7 @@ from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
 from dictation.prompt import load_prompt
 from dictation.prompt_editor import set_logger as set_editor_logger
-from dictation.recorder import (
-    SAMPLE_RATE,
-    Recorder,
-    peak_percent,
-    speech_rooms,
-    whisper_rooms,
-)
+from dictation.recorder import SAMPLE_RATE, Recorder, peak_percent
 from dictation.recording_store import RecordingStore
 from dictation.sounds import quiet_beep_start, quiet_beep_stop
 from dictation.status_panel import set_logger as set_panel_logger
@@ -35,13 +29,6 @@ from dictation.timing import (
 from dictation.transcriber import Transcriber
 
 LOG_NAME = "dictation.log"
-# Сколько кусков по 50 мс в записи должны быть громче шума, чтобы признать,
-# что человек говорил. Один-два — обычно щелчок или скрип стула.
-MIN_SPEECH_ROOMS = 4
-# Что вставляется вместо текста, когда в записи одна тишина. Невидимый
-# markdown-пробел: заметка о случившемся есть, а лишнего символа в чужие
-# данные не попадает.
-SILENT_MARK = "· тишина"
 
 
 def _log_line(project_root: Path, message: str) -> None:
@@ -377,7 +364,17 @@ def main() -> None:
 
             if not text or not text.strip():
                 print("Слишком короткая фраза, пропуск")
-                _log_line(project_root, "распознан пустой текст, запись оставлена")
+                # Громкость и микрофон рядом: по ним видно, молчал человек
+                # или запись пришла пустой с другого входа.
+                _log_line(
+                    project_root,
+                    (
+                        f"распознан пустой текст, запись оставлена: "
+                        f"{saved_path.name if saved_path else 'файл не сохранён'}, "
+                        f"громкость {peak_percent(audio)}% шкалы, "
+                        f"микрофон «{recorder.input_device_name() or 'как в Windows'}»"
+                    ),
+                )
                 return
             # Записи остаются на диске: папка «записи» нужна ещё и как собрание
             # своей речи. Текст кладём рядом, чтобы было понятно, что за звук.
@@ -583,47 +580,11 @@ def main() -> None:
                 f"запись сохранена: {saved.name} ({len(audio) / SAMPLE_RATE:.1f} с)",
             )
             store.trim()
-        if (
-            speech_rooms(audio) < MIN_SPEECH_ROOMS
-            and whisper_rooms(audio, noise) < MIN_SPEECH_ROOMS
-        ):
-            # В записи нет ни одного громкого места: человек, скорее всего,
-            # молчал или микрофон молчит. Модели там делать нечего — она
-            # вернула бы пустоту, и снаружи это «нажимаю — ничего не
-            # вставляется». Зато видно, что нажатие дошло: короткая пометка
-            # встаёт вместо текста, а запись остаётся на диске — её можно
-            # послушать и понять, было ли там что-то.
-            level = peak_percent(audio)
-            _log_line(
-                project_root,
-                (
-                    f"в записи тишина, распознавать нечего: "
-                    f"{saved.name if saved else 'файл не сохранён'} "
-                    f"(самый громкий звук {level}% шкалы — шум комнаты)"
-                ),
-            )
-            _log_line(
-                project_root,
-                (
-                    "микрофон отдаёт только шум. Это тихий вход, усиление на нуле "
-                    "или выключенный микрофон — выбрать другой в меню трея: "
-                    "«Микрофон»"
-                ),
-            )
-            text = SILENT_MARK
-            pasted, enter_sent = paste_text(
-                text,
-                append_space=False,
-                auto_enter=False,
-                target_hwnd=record_target_hwnd,
-            )
-            if not pasted:
-                _log_line(project_root, "не удалось вставить отметку о тишине")
-            if tray_app is not None:
-                tray_app.set_activity("processing", "в записи тишина")
-            busy.clear()
-            reset_tray_idle()
-            return
+        # Проверки на тишину нет нарочно. Она решала за человека, есть ли в
+        # записи речь, и ошиблась: тихую диктовку («раз, два, три» на 8 %
+        # шкалы) объявляла тишиной, хотя модель узнавала её. Теперь модель
+        # слышит каждую запись, а когда текста нет — в журнале остаются
+        # громкость записи и имя микрофона, чтобы причина была видна.
         worker = threading.Thread(
             target=_process_audio_guarded,
             args=(audio, saved, noise),
