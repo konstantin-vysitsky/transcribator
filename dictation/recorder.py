@@ -33,6 +33,117 @@ MARGIN_S = 0.5
 # выделяется из шума комнаты, уже может быть тихим голосом.
 MIN_SPEECH_PERCENT = 0.3
 
+# Устройства, на которых поток уже не открылся. Windows помнит вынутый
+# микрофон и показывает его в списке, но запись с него невозможна, и без
+# этой памяти каждый старт записи заново тратил бы время на отказ.
+BROKEN_DEVICES: set[str] = set()
+
+
+def _device_key(index: int | None) -> str:
+    """Имя устройства для памяти об отказах.
+
+    Имя, а не номер: номера выдаются заново после каждого переподключения,
+    и по ним запомнился бы не тот микрофон.
+    """
+    if index is None:
+        return ""
+    try:
+        return str(sd.query_devices(index)["name"])
+    except (sd.PortAudioError, ValueError, TypeError):
+        return ""
+
+
+# Вкусы звука Windows по убыванию предпочтения: WASAPI — новый и быстрый,
+# за ним MME (его так же держит и сама Windows). Без DirectSound: он один
+# прошёл проверку на запись и стоит последним на случай поломки остальных.
+_HOSTAPI_RANK = {"wasapi": 0, "mme": 1, "wdm-ks": 2, "directsound": 3}
+
+
+def _hostapi_rank(index: int) -> int:
+    try:
+        name = str(sd.query_hostapis(sd.query_devices(index)["hostapi"])["name"]).lower()
+    except (sd.PortAudioError, ValueError, TypeError, KeyError):
+        return 9
+    for prefix, rank in _HOSTAPI_RANK.items():
+        if prefix in name:
+            return rank
+    return 9
+
+
+def _is_default_input(index: int | None) -> bool:
+    try:
+        return int(sd.default.device[0]) == index
+    except (TypeError, ValueError, IndexError):
+        return False
+
+
+def device_variants(choice: object = "") -> list[int]:
+    """Все способы открыть выбранный микрофон, лучший первым.
+
+    Один и тот же микрофон Windows показывает столько раз, сколько в нём
+    способов записи, и по-разному. Самая частая жалоба на «не слышно» —
+    микрофон занят: его уже держит другое приложение, и один из способов
+    при этом отвечает отказом, хотя остальные работают. Поэтому смена
+    идёт по всем способам, а не по одному.
+
+    Выбранное устройство по имени первым; за ним те же имена во всех
+    вкусах, чтобы выбирать было из чего.
+    """
+    try:
+        devices = list(sd.query_devices())
+    except (sd.PortAudioError, ValueError, TypeError):
+        return []
+    inputs = []
+    for position, device in enumerate(devices):
+        try:
+            if int(device.get("max_input_channels", 0)) > 0:
+                inputs.append((position, str(device.get("name", ""))))
+        except (KeyError, TypeError, ValueError):
+            continue
+    wanted = str(choice if choice is not None else "").strip()
+    preferred: str | None = None
+    if wanted:
+        try:
+            preferred = str(devices[int(wanted)]["name"])
+        except (ValueError, IndexError, KeyError, TypeError):
+            preferred = wanted
+    chosen: list[int] = []
+    if preferred is not None:
+        chosen = [index for index, name in inputs if name == preferred]
+        if not chosen:
+            return []
+        rest = [(index, name) for index, name in inputs if name != preferred]
+    else:
+        system = [index for index, name in inputs if _is_default_input(index)]
+        chosen = system or [index for index, _name in inputs]
+        # Системный вход тоже пробуется во всех вкусах: отказ одного не
+        # должен значить, что выбранный в Windows микрофон не слышен.
+        preferred = ""
+        rest = [(index, name) for index, name in inputs if index not in chosen]
+    chosen.sort(key=lambda index: _hostapi_rank(index))
+    grouped: dict[str, list[int]] = {}
+    for index, name in rest:
+        grouped.setdefault(name, []).append(index)
+    tail = [index for name in grouped for index in sorted(grouped[name], key=_hostapi_rank)]
+    return chosen + tail
+
+
+def _default_input_name() -> str:
+    """Имя входа, выбранного в Windows."""
+    try:
+        return str(sd.query_devices(kind="input")["name"])
+    except (sd.PortAudioError, ValueError, TypeError):
+        return ""
+
+
+def input_device_name(choice: object = "") -> str:
+    """Имя микрофона, который сейчас записывает диктовку.
+
+    Пустой выбор — микрофон Windows. Выбранный по имени — он же, даже если
+    запись пошла через другой вкус того же устройства.
+    """
+    return str(choice if choice is not None else "").strip() or _default_input_name()
+
 
 def input_devices() -> list[dict[str, Any]]:
     """Микрофоны, которые сейчас видит система.
@@ -61,15 +172,13 @@ def input_devices() -> list[dict[str, Any]]:
         if name in seen:
             continue
         seen.add(name)
-        result.append(
-            {
-                "index": index,
-                "name": name,
-                # Номер в конце имени: два входа одной карты могут зваться
-                # одинаково, и человеку нужен способ их различить.
-                "label": f"{name} (#{index})",
-            }
-        )
+        label = f"{name} (#{index})"
+        # Вход, который Windows помнит, но которого нет (вынут из USB),
+        # открыть нельзя. Сразу говорим об этом в меню, а не после того,
+        # как человек выбрал его и получил пустую запись.
+        if name in BROKEN_DEVICES:
+            label = f"{name} (не работает)"
+        result.append({"index": index, "name": name, "label": label})
     return result
 
 
@@ -130,13 +239,19 @@ def _pick_stream_kwargs(index: int | None) -> dict[str, Any]:
     return {"device": index}
 
 
-def _pick_stream(index: int | None) -> sd.InputStream:
+def _pick_stream(
+    index: int | None,
+    callback: Callable[..., None] | None = None,
+) -> sd.InputStream:
     """Открыть поток на микрофоне.
 
     У сенсора вход умеет и 16000, у веб-камеры — только свою частоту, и
     молчаливая «тишина» бывает именно оттого, что устройство не отдало
     нужную. Поэтому сначала пробуем 16000, а если не вышло — берём частоту
     самого устройства и просим пересчёт к 16000.
+
+    Обработчик звука обязателен: без него поток открывается, но звук
+    копит сам в себе и никуда не отдаёт — запись выходит пустой.
     """
     kwargs = _pick_stream_kwargs(index)
     return sd.InputStream(
@@ -144,30 +259,22 @@ def _pick_stream(index: int | None) -> sd.InputStream:
         channels=CHANNELS,
         dtype=DTYPE,
         device=kwargs["device"],
+        callback=callback,
     )
 
 
-def _pick_rec_kwargs(index: int | None) -> dict[str, Any]:
-    """То же для `sd.rec`: там пересчёт частоты умеет только он."""
-    kwargs = _pick_stream_kwargs(index)
+def _pick_rec_kwargs(index: int | None, probe: bool = True) -> dict[str, Any]:
+    """То же для `sd.rec`: там пересчёт частоты умеет только он.
+
+    `probe=False` — для записи, а не для пробы: устройство проверяется
+    одно, и перебор способов открыть его остаётся за `_pick_stream`.
+    """
+    kwargs = _pick_stream_kwargs(index) if probe else {"device": index}
     result: dict[str, Any] = {"device": index}
     if kwargs.get("samplerate", SAMPLE_RATE) != SAMPLE_RATE:
         result["samplerate"] = kwargs["samplerate"]
         result["resample"] = True
     return result
-
-
-def _default_input_signature() -> str:
-    """Опознать микрофон, который сейчас выбран в системе.
-
-    Сравнивается имя, а не номер устройства: номера присваиваются заново,
-    когда микрофон втыкают или вынимают, и один и тот же номер после
-    переподключения может указывать на другое железо. Имя остаётся именем.
-    """
-    try:
-        return str(sd.query_devices(kind="input")["name"])
-    except (sd.PortAudioError, ValueError, TypeError):
-        return ""
 
 
 def _loud(samples: np.ndarray, noise: np.ndarray | None = None) -> bool:
@@ -395,13 +502,24 @@ class Recorder:
         # Выбранный человеком микрофон: пусто — тот, что в Windows.
         self._device_choice = device
         self._lock = threading.Lock()
+        # Замок для звука из обработчика потока. Отдельный нарочно:
+        # обработчик вызывается из звуковой нити, и если он ждёт замок,
+        # который держит тот, кто открывает или закрывает поток, они
+        # ждут друг друга навсегда — приложение встаёт намертво.
+        self._data_lock = threading.Lock()
         self._chunks: list[np.ndarray] = []
         self._ring: deque[np.ndarray] = deque(maxlen=max(1, PREROLL_SAMPLES // 1024 + 1))
         self._stream: sd.InputStream | None = None
-        # К какому микрофону привязан открытый поток. По этому признаку
-        # замечается смена устройства между записями.
-        self._opened_signature: str = ""
-        # Номер устройства при открытии потока; None — устройство Windows.
+        # Способы держать открытыми выбранный микрофон на будущее. Поток
+        # открывается в момент нажатия, и открытие — то самое время, когда
+        # первые слова теряются, а иногда и весь вход не отвечает. Здесь
+        # способы, которые уже проверены и слышат: их мы держим открытыми
+        # заранее, и каждое нажатие лишь дописывает звук.
+        self._warm: list[tuple[int, sd.InputStream]] = []
+        # Микрофон, выбранный при прошлой записи (уже подставленный).
+        self._prepared_choice: object = device
+        # Номер устройства, с которого пошла прошлая запись; None — ещё не
+        # было записи.
         self._opened_index: int | None = None
         self._recording = False
         # Куда сообщать громкость: панель показывает, что её слышно. Звать
@@ -412,7 +530,7 @@ class Recorder:
         if status:
             pass
         chunk = indata[:, 0].copy()
-        with self._lock:
+        with self._data_lock:
             recording = self._recording
             if recording:
                 self._chunks.append(chunk)
@@ -426,6 +544,84 @@ class Recorder:
                 self.on_level(max(0.0, min(1.0, (level - 300.0) / 8700.0)))
             except Exception:
                 self.on_level = None
+
+    def _warm_up(self) -> None:
+        """Открыть входы заранее, чтобы нажатие не тратило время на открытие.
+
+        Нажатие — единственное время, которое не отменить. Если способ
+        открытия на этом компьютере не работал ни разу, одна его попытка
+        при записи не тратит ничего: она делается здесь, заранее.
+        """
+        wanted = self._device_choice
+        if wanted == self._prepared_choice and self._warm:
+            return
+        self._close_warm()
+        self._prepared_choice = wanted
+        for index in device_variants(wanted)[:4]:
+            try:
+                stream = _pick_stream(index, self._callback)
+                stream.start()
+            except Exception:  # noqa: BLE001 — нерабочий способ просто пропускаем
+                BROKEN_DEVICES.add(_device_key(index))
+                continue
+            BROKEN_DEVICES.discard(_device_key(index))
+            self._warm.append((index, stream))
+
+    def _close_warm(self) -> None:
+        warm, self._warm = self._warm, []
+        for _index, stream in warm:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def _start_recording_lock(self) -> None:
+        """Включить запись. Вызывается уже под замком."""
+        self._chunks = []
+        if self._preroll and self._ring:
+            preroll = np.concatenate(list(self._ring))
+            if len(preroll) > PREROLL_SAMPLES:
+                preroll = preroll[-PREROLL_SAMPLES:]
+            self._chunks.append(preroll)
+        self._recording = True
+        self._warm_up()
+        # Готовые входы — первыми. Микрофон могли выдернуть из USB или
+        # переключить устройство по умолчанию: тогда из тех же способов
+        # хватает живого, а если не хватает — закрываем и открываем заново.
+        for index, stream in list(self._warm):
+            if stream.active or self._reopen(stream):
+                self._opened_index = index
+                return
+            BROKEN_DEVICES.add(_device_key(index))
+            self._warm.remove((index, stream))
+            try:
+                stream.close()
+            except Exception:
+                pass
+        # Ни один из заранее открытых способов не слышит: пробуем всё
+        # остальное, от лучшего к худшему.
+        for index in device_variants(self._device_choice):
+            try:
+                stream = _pick_stream(index, self._callback)
+                stream.start()
+            except Exception:  # noqa: BLE001 — пробуем следующий
+                BROKEN_DEVICES.add(_device_key(index))
+                continue
+            BROKEN_DEVICES.discard(_device_key(index))
+            self._warm.append((index, stream))
+            self._opened_index = index
+            return
+        raise sd.PortAudioError("микрофон не отвечает: ни один вход не открылся")
+
+    @staticmethod
+    def _reopen(stream: sd.InputStream) -> bool:
+        """Оживить уже открытый вход: Windows могла его приостановить."""
+        try:
+            if not stream.active:
+                stream.start()
+            return bool(stream.active)
+        except Exception:  # noqa: BLE001
+            return False
 
     def start(self) -> bool:
         """Начать запись. False — запись уже идёт, начинать заново нельзя.
@@ -441,55 +637,12 @@ class Recorder:
         with self._lock:
             if self._recording:
                 return False
-            self._chunks = []
-            if self._preroll and self._ring:
-                preroll = np.concatenate(list(self._ring))
-                if len(preroll) > PREROLL_SAMPLES:
-                    preroll = preroll[-PREROLL_SAMPLES:]
-                self._chunks.append(preroll)
-            self._recording = True
             try:
-                # Поток переиспользуется между записями, но привязан он к
-                # устройству на момент открытия. Микрофон могут выдернуть из
-                # USB, вставить обратно, Windows — переключить устройство по
-                # умолчанию. Тогда старый поток пишет тишину либо с чужого
-                # железа, и снаружи это «диктовка перестала понимать».
-                # Поэтому сравниваем, что выбрано сейчас, и при расхождении
-                # открываем поток заново уже на новом устройстве.
-                chosen_index = resolve_device(self._device_choice)
-                if chosen_index is not None:
-                    # Микрофон выбран человеком: слушаем именно его, и
-                    # смена устройства по умолчанию в Windows здесь
-                    # ничего не значит.
-                    desired = ""
-                else:
-                    desired = _default_input_signature()
-                if self._opened_index != chosen_index and self._stream is not None:
-                    self._discard_stream()
-                # Пустой признак означает, что поток открыт не нами (его
-                # подставили снаружи) либо признак ещё не снят. Судить о смене
-                # устройства по нему нельзя — выбрасывать чужой поток без
-                # причины незачем.
-                if (
-                    self._stream is not None
-                    and self._opened_signature
-                    and desired
-                    and desired != self._opened_signature
-                ):
-                    self._discard_stream()
-                if self._stream is None:
-                    self._stream = _pick_stream(chosen_index)
-                    self._stream.start()
-                    self._opened_signature = desired
-                    self._opened_index = chosen_index
-                elif not self._stream.active:
-                    self._stream.start()
-                    self._opened_signature = desired
-                    self._opened_index = chosen_index
+                self._start_recording_lock()
             except Exception:
                 # Поток не пошёл — микрофон пропал, устройство занято, звук
-                # сменился. Флаг записи снимаем и поток выбрасываем целиком:
-                # поток, который не запустился, уже не годится, и держать его
+                # сменился. Флаг записи снимаем и готовые входы выбрасываем:
+                # вход, который не запустился, уже не годится, и держать его
                 # значит обречь на ту же ошибку каждое следующее нажатие.
                 # Без этого `is_recording()` навсегда отдаёт True, приложение
                 # считает, что уже пишет, и молча ничего не делает — это и был
@@ -497,27 +650,19 @@ class Recorder:
                 self._recording = False
                 self._chunks = []
                 self._ring.clear()
-                self._discard_stream()
+                self._close_warm()
                 raise
         return True
 
     def _discard_stream(self) -> None:
-        """Закрыть поток целиком: он больше не годится.
+        """Закрыть входы целиком: они больше не годятся.
 
-        Поток, привязанный к пропавшему устройству, не оживает сам и держит
+        Вход, привязанный к пропавшему устройству, не оживает сам и держит
         микрофон занятым. Если оставить его, каждое следующее нажатие
         упирается в ту же ошибку, и запись перестаёт начинаться насовсем.
         """
-        stream = self._stream
-        self._stream = None
-        self._opened_signature = ""
+        self._close_warm()
         self._opened_index = None
-        if stream is None:
-            return
-        try:
-            stream.close()
-        except Exception:
-            pass
 
     def is_recording(self) -> bool:
         with self._lock:
@@ -526,31 +671,29 @@ class Recorder:
     def set_device(self, device: object) -> None:
         """Сменить микрофон без перезапуска приложения.
 
-        Открытый поток привязан к старому устройству, поэтому он
-        закрывается: следующий старт записи откроет поток заново, уже на
-        выбранном микрофоне. Запись, если она идёт, этим не трогается —
-        человек услышит, что микрофон теперь другой, со следующей.
+        Готовые входы привязаны к старому устройству, поэтому они
+        закрываются, а выбранное прозвучит в микшере Windows при следующем
+        нажатии: коротко, пока её никто не записывает. Запись, если она
+        идёт, этим не трогается — человек услышит, что микрофон теперь
+        другой, со следующей.
         """
         with self._lock:
             self._device_choice = device
             self._discard_stream()
 
     def input_device_name(self) -> str:
-        """Имя устройства, с которого идёт запись.
+        """Имя микрофона, с которого идёт запись.
 
         Нужно ради журнала: когда микрофон отключают от USB, Windows молча
         берёт другое устройство по умолчанию — обычно веб-камеру, которая
         пишет тишину. Без имени устройства такая подмена не видна, и поломка
-        выглядит как «диктовка перестала понимать».
+        выглядит как «диктовка перестала понимать». Спрашивается выбор, а не
+        номер потока: имя остаётся тем же, через какой вкус Windows ни шла
+        бы запись.
         """
-        stream = self._stream
-        if stream is None:
+        if self._opened_index is None and not self._warm:
             return ""
-        try:
-            index = stream.device
-            return str(sd.query_devices(index)["name"])
-        except (sd.PortAudioError, ValueError, TypeError):
-            return ""
+        return input_device_name(self._device_choice)
 
     def stop(self) -> np.ndarray | None:
         """Остановить запись и отдать звук. None — запись короче порога."""
@@ -565,8 +708,11 @@ class Recorder:
         записи голос поднимает фон и планку вместе с собой, поэтому фон
         берётся из тишины, записанной до микрофона.
         """
-        with self._lock:
+        with self._data_lock:
             self._recording = False
+            # Готовые входы продолжают тихо слушать в ожидании следующего
+            # нажатия: их начало уже на месте, и открывать вход заново под
+            # нажатием не придётся.
             if not self._chunks:
                 return None
             recorded = np.concatenate(self._chunks)
@@ -580,14 +726,9 @@ class Recorder:
         return trim_silence(recorded, noise), noise
 
     def close(self) -> None:
-        with self._lock:
+        with self._data_lock:
             self._recording = False
-            stream = self._stream
-            if stream is not None:
-                try:
-                    stream.stop()
-                except Exception:
-                    pass
-            self._discard_stream()
             self._chunks = []
             self._ring.clear()
+        with self._lock:
+            self._discard_stream()
