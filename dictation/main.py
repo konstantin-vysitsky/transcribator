@@ -17,7 +17,13 @@ from dictation.remote_trigger import UdpToggleServer
 from dictation.paster import capture_foreground_window, paste_text
 from dictation.prompt import load_prompt
 from dictation.prompt_editor import set_logger as set_editor_logger
-from dictation.recorder import SAMPLE_RATE, Recorder, speech_rooms
+from dictation.recorder import (
+    SAMPLE_RATE,
+    Recorder,
+    peak_percent,
+    speech_rooms,
+    whisper_rooms,
+)
 from dictation.recording_store import RecordingStore
 from dictation.sounds import quiet_beep_start, quiet_beep_stop
 from dictation.status_panel import set_logger as set_panel_logger
@@ -312,10 +318,17 @@ def main() -> None:
             _log_line(project_root, f"ошибка записи: {type(exc).__name__}: {exc}")
             return False
 
-    def process_audio(audio: np.ndarray, saved_path: Path | None = None) -> None:
+    def process_audio(
+        audio: np.ndarray,
+        saved_path: Path | None = None,
+        noise: np.ndarray | None = None,
+    ) -> None:
         timer: TranscribeTimer | None = None
         progress_thread: threading.Thread | None = None
         stop_progress = threading.Event()
+        # Был ли текст вставлен. По этому признаку в конце решается, о чём
+        # честно писать в журнал, если запись осталась на диске.
+        text_delivered = False
 
         def _progress_loop() -> None:
             while not stop_progress.wait(0.5):
@@ -446,6 +459,8 @@ def main() -> None:
                     print(f"Было распознано: {raw_text}")
 
             _log_line(project_root, f"вставлено ({len(text)} знаков)")
+            if pasted:
+                text_delivered = True
 
             if timer is not None:
                 record_speed_sample(
@@ -462,14 +477,22 @@ def main() -> None:
             # Файл дожил до этого места — значит, распознавание не довели до
             # текста. Говорим об этом прямо: иначе запись лежит в папке, а
             # человек считает её потерянной.
-            if saved_path is not None:
+            #
+            # Но бывает и наоборот: текст уже вставлен, а файл просто не
+            # успели убрать — убрать не вышло. Тогда писать «не завершилось»
+            # значит соврать о диктовке, которая прошла.
+            if saved_path is not None and not text_delivered:
                 message = f"распознавание не завершилось, запись сохранена: {saved_path.name}"
                 print(message)
                 _log_line(project_root, message)
             busy.clear()
             reset_tray_idle()
 
-    def _process_audio_guarded(audio: np.ndarray, saved_path: Path | None = None) -> None:
+    def _process_audio_guarded(
+        audio: np.ndarray,
+        saved_path: Path | None = None,
+        noise: np.ndarray | None = None,
+    ) -> None:
         """Распознать запись, что бы ни случилось.
 
         `busy` снимается в `finally` у `process_audio`, но туда ещё надо
@@ -487,7 +510,7 @@ def main() -> None:
         _log_line(project_root, "обработка начата")
         failure: str | None = None
         try:
-            process_audio(audio, saved_path)
+            process_audio(audio, saved_path, noise)
         except BaseException as exc:  # noqa: BLE001 — приложение не должно замереть
             # Именно BaseException, а не Exception: выход из системы и прочие
             # «не ошибки» тоже проходят здесь, и оставлять после них признак
@@ -525,7 +548,7 @@ def main() -> None:
             except Exception:
                 pass
         try:
-            audio = recorder.stop()
+            result = recorder.stop_with_noise()
         except Exception as exc:
             # Микрофон отвалился посреди записи — звук уже не вернуть, но
             # приложение обязано остаться живым. Без этого `busy` оставался
@@ -536,6 +559,7 @@ def main() -> None:
             busy.clear()
             reset_tray_idle()
             return False
+        audio, noise = result if result is not None else (None, None)
         if audio is None:
             # Пусто: сказанного не хватило на минуту разборчивой записи.
             # Самая частая причина — микрофон отключился или выбран тот, что
@@ -559,16 +583,32 @@ def main() -> None:
                 f"запись сохранена: {saved.name} ({len(audio) / SAMPLE_RATE:.1f} с)",
             )
             store.trim()
-        if speech_rooms(audio) < MIN_SPEECH_ROOMS:
+        if (
+            speech_rooms(audio) < MIN_SPEECH_ROOMS
+            and whisper_rooms(audio, noise) < MIN_SPEECH_ROOMS
+        ):
             # В записи нет ни одного громкого места: человек, скорее всего,
             # молчал или микрофон молчит. Модели там делать нечего — она
             # вернула бы пустоту, и снаружи это «нажимаю — ничего не
             # вставляется». Зато видно, что нажатие дошло: короткая пометка
             # встаёт вместо текста, а запись остаётся на диске — её можно
             # послушать и понять, было ли там что-то.
+            level = peak_percent(audio)
             _log_line(
                 project_root,
-                f"в записи тишина, распознавать нечего: {saved.name if saved else 'файл не сохранён'}",
+                (
+                    f"в записи тишина, распознавать нечего: "
+                    f"{saved.name if saved else 'файл не сохранён'} "
+                    f"(самый громкий звук {level}% шкалы — шум комнаты)"
+                ),
+            )
+            _log_line(
+                project_root,
+                (
+                    "микрофон отдаёт только шум. Это тихий вход, усиление на нуле "
+                    "или выключенный микрофон — выбрать другой в меню трея: "
+                    "«Микрофон»"
+                ),
             )
             text = SILENT_MARK
             pasted, enter_sent = paste_text(
@@ -586,7 +626,7 @@ def main() -> None:
             return
         worker = threading.Thread(
             target=_process_audio_guarded,
-            args=(audio, saved),
+            args=(audio, saved, noise),
             daemon=True,
             name="process-audio",
         )

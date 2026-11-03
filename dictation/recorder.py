@@ -29,6 +29,10 @@ PROBE_WINDOW_S = 0.05
 # Сколько тишины оставить до и после голоса, когда обрезаются края записи.
 MARGIN_S = 0.5
 
+# Предел, ниже которого в окне только фон. Всё, что выше его и резко
+# выделяется из шума комнаты, уже может быть тихим голосом.
+MIN_SPEECH_PERCENT = 0.3
+
 
 def input_devices() -> list[dict[str, Any]]:
     """Микрофоны, которые сейчас видит система.
@@ -196,6 +200,101 @@ def loud_windows(data: np.ndarray, noise: np.ndarray | None = None) -> int:
         if _loud(data[start:start + window], noise):
             loud += 1
     return loud
+
+
+def peak_percent(audio: np.ndarray) -> float:
+    """Самая громкая точка записи в процентах от полной шкалы."""
+    if len(audio) == 0:
+        return 0.0
+    return round(float(np.max(np.abs(audio))) * 100.0, 2)
+
+
+def whisper_rooms(audio: np.ndarray, noise: np.ndarray | None = None) -> int:
+    """Сколько окон звучат так тихо, что обычный порог их не заметил.
+
+    Порог тишины высокий нарочно: шум вентилятора и веб-камеры иначе
+    звучал бы как речь. Но тихий микрофон — гарнитура, микрофон веб-камеры,
+    гарнитура на минимальном усилении — говорит тише этого порога, и запись
+    целиком называлась тишиной, хотя в ней был голос: «раз, два, три»
+    набирало 1.2 % шкалы, а порог стоял на 25 %.
+
+    Здесь решает шум комнаты. Человек, который что-то сказал, в любом
+    месте записи поднимается над самым громким местом пустой комнаты:
+    тише не бывает — иначе его бы никто не услышал. Шум комнаты такой
+    высоты сам не бывает, он стоит ниже и ровно.
+    """
+    if len(audio) == 0:
+        return 0
+    windows = _window_levels(audio)
+    if not len(windows):
+        return 0
+    if _click_only(audio):
+        # Щелчок от включения передачи: он громкий и короткий, но низкие
+        # частоты в нём не звучат — человек так не говорит.
+        return 0
+    level = _floor_percent(noise)
+    if level is None:
+        level = _floor_percent(audio)
+    # Выше шума в два с половиной раза, но не ниже общего предела: в
+    # цифровом нуле на фоне нечего, и планка на нуле пропустила бы щелчок.
+    rise = max(MIN_SPEECH_PERCENT, (level or 0.0) * 2.5)
+    return int(np.count_nonzero(windows > rise))
+
+
+def _window_levels(audio: np.ndarray) -> np.ndarray:
+    """Действующая громкость каждого окна пробы, в процентах шкалы."""
+    window = max(4, int(SAMPLE_RATE * PROBE_WINDOW_S))
+    parts = [audio[start:start + window] for start in range(0, len(audio) - window + 1, window)]
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    levels = [float(np.percentile(np.abs(part), 75)) for part in parts]
+    return np.asarray(levels, dtype=np.float32) * 100.0
+
+
+def _click_only(audio: np.ndarray) -> bool:
+    """Громкое в записи — это щелчок, а не голос.
+
+    У голоса есть основной тон: даже «с», «ш» и щелчки языка стоят на
+    низах и держат их. У щелчка от включения передачи энергия сдвинута
+    вверх, и ниже 250 герц почти пусто. Проверяется только самая громкая
+    часть записи: в редких выбросах голоса его и не должно быть.
+    """
+    if len(audio) == 0:
+        return True
+    peak = float(np.max(np.abs(audio)))
+    if peak <= 0:
+        return True
+    loud = np.nonzero(np.abs(audio) > peak * 0.5)[0]
+    if not len(loud):
+        return True
+    begin = max(0, int(loud[0]) - 100)
+    piece = audio[begin:begin + 512]
+    if len(piece) < 64:
+        return False
+    spectrum = np.abs(np.fft.rfft(piece * np.hanning(len(piece))))
+    freqs = np.fft.rfftfreq(len(piece), 1.0 / SAMPLE_RATE)
+    total = float(np.sum(spectrum))
+    if total <= 0:
+        return True
+    low = float(np.sum(spectrum[freqs < 250]))
+    return low / total < 0.05
+
+
+def _floor_percent(audio: np.ndarray | None) -> float | None:
+    """Самый громкий настоящий звук тишины, в процентах шкалы.
+
+    Порог — не весь кусок тишины: в него попадают щелчки от нажатия
+    клавиши и от включения передачи, и по всему куску планка встала бы
+    выше, чем нужно. Берётся уровень, который держится чаще остального.
+    """
+    if audio is None or not len(audio):
+        return None
+    levels = _window_levels(audio)
+    if not len(levels):
+        return None
+    # Средний, а не верхний уровень: щелчки от нажатия клавиши и от
+    # включения передачи занимают пару окон из сотни, и медиана их не видит.
+    return float(np.median(levels))
 
 
 def ping_sources(window_s: float = 0.3) -> dict[str, Any]:
@@ -454,6 +553,18 @@ class Recorder:
             return ""
 
     def stop(self) -> np.ndarray | None:
+        """Остановить запись и отдать звук. None — запись короче порога."""
+        result = self.stop_with_noise()
+        return None if result is None else result[0]
+
+    def stop_with_noise(self) -> tuple[np.ndarray, np.ndarray | None] | None:
+        """Остановить запись: звук и шум комнаты с того же микрофона.
+
+        Шум нужен не только обрезке краёв. По нему видно, говорит ли
+        человек тихо: голос поднимается над фоном резко, шум — нет. В самой
+        записи голос поднимает фон и планку вместе с собой, поэтому фон
+        берётся из тишины, записанной до микрофона.
+        """
         with self._lock:
             self._recording = False
             if not self._chunks:
@@ -466,7 +577,7 @@ class Recorder:
             noise = np.concatenate(list(self._ring)) if self._ring else None
         if len(recorded) < int(self._min_duration_s * SAMPLE_RATE):
             return None
-        return trim_silence(recorded, noise)
+        return trim_silence(recorded, noise), noise
 
     def close(self) -> None:
         with self._lock:
