@@ -215,6 +215,7 @@ def test_tray_menu() -> None:
     app._ai_enabled = True
     app._panel_style = "black"
     app._panel_theme = "auto"
+    app._microphone = ""
     app._history = __import__("collections").deque(maxlen=3)
     app._history_lock = __import__("threading").Lock()
 
@@ -230,17 +231,20 @@ def test_tray_menu() -> None:
 
     check("объект pystray.Menu собран", isinstance(menu, pystray.Menu))
 
-    # Вид и тема панели выбираются в настройках, а не в коде.
-    check("пункт вида панели есть", "Вид панели" in texts)
-    check("пункт темы панели есть", "Тема панели" in texts)
-    style_item = next(item for item in menu.items if str(item.text) == "Вид панели")
-    theme_item = next(item for item in menu.items if str(item.text) == "Тема панели")
-    style_labels = [str(i.text) for i in style_item.submenu.items]
-    theme_labels = [str(i.text) for i in theme_item.submenu.items]
-    check("четыре вида панели", len(style_labels) == 4, style_labels)
-    check("три темы панели", len(theme_labels) == 3, theme_labels)
-    checked_styles = [str(i.text) for i in style_item.submenu.items if i.checked]
-    check("вид отмечен галочкой", checked_styles == ["2 · Чёрное стекло"], checked_styles)
+    # Оформление убрано из меню: вид и тема не должны висеть перед глазами.
+    check("пункта вида панели нет", "Вид панели" not in texts)
+    check("пункта темы панели нет", "Тема панели" not in texts)
+
+    # Выбор микрофона: список строится при открытии меню, а не при запуске.
+    check("пункт микрофона есть", "Микрофон" in texts)
+    mic_item = next(item for item in menu.items if str(item.text) == "Микрофон")
+    # У меню, которое строится при открытии, pystray держит функцию в _action.
+    mic_menu = mic_item.submenu or mic_item._action
+    check("микрофоны подгружаются при открытии", callable(mic_menu))
+    submenu = mic_menu(None, mic_item)
+    labels = [str(i.text) for i in submenu.items if i.__name__ != "SEPARATOR"]
+    print(f"       микрофоны: {labels}")
+    check("есть выбор «как в Windows»", labels and labels[0].startswith("Как в Windows"), labels)
 
 
 def test_panel_style_settings() -> None:
@@ -295,6 +299,61 @@ def test_panel_style_settings() -> None:
             str(black_light["bg"]) < str(frost_light["bg"]),
             (black_light["bg"], frost_light["bg"]),
         )
+    finally:
+        config.CONFIG_PATH = original_path
+        config.LOCAL_CONFIG_PATH = original_local
+        tmp.cleanup()
+
+
+def test_microphone_choice() -> None:
+    """Выбор микрофона: запоминается, переживает перезапуск, доходит до записи."""
+    print("выбор микрофона:")
+    from dictation import recorder
+    from dictation.tray import TrayApp
+
+    tmp = tempfile.TemporaryDirectory()
+    original_path = config.CONFIG_PATH
+    original_local = config.LOCAL_CONFIG_PATH
+    try:
+        config.CONFIG_PATH = Path(tmp.name) / "config.json"
+        config.LOCAL_CONFIG_PATH = Path(tmp.name) / "config.local.json"
+        fresh = config.load_config()
+        check("по умолчанию микрофон как в Windows", fresh["microphone"] == "", fresh["microphone"])
+        check("пустой выбор отдаётся Windows", recorder.resolve_device("") is None)
+
+        devices = recorder.input_devices()
+        check("система отдаёт хотя бы один микрофон", bool(devices), devices)
+        first = devices[0]["name"] if devices else "условный микрофон"
+        # Один микрофон Windows называет несколько раз: в списке он один.
+        names = [d["name"] for d in devices]
+        check("в списке нет повторов", len(names) == len(set(names)), names)
+
+        changed: list[str] = []
+        app = TrayApp(
+            project_root=Path(tmp.name),
+            status_text="x",
+            on_exit=lambda: None,
+            on_microphone_change=changed.append,
+        )
+        app._select_microphone(first)(None, None)
+        check("выбор записан в настройки", config.load_config()["microphone"] == first)
+        check("запись узнала о смене", changed == [first], changed)
+        check("имя находит устройство", recorder.resolve_device(first) == devices[0]["index"]
+              if devices else True)
+        app._select_microphone("") (None, None)
+        check("возврат к Windows записан", config.load_config()["microphone"] == "")
+
+        mic_item = next(i for i in app._build_menu().items if str(i.text) == "Микрофон")
+        app._select_microphone("Микрофон, которого нет")(None, None)
+        submenu = (mic_item.submenu or mic_item._action)(None, mic_item)
+        labels = [str(i.text) for i in submenu.items]
+        check(
+            "пропавший микрофон виден пометкой",
+            any("не подключён" in label for label in labels),
+            labels,
+        )
+        # Исчезнувший микрофон не ломает запись: слушаем тот, что в Windows.
+        check("пропавший выбор отдаётся Windows", recorder.resolve_device("Микрофон, которого нет") is None)
     finally:
         config.CONFIG_PATH = original_path
         config.LOCAL_CONFIG_PATH = original_local
@@ -357,6 +416,7 @@ def main() -> int:
     test_panel_click_is_saved()
     test_default_prompt_content()
     test_tray_menu()
+    test_microphone_choice()
     test_panel_style_settings()
     print()
     if FAILURES:

@@ -15,6 +15,7 @@ from PIL import Image
 from dictation import autostart, config, panel_style
 from dictation.prompt import load_prompt, save_prompt
 from dictation.prompt_editor import PromptEditor
+from dictation.recorder import input_devices
 from dictation.status_panel import PAGE_STYLES, StatusPanel
 from dictation.tray_icon import make_icon
 
@@ -133,6 +134,7 @@ class TrayApp:
         on_abort: Callable[[], None] | None = None,
         on_stop_recording: Callable[[], None] | None = None,
         on_toggle_ai: Callable[[bool], None] | None = None,
+        on_microphone_change: Callable[[str], None] | None = None,
     ) -> None:
         self._project_root = project_root
         self._idle_tooltip = status_text
@@ -146,6 +148,7 @@ class TrayApp:
         # Имена с «notify»: обработчик, названный как метод класса, затирает
         # этот метод собой, и вызвать его становится нечем.
         self._notify_toggle_ai = on_toggle_ai
+        self._on_microphone_change = on_microphone_change
         self._on_hotkey_mode_change: Callable[[str], None] | None = None
         self._icon: pystray.Icon | None = None
         self._ready = threading.Event()
@@ -156,6 +159,10 @@ class TrayApp:
         self._cpu_threads = int(cfg.get("cpu_threads", 6))
         self._ai_enabled = bool(cfg.get("ai_enabled", False))
         self._autostart_enabled = autostart.is_autostart_enabled()
+        # Если микрофон сохранён, но сейчас не подключён, пункт в меню всё
+        # равно должен показывать выбор человека: он вступит в силу, когда
+        # микрофон вставят обратно.
+        self._microphone = str(cfg.get("microphone", "") or "").strip()
         self._panel_style = panel_style.normalize_style(cfg.get("panel_style"))
         self._panel_theme = panel_style.normalize_theme(cfg.get("panel_theme"))
         if self._panel_style not in PAGE_STYLES:
@@ -433,32 +440,8 @@ class TrayApp:
             ),
             pystray.MenuItem("Промпт обработки…", self._edit_prompt),
             pystray.MenuItem(
-                "Вид панели",
-                pystray.Menu(
-                    *[
-                        pystray.MenuItem(
-                            label,
-                            self._select_panel_style(name),
-                            checked=lambda _item, n=name: self._panel_style == n,
-                            radio=True,
-                        )
-                        for name, label in panel_style.STYLE_LABELS.items()
-                    ]
-                ),
-            ),
-            pystray.MenuItem(
-                "Тема панели",
-                pystray.Menu(
-                    *[
-                        pystray.MenuItem(
-                            label,
-                            self._select_panel_theme(name),
-                            checked=lambda _item, n=name: self._panel_theme == n,
-                            radio=True,
-                        )
-                        for name, label in panel_style.THEME_LABELS.items()
-                    ]
-                ),
+                "Микрофон",
+                self._build_microphone_menu,
             ),
             pystray.MenuItem(
                 "Запуск с Windows",
@@ -469,28 +452,68 @@ class TrayApp:
             pystray.MenuItem("Выход", self._exit),
         )
 
-    def _select_panel_style(self, style: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
-        """Вид панели: показать сразу и запомнить.
+    def microphone(self) -> str:
+        return self._microphone
 
-        Панель живёт всё время работы приложения, поэтому смена вида не ждёт
-        перезапуска: человек выбирает пункт и тут же видит его в деле.
+    def _build_microphone_menu(self, _item: pystray.MenuItem) -> pystray.Menu:
+        """Список микрофонов, который читается заново при каждом открытии меню.
+
+        Список строится не при запуске, а каждый раз по нажатию: микрофон
+        могут вынуть из USB или вставить новый, и статичный пункт врал бы.
         """
+        items = [
+            pystray.MenuItem(
+                "Как в Windows (по умолчанию)",
+                self._select_microphone(""),
+                checked=self._microphone_is(""),
+                radio=True,
+            ),
+            pystray.Menu.SEPARATOR,
+        ]
+        found = input_devices()
+        current_seen = False
+        for device in found:
+            name = str(device["name"])
+            if name == self._microphone:
+                current_seen = True
+            items.append(
+                pystray.MenuItem(
+                    str(device["label"]),
+                    self._select_microphone(name),
+                    checked=self._microphone_is(name),
+                    radio=True,
+                )
+            )
+        if self._microphone and not current_seen:
+            # Выбранный микрофон сейчас не подключён: пункт остаётся, чтобы
+            # выбор не пропал и было видно, чего не хватает.
+            items.append(
+                pystray.MenuItem(
+                    f"{self._microphone} (не подключён)",
+                    self._select_microphone(self._microphone),
+                    checked=self._microphone_is(self._microphone),
+                    radio=True,
+                )
+            )
+        return pystray.Menu(*items)
+
+    def _microphone_is(self, name: str) -> Callable[[pystray.MenuItem], bool]:
+        return lambda _item: self._microphone == name
+
+    def _select_microphone(
+        self, name: str
+    ) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
+        """Выбрать микрофон: с этого момента диктовка слушает его и запоминает."""
 
         def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-            if self._panel_style == style:
+            if self._microphone == name:
                 return
-            self._panel_style = panel_style.apply_style(style)
-            self._status_panel.set_style(self._panel_style)
-            self._refresh_menu()
-
-        return _handler
-
-    def _select_panel_theme(self, theme: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
-        def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
-            if self._panel_theme == theme:
-                return
-            self._panel_theme = panel_style.apply_theme(theme)
-            self._status_panel.set_theme(self._panel_theme)
+            self._microphone = name
+            cfg = config.load_config()
+            cfg["microphone"] = name
+            config.save_config(cfg)
+            if self._on_microphone_change is not None:
+                self._on_microphone_change(name)
             self._refresh_menu()
 
         return _handler

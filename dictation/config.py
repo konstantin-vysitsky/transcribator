@@ -27,10 +27,14 @@ DEFAULTS: dict[str, Any] = {
     "ai_api_key": "",
     "ai_model": "deepseek-flash",
     "ai_timeout_s": 30.0,
-    # Вид панели и её тема. Тема «auto» — панель следует за Windows: у
-    # человека ночью тёмная тема, днём светлая, и выбор ему не нужен.
+    # Вид и тема панели убраны из меню: оформление одно, выбранное человеком.
+    # Значения остались, чтобы старые файлы настроек не ломались.
     "panel_style": "black",
     "panel_theme": "auto",
+    # Микрофон: пусто — тот, что выбран в Windows. Или имя устройства, как
+    # его видит система, либо его номер. Имя надёжнее номера: номера
+    # меняются, когда микрофон втыкают и вынимают.
+    "microphone": "",
 }
 
 # Поля, которые читаются ещё и из config.local.json и там главнее.
@@ -57,7 +61,17 @@ def _clamp(merged: dict[str, Any]) -> dict[str, Any]:
     # окно, она превращается в значение по умолчанию.
     merged["panel_style"] = _normalize_style(merged.get("panel_style"))
     merged["panel_theme"] = _normalize_theme(merged.get("panel_theme"))
+    merged["microphone"] = _normalize_microphone(merged.get("microphone"))
     return merged
+
+
+def _normalize_microphone(value: object) -> str:
+    """Номер устройства приходил числом, имя — строкой. В файле всегда строка."""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    return str(value or "").strip()
 
 
 def _normalize_style(value: object) -> str:

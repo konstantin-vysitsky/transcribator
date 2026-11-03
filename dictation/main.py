@@ -143,7 +143,10 @@ def main() -> None:
     restart_requested = False
     tray_app = None
     hotkey: HotkeyListener | None = None
-    recorder = Recorder(min_duration_s=cfg["min_utterance_s"])
+    recorder = Recorder(
+        min_duration_s=cfg["min_utterance_s"],
+        device=cfg.get("microphone", ""),
+    )
     store = RecordingStore(project_root)
     record_target_hwnd: int | None = None
     # Поток, который сейчас разбирает запись. Нужен, чтобы отличить честную
@@ -202,6 +205,7 @@ def main() -> None:
             on_restart=request_restart,
             on_abort=abort_transcription,
             on_stop_recording=finish_recording_from_ui,
+            on_microphone_change=recorder.set_device,
         )
         tray_app.start()
 

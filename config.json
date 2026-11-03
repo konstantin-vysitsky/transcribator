@@ -15,5 +15,6 @@
   "ai_timeout_s": 30.0,
   "panel_style": "black",
   "panel_theme": "dark",
+  "microphone": "",
   "panel_scale": 0.0
 }
