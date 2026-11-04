@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import Any
@@ -11,6 +12,67 @@ import sounddevice as sd
 SAMPLE_RATE = 16000
 CHANNELS = 1
 DTYPE = "float32"
+
+# Микрофон fifine через WASAPI звук не пересчитывает: цифры в буфере за
+# секунду выглядят как для 16000, но это его собственные 48000. На слух
+# выходит замедленная и низкая речь — модель в ней не понимает ни слова,
+# и запись нужной длины наполовину короче (две секунды говора — 0.7 с).
+# Поэтому куски этого вида растягиваются обратно: 48000/16000 в точности.
+STRETCH = SAMPLE_RATE // 16000 if SAMPLE_RATE % 16000 == 0 else 1
+
+# Проба «в каком виде вход отдаёт звук»: полсекунды и замер пришедших цифр.
+PROBE_SECONDS = 0.5
+PROBE_BLOCK = 1024
+# Сколько раз пробовать: вход, занятый другим приложением, с первого раза
+# может не ответить, а записать диктовку надо.
+STRETCH_ATTEMPTS = 3
+
+
+def _stretched_rate(index: int | None) -> int:
+    """Частота, на которой вход стоит открыть, или 0 — обычно.
+
+    Не по названию способа, а по самому факту: открыть пробно на 16000 на
+    полсекунды и посмотреть, сколько цифр прийдёт. Того же микрофона через
+    WASAPI не приходит ровно втрое больше — вход не пересчитывает частоту,
+    а отдаёт свою. Через MME у того же микрофона цифр столько, сколько
+    просили, и там всё остаётся как было.
+    """
+    try:
+        info = sd.query_devices(index)
+        own = int(round(float(info["default_samplerate"])))
+    except (sd.PortAudioError, ValueError, TypeError, KeyError, IndexError):
+        return 0
+    # Ровно в три раза — только так пересчёт простой, а не с догадкой.
+    if own != SAMPLE_RATE * STRETCH:
+        return 0
+    frames = [0]
+
+    def count(_indata, got, _time, _status) -> None:
+        frames[0] += got
+
+    try:
+        probe = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            device=index,
+            callback=count,
+            blocksize=PROBE_BLOCK,
+        )
+        probe.start()
+        began = time.monotonic()
+        time.sleep(PROBE_SECONDS)
+        elapsed = time.monotonic() - began
+        probe.stop()
+        probe.close()
+    except Exception:  # noqa: BLE001 — проба не должна мешать записи
+        return 0
+    if elapsed <= 0:
+        return 0
+    heard = frames[0] / elapsed / SAMPLE_RATE
+    return own if heard > 2.0 else 0
+
+
 PREROLL_MS = 200
 PREROLL_SAMPLES = int(SAMPLE_RATE * PREROLL_MS / 1000)
 
@@ -242,6 +304,7 @@ def _pick_stream_kwargs(index: int | None) -> dict[str, Any]:
 def _pick_stream(
     index: int | None,
     callback: Callable[..., None] | None = None,
+    stretched: bool | None = None,
 ) -> sd.InputStream:
     """Открыть поток на микрофоне.
 
@@ -250,12 +313,29 @@ def _pick_stream(
     нужную. Поэтому сначала пробуем 16000, а если не вышло — берём частоту
     самого устройства и просим пересчёт к 16000.
 
+    Исключение — вход, который 16000 принимает, но не пересчитывает, а
+    отдаёт свои цифры как есть (так ведёт себя fifine через WASAPI). Его
+    лучше открыть на его собственной частоте и пересчитать самим: у звука
+    сохранится обычная высота. Узнаётся такой вход пробой, и `stretched`
+    даёт готовый ответ, чтобы взять его заранее, а не мерить повторно.
+
     Обработчик звука обязателен: без него поток открывается, но звук
     копит сам в себе и никуда не отдаёт — запись выходит пустой.
     """
     kwargs = _pick_stream_kwargs(index)
+    samplerate = kwargs.get("samplerate", SAMPLE_RATE)
+    own = 0
+    try:
+        own = int(round(float(sd.query_devices(index)["default_samplerate"])))
+    except (sd.PortAudioError, ValueError, TypeError, KeyError, IndexError):
+        own = 0
+    if samplerate == SAMPLE_RATE and own != SAMPLE_RATE:
+        if stretched is None:
+            stretched = bool(_stretched_rate(index))
+        if stretched:
+            samplerate = own
     return sd.InputStream(
-        samplerate=kwargs.get("samplerate", SAMPLE_RATE),
+        samplerate=samplerate,
         channels=CHANNELS,
         dtype=DTYPE,
         device=kwargs["device"],
@@ -462,6 +542,47 @@ def speech_rooms(audio: np.ndarray) -> int:
     return loud_windows(np.clip(audio, -1.0, 1.0).astype(np.float32))
 
 
+def patch_dropouts(audio: np.ndarray) -> np.ndarray:
+    """Залить нулевые провалы звуком соседей, чтобы вход USB не «дёргался».
+
+    В записях 4 ноября звук десятки раз в секунду падает в ноль на 2–8 мс.
+    На слух почти незаметно, но модель теряется: запись на 107 секунд с
+    громким голосом не дала ни слова.
+
+    Заполняется только сам провал, прямым отрезком от звука до него к звуку
+    после. Провал короче 10 мс — единственное, что заливается: тихая пауза
+    шире этого остаётся собой, и речь этим не портится.
+    """
+    if len(audio) < 3:
+        return audio
+    flat = np.abs(np.diff(audio)) < 1e-4
+    if not flat.any():
+        return audio
+    # Куски, где соседние отсчёты одинаковы: это провал, а не тихая речь.
+    edges = np.flatnonzero(np.diff(np.concatenate(([False], flat, [False])).astype(np.int8)))
+    runs = edges.reshape(-1, 2) + 1
+    if not len(runs):
+        return audio
+    widths = runs[:, 1] - runs[:, 0]
+    runs = runs[widths <= int(SAMPLE_RATE * 0.01)]
+    if not len(runs):
+        return audio
+    starts, stops = runs[:, 0], runs[:, 1]
+    # Отрезок считается от звука ДО провала к звуку ПОСЛЕ. Заливка одним
+    # предыдущим отсчётом оставляла ступеньку и сама становилась провалом:
+    # вторая проверка давала вдвое больше кусков, чем первая.
+    before = audio[np.maximum(starts - 1, 0)]
+    after = audio[np.minimum(stops, len(audio) - 1)]
+    lengths = stops - starts
+    # Всё, что нужно, собирается векторно: провалов тысячи, и цикл по ним
+    # задерживал бы остановку записи.
+    inside = np.arange(int(lengths.sum())) - np.repeat(np.cumsum(lengths) - lengths, lengths)
+    values = np.repeat(before, lengths) + np.repeat((after - before) / (lengths + 1), lengths) * (inside + 1)
+    result = audio.copy()
+    result[np.repeat(starts, lengths) + inside] = values
+    return result
+
+
 def trim_silence(audio: np.ndarray, noise: np.ndarray | None = None) -> np.ndarray:
     """Обрезать тихие края записи, не трогая середину.
 
@@ -508,7 +629,16 @@ class Recorder:
         # ждут друг друга навсегда — приложение встаёт намертво.
         self._data_lock = threading.Lock()
         self._chunks: list[np.ndarray] = []
-        self._ring: deque[np.ndarray] = deque(maxlen=max(1, PREROLL_SAMPLES // 1024 + 1))
+        # Кольцо прелюдии. Части короче милисекунды, не длиннее 0.25 с.
+        self._ring: deque[np.ndarray] = deque(maxlen=4000)
+        # Сколько отсчётов пришло в кольцо за всё время. По нему видно, какой
+        # кусок кольца записан после прошлой остановки: нажатие на секунду
+        # при живом кольце на две секунды давало запись в три секунды.
+        self._ring_count = 0
+        # Сколько отсчётов кольца уже попало в прошлую запись.
+        self._preroll_used = 0
+        # Сколько отсчётов пришло к моменту прошлой остановки.
+        self._recorded_at_stop = 0
         self._stream: sd.InputStream | None = None
         # Способы держать открытыми выбранный микрофон на будущее. Поток
         # открывается в момент нажатия, и открытие — то самое время, когда
@@ -521,7 +651,17 @@ class Recorder:
         # Номер устройства, с которого пошла прошлая запись; None — ещё не
         # было записи.
         self._opened_index: int | None = None
+        # Частота, которую вход отдаёт на самом деле, если она выше 16000.
+        self._stream_rate = SAMPLE_RATE
+        # Пробы «отдаёт ли вход 16000 на самом деле» по номерам устройств.
+        self._stretched: dict[int, bool] = {}
         self._recording = False
+        # Громкость, пока поток простаивает. Обработчик звука копит её всегда,
+        # а панель показывает только во время записи — иначе столбик стоит на
+        # громкости прошлой диктовки ещё до того, как человек начал говорить.
+        # Окно — около секунды: вход отдаёт куски по 10 мс, и на четырёх
+        # кусках цифра зависела от того, попал ли в них голос.
+        self._level: deque[float] = deque(maxlen=int(SAMPLE_RATE / 1024))
         # Куда сообщать громкость: панель показывает, что её слышно. Звать
         # необязательно, а без него запись работает как прежде.
         self.on_level: Callable[[float], None] | None = None
@@ -530,42 +670,96 @@ class Recorder:
         if status:
             pass
         chunk = indata[:, 0].copy()
+        if len(chunk) and self._stream_rate != SAMPLE_RATE:
+            # Вход отдаёт больше цифр, чем нужно модели: берётся третья.
+            # Она же заодно отсекает шум выше 8 кГц — модели он не нужен.
+            chunk = np.ascontiguousarray(chunk[:: self._stream_rate // SAMPLE_RATE].copy())
+        # 300 — тишина, 9000 — громкая речь: этого хватает для столбика
+        # на панели. Считается всегда, чтобы сразу после нажатия было что
+        # показать; отдаётся — только во время записи.
+        level = float(np.sqrt(np.mean(np.square(chunk)))) if len(chunk) else 0.0
         with self._data_lock:
             recording = self._recording
             if recording:
                 self._chunks.append(chunk)
             elif self._preroll:
                 self._ring.append(chunk)
+                self._ring_count += len(chunk)
+                age = self._ring_count - self._preroll_used
+                before_stop = self._ring_count - self._recorded_at_stop
+                want = PREROLL_SAMPLES if self._recorded_at_stop == 0 else min(age, before_stop, PREROLL_SAMPLES)
+                # В кольце всегда ровно столько звука, сколько пойдёт
+                # прелюдией, плюс прежний кусок 0.2 с. Раньше глубина
+                # кольца задавалась на глаз и держала больше трёх секунд:
+                # после первой записи кольцо уже полно её хвоста, и
+                # короткое нажатие писало то, что говорилось до него.
+                if want > 0:
+                    held = sum(len(part) for part in self._ring)
+                    while held - len(self._ring[0]) >= want + PREROLL_SAMPLES and len(self._ring) > 1:
+                        held -= len(self._ring.popleft())
+        self._level.append(level)
         if recording and self.on_level is not None and len(chunk):
-            # 300 — тишина, 9000 — громкая речь: этого хватает для столбика
-            # на панели. Считаем здесь же, чтобы не заводить второй поток.
-            level = float(np.sqrt(np.mean(np.square(chunk))))
             try:
                 self.on_level(max(0.0, min(1.0, (level - 300.0) / 8700.0)))
             except Exception:
                 self.on_level = None
 
-    def _warm_up(self) -> None:
-        """Открыть входы заранее, чтобы нажатие не тратило время на открытие.
+    def current_level(self) -> float:
+        """Последняя измеренная громкость входа, 0 — тишина, 1 — громко.
 
-        Нажатие — единственное время, которое не отменить. Если способ
-        открытия на этом компьютере не работал ни разу, одна его попытка
-        при записи не тратит ничего: она делается здесь, заранее.
+        Нужна сразу после старта записи: обработчик звука уже мерил громкость
+        до нажатия, и панель получает готовую цифру, а не ноль.
+        """
+        if not self._level:
+            return 0.0
+        level = float(np.mean(list(self._level)))
+        return max(0.0, min(1.0, (level - 300.0) / 8700.0))
+
+    def _warm_up(self) -> None:
+        """Открыть вход заранее, чтобы нажатие не тратило время на открытие.
+
+        Открывается РОВНО ОДИН способ, лучший первым. Открыть все способы
+        одновременно нельзя: у одного микрофона их три (WASAPI, MME и
+        DirectSound), и все три забирают звук у одного устройства — запись
+        выходит мешаниной из наложений, громче, чем говорят, с провалами и
+        хвостом с прошлых нажатий. Внешне это «диктую, а текста нет», хотя в
+        самой Windows уровень микрофона в порядке.
+
+        Нажатие — единственное время, которое не отменить, поэтому вход
+        открыт заранее. Если способ не открылся, пробуется следующий — тоже
+        один, и прошлый закрывается.
         """
         wanted = self._device_choice
         if wanted == self._prepared_choice and self._warm:
             return
         self._close_warm()
         self._prepared_choice = wanted
-        for index in device_variants(wanted)[:4]:
+        for index in device_variants(wanted):
             try:
-                stream = _pick_stream(index, self._callback)
+                stream = _pick_stream(index, self._callback, self._stretched_for(index))
                 stream.start()
             except Exception:  # noqa: BLE001 — нерабочий способ просто пропускаем
                 BROKEN_DEVICES.add(_device_key(index))
                 continue
             BROKEN_DEVICES.discard(_device_key(index))
             self._warm.append((index, stream))
+            self._stream_rate = int(round(stream.samplerate))
+            return
+
+    def _stretched_for(self, index: int) -> bool:
+        """Стоит ли открывать этот вход на его частоте; проба запоминается.
+
+        Проба занимает полсекунды и больше не повторяется: если в первый
+        раз вход отдал звук правильно, второй раз мерить нечего.
+        """
+        if index not in self._stretched:
+            answer = False
+            for _ in range(STRETCH_ATTEMPTS):
+                answer = bool(_stretched_rate(index))
+                if answer:
+                    break
+            self._stretched[index] = answer
+        return self._stretched[index]
 
     def _close_warm(self) -> None:
         warm, self._warm = self._warm, []
@@ -577,20 +771,52 @@ class Recorder:
 
     def _start_recording_lock(self) -> None:
         """Включить запись. Вызывается уже под замком."""
+        # Громкость панели — до звука: она копится, пока вход простаивает,
+        # и без сброса показывает громкость с прошлого нажатия.
+        self._level.clear()
+        # Очистка буфера — ТОЛЬКО здесь, до открытия входов. Состояние
+        # «пишем» включается в самом конце, когда вход уже запущен; пока оно
+        # снято, обработчик звука пишет в кольцо прелюдии, а не в буфер.
+        # Раньше входы открывались уже после очистки, и обработчик закрытого
+        # входа успевал дописать в буфер звук от прошлых нажатий: запись в
+        # 5.4 секунды выходила в 6 секунд, а в 107-секундной звук был с
+        # самого начала — от неё модель не понимала ни слова.
+        # Кольцо держит только звук до нажатия — 0.2 секунды, не разговор:
+        # нажатие не срезает первое слово. Глубину держит обработчик звука
+        # (см. _callback), а здесь из него берётся последний кусок.
+        #
+        # Первая запись после включения: всё кольцо — тишина до нажатия.
+        # Дальше — сколько звука пришло после прошлой остановки, не длиннее
+        # кольца.
         self._chunks = []
+        skip = 0
         if self._preroll and self._ring:
-            preroll = np.concatenate(list(self._ring))
-            if len(preroll) > PREROLL_SAMPLES:
-                preroll = preroll[-PREROLL_SAMPLES:]
-            self._chunks.append(preroll)
-        self._recording = True
-        self._warm_up()
+            if self._recorded_at_stop > 0:
+                skip = min(self._preroll_used, self._ring_count)
+            parts = list(self._ring)
+            consumed = 0
+            keep: list[np.ndarray] = []
+            for part in parts:
+                if consumed + len(part) <= skip:
+                    consumed += len(part)
+                    continue
+                keep.append(part[max(0, skip - consumed):])
+                consumed += len(part)
+            # Кусок короче прелюдии — нормально: если между диктовками
+            # прошло меньше 0.2 с, больше звука и не было.
+            preroll = np.concatenate(keep) if keep else np.zeros(0, np.float32)
+            if len(preroll):
+                self._chunks.append(preroll[-PREROLL_SAMPLES:])
+        self._preroll_used = max(0, self._ring_count)
+        self._recorded_at_stop = self._ring_count
         # Готовые входы — первыми. Микрофон могли выдернуть из USB или
         # переключить устройство по умолчанию: тогда из тех же способов
         # хватает живого, а если не хватает — закрываем и открываем заново.
+        # Состояние «пишем» включается здесь же, когда вход уже запущен.
         for index, stream in list(self._warm):
             if stream.active or self._reopen(stream):
                 self._opened_index = index
+                self._recording = True
                 return
             BROKEN_DEVICES.add(_device_key(index))
             self._warm.remove((index, stream))
@@ -602,7 +828,7 @@ class Recorder:
         # остальное, от лучшего к худшему.
         for index in device_variants(self._device_choice):
             try:
-                stream = _pick_stream(index, self._callback)
+                stream = _pick_stream(index, self._callback, self._stretched_for(index))
                 stream.start()
             except Exception:  # noqa: BLE001 — пробуем следующий
                 BROKEN_DEVICES.add(_device_key(index))
@@ -610,6 +836,8 @@ class Recorder:
             BROKEN_DEVICES.discard(_device_key(index))
             self._warm.append((index, stream))
             self._opened_index = index
+            self._stream_rate = int(round(stream.samplerate))
+            self._recording = True
             return
         raise sd.PortAudioError("микрофон не отвечает: ни один вход не открылся")
 
@@ -717,13 +945,19 @@ class Recorder:
                 return None
             recorded = np.concatenate(self._chunks)
             self._chunks = []
+            # До этого места вход дошёл к остановке: всё старшее — прошлая
+            # диктовка. Нужно, чтобы следующая не прихватила её хвост.
+            self._recorded_at_stop = self._ring_count
             # Тишина с прелюдией — шум комнаты того же устройства. По нему
             # видно, где кончается шум и начинается голос: у разных
             # микрофонов этот шум разной громкости.
             noise = np.concatenate(list(self._ring)) if self._ring else None
+        noise = noise[-PREROLL_SAMPLES:] if noise is not None else None
         if len(recorded) < int(self._min_duration_s * SAMPLE_RATE):
             return None
-        return trim_silence(recorded, noise), noise
+        # Провалы в ноль — до обрезки краёв: обрезка ищет громкие места по
+        # громкости, а провал делал «громкую» речь кусками.
+        return trim_silence(patch_dropouts(recorded), noise), noise
 
     def close(self) -> None:
         with self._data_lock:
