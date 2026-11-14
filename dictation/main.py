@@ -361,6 +361,19 @@ def main() -> None:
                     )
 
             _log_line(project_root, f"распознаю {audio_duration:.1f} с")
+            silent_input = recorder.is_silent()
+            if silent_input:
+                # Ни одного ненулевого отсчёта: дело не в модели и не в
+                # громкости речи, а во входе. Называем это до распознавания,
+                # чтобы причину не искать в модели и в тексте.
+                _log_line(
+                    project_root,
+                    (
+                        f"вход отдал полную тишину за {audio_duration:.1f} с, "
+                        f"микрофон «{recorder.input_device_name() or 'как в Windows'}»: "
+                        "проверить, воткнут ли он и не выбран ли молчащий вход"
+                    ),
+                )
             text = transcriber.transcribe(audio, on_progress=on_chunk)
             if transcribe_cancel.is_set():
                 return

@@ -76,6 +76,19 @@ def _stretched_rate(index: int | None) -> int:
 PREROLL_MS = 200
 PREROLL_SAMPLES = int(SAMPLE_RATE * PREROLL_MS / 1000)
 
+# Сколько ждать хвост записи после паузы. Вход отдаёт звук не в тот же миг,
+# когда человек нажал остановку, но и не запаздывает надолго: за две недели
+# записей недобор по часам был 0.1–0.6 с, а у некоторых — до 10 с, когда
+# Windows притормозила вход. Остановка забирала лишь то, что уже лежало в
+# буфере, — так пропадал конец фразы. Ждать дольше нужного нельзя: лишняя
+# тишина в конце цепляет звук после нажатия паузы.
+DRAIN_MIN_S = 0.5
+DRAIN_MAX_S = 0.8
+# Шаг ожидания: мелкий, чтобы ждать ровно столько, сколько нужно.
+DRAIN_STEP_S = 0.01
+# Зазор между «прозвучало» и «пришло», с которым хвост считается полным.
+DRAIN_GAP_S = 0.25
+
 # Пороги громкости в процентах от полной шкалы — так же, как показывает
 # уровень звукозапись Windows. У веб-камеры C922 шум в тихой комнате идёт
 # около четверти шкалы, а сказанное слово поднимает пик над ним заметно:
@@ -639,6 +652,12 @@ class Recorder:
         self._preroll_used = 0
         # Сколько отсчётов пришло к моменту прошлой остановки.
         self._recorded_at_stop = 0
+        # Когда началась эта запись: по этому времени видно, сколько звука
+        # должно было прозвучать, — нужно остановке, чтобы дождаться хвоста.
+        self._started_at: float | None = None
+        # Шум комнаты, записанный до нажатия: по нему видно, говорил ли
+        # человек только что.
+        self._room_noise: np.ndarray | None = None
         self._stream: sd.InputStream | None = None
         # Способы держать открытыми выбранный микрофон на будущее. Поток
         # открывается в момент нажатия, и открытие — то самое время, когда
@@ -695,7 +714,11 @@ class Recorder:
                 # короткое нажатие писало то, что говорилось до него.
                 if want > 0:
                     held = sum(len(part) for part in self._ring)
-                    while held - len(self._ring[0]) >= want + PREROLL_SAMPLES and len(self._ring) > 1:
+                    # Ровно отрезанное кольцо, с точностью до куска. Предел
+                    # «x2 плюс запас» делал кольцо в полтора раза длиннее,
+                    # чем нужно: в его хвост попадал звук другой диктовки и
+                    # уходил в следующую запись. Перебор — не больше куска.
+                    while held - len(self._ring[0]) >= want and len(self._ring) > 1:
                         held -= len(self._ring.popleft())
         self._level.append(level)
         if recording and self.on_level is not None and len(chunk):
@@ -703,6 +726,17 @@ class Recorder:
                 self.on_level(max(0.0, min(1.0, (level - 300.0) / 8700.0)))
             except Exception:
                 self.on_level = None
+
+    def is_silent(self) -> bool:
+        """Вход не отдаёт ни одного отсчёта: записи нечего распознавать.
+
+        Так бывает, когда микрофон выдернули, Windows сменила устройство
+        по умолчанию или fifine замолчал до переподключения. Внешне это
+        «распознавание прошло, а текста нет»; по громкости причина видна
+        до того, как открыт большой журнал.
+        """
+        with self._data_lock:
+            return not any(bool(np.any(part)) for part in self._chunks)
 
     def current_level(self) -> float:
         """Последняя измеренная громкость входа, 0 — тишина, 1 — громко.
@@ -816,6 +850,7 @@ class Recorder:
         for index, stream in list(self._warm):
             if stream.active or self._reopen(stream):
                 self._opened_index = index
+                self._started_at = time.monotonic()
                 self._recording = True
                 return
             BROKEN_DEVICES.add(_device_key(index))
@@ -837,6 +872,7 @@ class Recorder:
             self._warm.append((index, stream))
             self._opened_index = index
             self._stream_rate = int(round(stream.samplerate))
+            self._started_at = time.monotonic()
             self._recording = True
             return
         raise sd.PortAudioError("микрофон не отвечает: ни один вход не открылся")
@@ -938,11 +974,19 @@ class Recorder:
         """
         with self._data_lock:
             self._recording = False
+            started = self._started_at
             # Готовые входы продолжают тихо слушать в ожидании следующего
             # нажатия: их начало уже на месте, и открывать вход заново под
             # нажатием не придётся.
             if not self._chunks:
                 return None
+        # Пауза нажата, но последние слова ещё в пути: вход отдаёт звук не
+        # сразу. Дождёмся их и заберём из кольца — иначе конец фразы так и
+        # останется несказанным для модели.
+        tail = self._drain_tail_after(started)
+        with self._data_lock:
+            if len(tail):
+                self._chunks.append(tail)
             recorded = np.concatenate(self._chunks)
             self._chunks = []
             # До этого места вход дошёл к остановке: всё старшее — прошлая
@@ -958,6 +1002,64 @@ class Recorder:
         # Провалы в ноль — до обрезки краёв: обрезка ищет громкие места по
         # громкости, а провал делал «громкую» речь кусками.
         return trim_silence(patch_dropouts(recorded), noise), noise
+
+    def _drain_tail_after(self, started: float | None) -> np.ndarray:
+        """Забрать из кольца звук, пришедший после паузы.
+
+        Остановка снимает `_recording`, и новые куски ложатся только в кольцо
+        прелюдии. Их надо дождаться и дописать в конец записи: в них —
+        последние слова, которые не успели дойти раньше. Ждём, пока прозвучит
+        столько же, сколько человек уже наговорил (то есть пока конец
+        прозвучившего совпадёт с концом записи), но не дольше DRAIN_MAX_S.
+        """
+        if started is None:
+            return np.zeros(0, np.float32)
+        began = time.monotonic()
+        with self._data_lock:
+            before = sum(len(part) for part in self._chunks)
+            # Всё, что было в кольце к нажатию, — прошлый звук, уже в буфере.
+            mark = self._ring_count
+            self._room_noise = np.concatenate(list(self._ring))[-PREROLL_SAMPLES:] if self._ring else None
+        heard_s = before / SAMPLE_RATE
+        # Предел ожидания в долях DRAIN_MIN_S. Сразу его не сравнить с
+        # записью: короткая запись может оказаться короче задержки входа, и
+        # тогда по времени ни отставание, ни тишину не отличить. Зато
+        # отличимы по громкости: если человек говорил, догонка захватит его
+        # голос, а пустая комната останется тишиной, и ждать второй раз
+        # нечего.
+        waits = 0
+        limit = max(1, int(round(DRAIN_MAX_S / DRAIN_MIN_S)))
+        while waits < limit:
+            time.sleep(DRAIN_STEP_S)
+            waiting_s = time.monotonic() - began
+            with self._data_lock:
+                arrived = self._ring_count - mark
+            # Дошло больше, чем отставало, — хвост целиком здесь. Условие
+            # берётся с запасом: кусок приходит, когда прозвучало ровно его
+            # длительность, и лишний круг ожидания ничего не стоит.
+            if arrived > 0 and arrived / SAMPLE_RATE >= heard_s + waiting_s - DRAIN_GAP_S:
+                break
+            if waiting_s >= DRAIN_MIN_S:
+                # Вход не отдал ничего нового: либо отстал сильнее обычного,
+                # либо в комнате тихо. Голос это показывает.
+                with self._data_lock:
+                    fresh = np.concatenate(list(self._ring)) if self._ring else None
+                if fresh is None or not _loud(fresh[-int(SAMPLE_RATE * DRAIN_MIN_S):], self._room_noise):
+                    break
+                waits += 1
+        with self._data_lock:
+            parts: list[np.ndarray] = []
+            want = self._ring_count - mark
+            got = 0
+            for part in reversed(self._ring):
+                parts.append(part)
+                got += len(part)
+                if got >= want:
+                    break
+            if not parts:
+                return np.zeros(0, np.float32)
+            tail = np.concatenate(list(reversed(parts)))
+        return tail[-want:] if want < len(tail) else tail
 
     def close(self) -> None:
         with self._data_lock:
