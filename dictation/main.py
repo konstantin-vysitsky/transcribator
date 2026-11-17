@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import sys
 import threading
 import time
@@ -29,6 +30,35 @@ from dictation.timing import (
 from dictation.transcriber import Transcriber
 
 LOG_NAME = "dictation.log"
+
+# Подписи моделей распознавания такие же, как в меню трея: по ним в меню
+# видно, какая модель работает сейчас.
+_STREAM_TRAY_LABELS = {
+    "t-one": "T-one, по ходу речи",
+    "zipformer-small": "Zipformer-small, по ходу речи",
+    "zipformer-small-int8": "Zipformer-small, по ходу речи",
+}
+
+
+def stream_tray_label(recognition: str) -> str:
+    return _STREAM_TRAY_LABELS.get(recognition, "GigaAM (после остановки)")
+
+
+def load_stream_model(recognition: str, cpu_threads: int):
+    """Загрузить потоковую модель. None — работать на GigaAM.
+
+    Модель не грузится (нет файлов, не хватает памяти) — приложение не
+    встаёт: GigaAM на месте, и диктовка остаётся. Причина видна в журнале.
+    """
+    if recognition == "gigaam":
+        return None
+    try:
+        from dictation.streaming import _recognizer
+
+        return _recognizer(recognition, max(1, cpu_threads))
+    except Exception as exc:  # noqa: BLE001 — потоковая модель это опыт
+        print(f"Потоковая модель не загрузилась: {exc}")
+        return None
 
 
 def _log_line(project_root: Path, message: str) -> None:
@@ -133,6 +163,16 @@ def main() -> None:
 
     stop_event = threading.Event()
     transcribe_cancel = threading.Event()
+    # Отдельная отмена для потоковой диктовки: на панели есть кнопка
+    # «отмена», и она должна отменять текущую запись, а не весь текст.
+    stream_cancel = threading.Event()
+    # Текущая потоковая диктовка: куда звук идёт прямо сейчас. None —
+    # обычная диктовка, распознаём после остановки.
+    stream_live: list[object | None] = [None]
+    # Вставка по ходу речи: очередь того, что печатать, и счёт последней
+    # вставки. Очередь — на одну диктовку, `typing[1]` — её состояние.
+    typing: list = [queue.Queue(), {}]
+    typing_nonce = 0
     restart_requested = False
     tray_app = None
     hotkey: HotkeyListener | None = None
@@ -173,6 +213,7 @@ def main() -> None:
 
     def abort_transcription() -> None:
         transcribe_cancel.set()
+        stream_cancel.set()
         if hotkey is not None:
             hotkey.reset_state()
         if recorder.is_recording():
@@ -205,18 +246,310 @@ def main() -> None:
     print("Загрузка модели распознавания речи...")
     print(f"Потоки CPU в настройках: {cfg['cpu_threads']} (применяются при запуске)")
     _log_line(project_root, "загрузка модели распознавания речи")
-    transcriber = Transcriber(
-        model=cfg["model"],
-        cpu_threads=cfg["cpu_threads"],
-        remove_fillers_enabled=cfg.get("remove_fillers", True),
+    # Какая модель работает: GigaAM (после остановки) или потоковая
+    # (по ходу речи). Задаётся в меню трея и переживает перезапуск;
+    # потоковая не заменяет GigaAM, а стоит рядом с ней.
+    recognition = cfg.get("recognition", "gigaam")
+    # Модель держим отдельно от счёта: счёт на каждую диктовку свой, а
+    # модель, загруженная один раз, живёт до перезапуска.
+    stream_model = load_stream_model(recognition, cfg["cpu_threads"])
+    if stream_model is None:
+        # Нет модели или она не поднялась: диктовка остаётся на GigaAM.
+        # Опечатка в настройках уже заменена GigaAM при чтении, так что
+        # сюда приходит только настоящая поломка.
+        if recognition != "gigaam":
+            _log_line(
+                project_root,
+                f"потоковая модель «{recognition}» не загрузилась — работаю на GigaAM",
+            )
+        recognition = "gigaam"
+        cfg["recognition"] = "gigaam"
+        transcriber = Transcriber(
+            model=cfg["model"],
+            cpu_threads=cfg["cpu_threads"],
+            remove_fillers_enabled=cfg.get("remove_fillers", True),
+        )
+    else:
+        transcriber = None
+    runtime_label = (
+        f"stream/{recognition}, cpu" if stream_model is not None else transcriber.runtime_label()
     )
-    print(f"Модель загружена ({transcriber.runtime_label()})")
-    _log_line(project_root, f"модель загружена: {transcriber.runtime_label()}")
+    print(f"Модель загружена ({runtime_label})")
+    _log_line(project_root, f"модель загружена: {runtime_label}")
     if tray_app is not None:
-        tray_app.set_runtime_info(transcriber.runtime_label())
+        tray_app.set_runtime_info(runtime_label)
+        tray_app.set_stream_label(stream_tray_label(cfg.get("recognition", "gigaam")))
     if use_tray:
         # Громкость видна на панели только во время записи.
         recorder.on_level = tray_app.set_microphone_level if tray_app is not None else None
+
+    def _stream_on_text(_raw: str) -> None:
+        """Модель поняла новые слова — отдать их в поле по ходу речи.
+
+        Текст в поле не дописывается, а заменяется целиком: модель может
+        переписать уже показанное слово. Поэтому прошлая вставка стирается,
+        и печатается новая версия куска. Делает это отдельный поток: звук
+        его не ждёт.
+        """
+        live = stream_live[0]
+        if live is None:
+            return
+        piece = live.emit_pending()
+        if piece:
+            typing[0].put(piece)
+
+    def _typed_len(text: str, pasted: bool) -> int:
+        """Сколько знаков стереть, чтобы убрать прошлую вставку.
+
+        Пробел в конце, который диктовка добавляет по настройке, тоже
+        считается: без него стёрлось бы одно слово меньше.
+        """
+        extra = 1 if pasted and cfg["paste_append_space"] and not text.endswith(" ") else 0
+        return len(text) + extra
+
+    def _typing_worker(nonce: int) -> None:
+        """Печатать в поле по мере роста текста. Живёт до конца диктовки."""
+        queue = typing[0]
+        while True:
+            item = queue.get()
+            if item is None:
+                return
+            face = typing[1]
+            if face.get("nonce") != nonce:
+                # Диктовку отменили: остаток очереди выбрасываем.
+                continue
+            piece = item
+            try:
+                from dictation.paster import erase_pasted, foreground_is
+
+                target = record_target_hwnd
+                if face.get("ever") and not foreground_is(target):
+                    # Человек ушёл в другое окно: по ходу речи туда не пишем,
+                    # панель и вставка в конце остаются.
+                    continue
+                if face.get("printed"):
+                    erase_pasted(
+                        _typed_len(face["printed"], bool(face.get("pasted"))), target
+                    )
+                elif face.get("pasted"):
+                    # Промежуточная вставка при нарезке по паузам.
+                    erase_pasted(int(face.get("len", 0)), target)
+                pasted, _ = paste_text(
+                    piece,
+                    append_space=cfg["paste_append_space"],
+                    auto_enter=False,
+                    target_hwnd=target,
+                    only_if_foreground=face.get("ever", False),
+                )
+                face["ever"] = pasted
+                face["printed"] = piece
+                face["pasted"] = pasted
+                face["len"] = _typed_len(piece, pasted)
+            except Exception as exc:  # noqa: BLE001 — звук и панель важнее
+                _log_line(
+                    project_root, f"сбой вставки по ходу речи: {type(exc).__name__}: {exc}"
+                )
+
+    def _start_stream_live() -> None:
+        """Начать потоковую диктовку: новый счёт для новой фразы."""
+        from dictation.streaming import StreamingTranscriber
+
+        # Модель загружена одна; счёт создаётся заново, и прошлый текст в
+        # новую диктовку не попадает.
+        stream_cancel.clear()
+        live = StreamingTranscriber(
+            model=recognition,
+            cpu_threads=cfg["cpu_threads"],
+            on_text=_stream_on_text,
+            model_ref=stream_model,
+        )
+        live.set_typing(True, live._on_replace)
+        # Новая вставка на новую диктовку: прошлые счётчики не годятся.
+        while not typing[0].empty():
+            typing[0].get_nowait()
+        nonlocal typing_nonce
+        typing_nonce += 1
+        nonce = typing_nonce
+        typing[1] = {
+            "nonce": nonce,
+            "printed": "",
+            "pasted": False,
+            "len": 0,
+            "ever": False,
+            "final": False,
+        }
+        stream_live[0] = live
+        live.start()
+        # Поток вставки — свой: модель зовёт его из своего потока и ждать его
+        # не должна.
+        threading.Thread(
+            target=_typing_worker, args=(nonce,), daemon=True, name="stream-type"
+        ).start()
+        recorder.on_audio_chunk = live.feed
+        if tray_app is not None:
+            tray_app.set_live_text("", active=True)
+
+
+    def _stop_stream_live(tail: np.ndarray | None = None) -> str | None:
+        """Закончить потоковую диктовку и вернуть сказанное одной строкой.
+
+        `tail` — звук, записанный, но пришедший из кольца уже после
+        остановки: в записи он есть, а в модель ещё не попал.
+        """
+        live = stream_live[0]
+        stream_live[0] = None
+        recorder.on_audio_chunk = None
+        if live is None:
+            return None
+        if stream_cancel.is_set():
+            live.cancel()
+            return None
+        if tail is not None and len(tail):
+            live.feed(tail)
+        return live.finish()
+
+    def _deliver_text(text: str, raw_text: str, use_ai: bool) -> bool:
+        """Вставить готовый текст в окно и записать это в историю панели.
+
+        Одно место для обеих моделей: вставка, Enter, история и строки
+        журнала одинаковы, чем бы текст ни распознали.
+        """
+        auto_enter = cfg.get("paste_auto_enter", False)
+        if tray_app is not None and tray_app.should_skip_auto_enter():
+            auto_enter = False
+        pasted, enter_sent = paste_text(
+            text,
+            append_space=cfg["paste_append_space"],
+            auto_enter=auto_enter,
+            target_hwnd=record_target_hwnd,
+        )
+        if tray_app is not None:
+            tray_app.add_transcription(text)
+        if pasted:
+            suffix = " + Enter" if enter_sent else ""
+            print(f"Вставлено{suffix}: {text}")
+        else:
+            print("Не удалось вставить текст")
+            _log_line(project_root, "не удалось вставить текст")
+            if text != raw_text:
+                print(f"Было распознано: {raw_text}")
+        _log_line(
+            project_root,
+            f"{'вставлено' if pasted else 'НЕ вставлено'} ({len(text)} знаков)",
+        )
+        return pasted
+
+    def _process_stream(
+        text: str,
+        audio: np.ndarray,
+        saved_path: Path | None,
+        started_at: float,
+    ) -> None:
+        """Потоковая диктовка закончена: дочистить текст и вставить.
+
+        Сборка, чистка, обработка ИИ и вставка — те же, что у GigaAM.
+        Отличие одно: текст мог уже появиться на панели по ходу, и здесь
+        он заменяется окончательным.
+        """
+        from dictation.streaming import merged_text
+
+        raw_text = merged_text(text)
+        if not raw_text.strip():
+            _log_line(
+                project_root,
+                (
+                    "потоковое распознавание дало пустой текст, "
+                    f"громкость {peak_percent(audio)}% шкалы, "
+                    f"микрофон «{recorder.input_device_name() or 'как в Windows'}»"
+                ),
+            )
+            if tray_app is not None:
+                tray_app.set_live_text("", active=False)
+            return
+        text = raw_text
+        if cfg.get("remove_fillers", True):
+            from dictation.cleanup import load_fillers, remove_fillers
+
+            text = remove_fillers(text, load_fillers())
+        if tray_app is not None:
+            tray_app.set_live_text(text, active=False)
+            tray_app.mark_transcribed()
+        use_ai = cfg.get("ai_enabled", False)
+        if tray_app is not None:
+            use_ai = tray_app.ai_enabled()
+        # Итог обработки ИИ. Когда она выключена, итога нет — и ниже это
+        # проверяется явно: без такой строки обращение к `ai_error` падало
+        # с UnboundLocalError уже после вставки текста.
+        ai_error: str | None = None
+        if use_ai and not stream_cancel.is_set():
+            if tray_app is not None:
+                tray_app.set_activity("processing", "жду ответа модели…")
+            text, ai_error = ai.process_text(
+                text,
+                prompt=load_prompt(project_root),
+                api_key=str(cfg.get("ai_api_key", "")),
+                base_url=str(cfg.get("ai_base_url", ai.DEFAULT_BASE_URL)),
+                model=str(cfg.get("ai_model", ai.DEFAULT_MODEL)),
+                timeout_s=float(cfg.get("ai_timeout_s", ai.DEFAULT_TIMEOUT_S)),
+            )
+            if tray_app is not None:
+                tray_app.finish_ai_stage(recovered=ai_error is None)
+            if ai_error is not None:
+                _log_line(project_root, f"обработка через ИИ не удалась: {ai_error}")
+            if stream_cancel.is_set():
+                return
+        if stream_cancel.is_set():
+            return
+        # Файл с текстом остаётся только в папке записей; саму запись
+        # убирает `store.trim`, она же чистит старые.
+        store.save_text(saved_path, text)
+        store.keep(saved_path)
+        face = typing[1]
+        typed = face.get("printed") or ""
+        if face.get("ever") and typed == text:
+            # По ходу речи в поле уже стоит ровно этот текст: вставлять
+            # его второй раз нельзя. Только переводим дух, если настроено.
+            pasted = True
+            if cfg.get("paste_auto_enter", False) and (
+                tray_app is None or not tray_app.should_skip_auto_enter()
+            ):
+                try:
+                    from dictation.paster import press_enter
+
+                    press_enter(record_target_hwnd)
+                except Exception:  # noqa: BLE001 — текст уже на месте
+                    pass
+            _log_line(project_root, "потоковая диктовка уже в поле по ходу речи")
+        else:
+            # Текст чаще всего уже стоит в поле, но собранный заново: знаки,
+            # заглавные и чистка могли его изменить. Стираем вставленное и
+            # ставим окончательное — человек видит безупречный текст, а не
+            # черновик, который модель печатала по ходу.
+            if face.get("pasted"):
+                try:
+                    from dictation.paster import erase_pasted
+
+                    erase_pasted(int(face.get("len", 0) or 0), record_target_hwnd)
+                except Exception:  # noqa: BLE001 — окончательная вставка важнее
+                    pass
+            pasted = _deliver_text(text, raw_text, use_ai)
+        if tray_app is not None:
+            if ai_error is not None:
+                tray_app.report_ai_error(ai_error)
+            elif use_ai:
+                tray_app.clear_ai_error()
+        if not pasted:
+            _log_line(
+                project_root,
+                f"потоковая диктовка не вставлена, текст: {text[:200]}",
+            )
+        # Сколько шло после отпускания клавиши: потоковая модель дочищает
+        # хвост и вставляет текст, и по этой цифре видно, стоит ли ждать.
+        _log_line(
+            project_root,
+            f"потоковая диктовка: {len(audio) / SAMPLE_RATE:.1f} с речи, "
+            f"{time.monotonic() - started_at:.1f} с на всё (включая вставку)",
+        )
 
     def on_record_start() -> bool:
         nonlocal record_target_hwnd, cfg
@@ -279,6 +612,11 @@ def main() -> None:
                 # успевает показаться с картинкой прошлой диктовки — с
                 # полосой под конец — и только потом её перерисовывает.
                 tray_app.flush()
+            # Потоковая диктовка: текст на панели появляется по ходу речи.
+            # Поднимается до открытия микрофона, чтобы первый же кусок звука
+            # попал в модель, а не в пустоту.
+            if stream_model is not None:
+                _start_stream_live()
             if not recorder.start():
                 # Запись уже идёт: второе нажатие не должно её стирать.
                 # Показываем это человеку, чтобы не выглядело как зависание.
@@ -553,6 +891,35 @@ def main() -> None:
             else:
                 _log_line(project_root, f"обработка прервана через {elapsed:.1f} с")
 
+    def _process_stream_guarded(
+        text: str,
+        audio: np.ndarray,
+        saved_path: Path | None,
+        started_at: float,
+    ) -> None:
+        """То же, что `_process_audio_guarded`, для потоковой диктовки.
+
+        Признак занятости снимается всегда, а сбой ложится в журнал: без
+        этого неудачная вставка оставляла бы диктовку «занятой» навсегда.
+        """
+        failure: str | None = None
+        try:
+            _process_stream(text, audio, saved_path, started_at)
+        except BaseException as exc:  # noqa: BLE001 — приложение не должно замереть
+            failure = f"{type(exc).__name__}: {exc}"
+            print(f"сбой потоковой диктовки: {failure}")
+            _log_line(project_root, f"сбой потоковой диктовки: {failure}")
+        finally:
+            busy.clear()
+            _set_processing_thread(None)
+            if hotkey is not None:
+                hotkey.reset_state()
+            reset_tray_idle()
+            if failure is None:
+                _log_line(project_root, "обработка закончена")
+            else:
+                _log_line(project_root, "обработка прервана")
+
     def on_record_stop() -> bool:
         if not recorder.is_recording():
             # Молчать здесь нельзя: снаружи это «нажимаю — ничего». Так уже
@@ -561,11 +928,17 @@ def main() -> None:
             # оставалось ни строки о поломке.
             _log_line(project_root, "остановка: запись уже не идёт, останавливать нечего")
             return False
+        stop_started = time.monotonic()
         if cfg.get("sound_feedback"):
             try:
                 quiet_beep_stop()
             except Exception:
                 pass
+        # Поток закрывается сразу после остановки записи: всё сказанное
+        # уже попало в модель, и ей остаётся дочитать хвост. Звук записанный,
+        # но ещё не пришедший из кольца, после этого в модель не попадёт —
+        # поток закрыт. Поэтому хвост из кольца отдаётся модели отдельно.
+        live = stream_live[0]
         try:
             result = recorder.stop_with_noise()
         except Exception as exc:
@@ -575,6 +948,7 @@ def main() -> None:
             # снаружи это «включается, слушает и перестаёт работать».
             print(f"Ошибка остановки записи: {exc}")
             _log_line(project_root, f"ошибка остановки записи: {exc}")
+            _stop_stream_live()
             busy.clear()
             reset_tray_idle()
             return False
@@ -588,6 +962,9 @@ def main() -> None:
                 "запись пуста: микрофон ничего не собрал "
                 "(отключён или выбран молчащий)",
             )
+            _stop_stream_live(audio)
+            if tray_app is not None:
+                tray_app.set_live_text("", active=False)
             busy.clear()
             reset_tray_idle()
             return True
@@ -607,12 +984,23 @@ def main() -> None:
         # шкалы) объявляла тишиной, хотя модель узнавала её. Теперь модель
         # слышит каждую запись, а когда текста нет — в журнале остаются
         # громкость записи и имя микрофона, чтобы причина была видна.
-        worker = threading.Thread(
-            target=_process_audio_guarded,
-            args=(audio, saved, noise),
-            daemon=True,
-            name="process-audio",
-        )
+        stream_text = _stop_stream_live(audio if live is not None else None)
+        if stream_text is not None:
+            # Потоковая диктовка: текст уже распознан по ходу, остаётся
+            # дочистить и вставить. В фоне, чтобы клавиша отвечала сразу.
+            worker = threading.Thread(
+                target=_process_stream_guarded,
+                args=(stream_text, audio, saved, stop_started),
+                daemon=True,
+                name="process-stream",
+            )
+        else:
+            worker = threading.Thread(
+                target=_process_audio_guarded,
+                args=(audio, saved, noise),
+                daemon=True,
+                name="process-audio",
+            )
         _set_processing_thread(worker)
         worker.start()
         return True

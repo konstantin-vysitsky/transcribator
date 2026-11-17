@@ -412,6 +412,56 @@ def test_default_prompt_content() -> None:
     )
 
 
+def test_recognition_choice() -> None:
+    """Выбор распознавания: GigaAM остаётся, потоковые переключаются и запоминаются."""
+    print("выбор распознавания:")
+    from dictation.tray import TrayApp
+
+    tmp = tempfile.TemporaryDirectory()
+    original_path = config.CONFIG_PATH
+    original_local = config.LOCAL_CONFIG_PATH
+    try:
+        config.CONFIG_PATH = Path(tmp.name) / "config.json"
+        config.LOCAL_CONFIG_PATH = Path(tmp.name) / "config.local.json"
+        fresh = config.load_config()
+        check("по умолчанию GigaAM после остановки", fresh["recognition"] == "gigaam", fresh["recognition"])
+
+        app = TrayApp(project_root=Path(tmp.name), status_text="x", on_exit=lambda: None)
+        menu = app._build_menu()
+        item = next(i for i in menu.items if str(i.text) == "Распознавание")
+        labels = [str(i.text) for i in item.submenu.items] if item.submenu else []
+        check(
+            "в меню обе модели и GigaAM",
+            any("T-one" in l for l in labels)
+            and any("Zipformer" in l for l in labels)
+            and any("GigaAM" in l for l in labels),
+            labels,
+        )
+
+        app._select_recognition("t-one")(None, None)
+        check("потоковая модель записана", config.load_config()["recognition"] == "t-one")
+        check("выбор переживает перезапуск", TrayApp(
+            project_root=Path(tmp.name), status_text="x", on_exit=lambda: None
+        )._stream_model == "t-one")
+
+        app._select_recognition("gigaam")(None, None)
+        check("возврат на GigaAM записан", config.load_config()["recognition"] == "gigaam")
+
+        # Опечатка в файле не должна отнимать рабочую диктовку.
+        def _normalized(value: str) -> str:
+            return config._clamp({"recognition": value})["recognition"]
+
+        check(
+            "чужое значение в файле становится GigaAM",
+            _normalized("нет такой модели") == "gigaam",
+        )
+        check("известное значение остаётся", _normalized("zipformer-small") == "zipformer-small")
+    finally:
+        config.CONFIG_PATH = original_path
+        config.LOCAL_CONFIG_PATH = original_local
+        tmp.cleanup()
+
+
 def main() -> int:
     test_config_roundtrip()
     test_decision_matrix()
@@ -419,6 +469,7 @@ def main() -> int:
     test_default_prompt_content()
     test_tray_menu()
     test_microphone_choice()
+    test_recognition_choice()
     test_panel_style_settings()
     print()
     if FAILURES:

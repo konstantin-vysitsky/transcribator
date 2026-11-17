@@ -35,7 +35,15 @@ DEFAULTS: dict[str, Any] = {
     # его видит система, либо его номер. Имя надёжнее номера: номера
     # меняются, когда микрофон втыкают и вынимают.
     "microphone": "",
+    # Распознавание: "gigaam" — как раньше, текст после остановки записи;
+    # "t-one" и "zipformer-small" — потоковые, текст пишется по ходу речи.
+    # GigaAM по умолчанию: потоковая диктовка — пока опыт.
+    "recognition": "gigaam",
 }
+
+# Допустимые модели распознавания. Всё остальное из файла превращается в
+# GigaAM: опечатка не должна отнимать у человека рабочую диктовку.
+_RECOGNITION = ("gigaam", "t-one", "zipformer-small", "zipformer-small-int8")
 
 # Поля, которые читаются ещё и из config.local.json и там главнее.
 _LOCAL_OVERRIDES = ("ai_api_key",)
@@ -62,6 +70,8 @@ def _clamp(merged: dict[str, Any]) -> dict[str, Any]:
     merged["panel_style"] = _normalize_style(merged.get("panel_style"))
     merged["panel_theme"] = _normalize_theme(merged.get("panel_theme"))
     merged["microphone"] = _normalize_microphone(merged.get("microphone"))
+    recognition = str(merged.get("recognition", "gigaam") or "gigaam").strip().lower()
+    merged["recognition"] = recognition if recognition in _RECOGNITION else "gigaam"
     return merged
 
 

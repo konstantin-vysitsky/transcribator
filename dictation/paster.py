@@ -9,6 +9,7 @@ import pyperclip
 VK_ALT = 0x12
 VK_CONTROL = 0x11
 VK_RETURN = 0x0D
+VK_BACK = 0x08
 VK_V = 0x56
 KEYEVENTF_KEYUP = 0x0002
 SW_RESTORE = 9
@@ -54,13 +55,62 @@ def _send_enter() -> None:
     user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
 
 
+def _send_backspaces(count: int) -> None:
+    for _ in range(max(0, count)):
+        user32.keybd_event(VK_BACK, 0, 0, 0)
+        time.sleep(0.002)
+        user32.keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.002)
+
+
+def erase_pasted(count: int, target_hwnd: int | None = None) -> bool:
+    """Стереть в поле последнюю вставку — ровно `count` знаков.
+
+    Нужно вставке по ходу речи: потоковая модель может переписать уже
+    показанное слово, и прошлый текст в поле заменяется целиком.
+    Возвращает False, если стереть не вышло: тогда живой текст дальше
+    идёт только в конце, а не латается в поле.
+    """
+    if count <= 0:
+        return True
+    try:
+        restore_foreground_window(target_hwnd)
+    except Exception:
+        return False
+    _send_backspaces(count)
+    return True
+
+
+def foreground_is(hwnd: int | None) -> bool:
+    """То же окно, куда человек диктует, сейчас на переднем плане."""
+    return bool(hwnd) and user32.GetForegroundWindow() == hwnd
+
+
+def press_enter(target_hwnd: int | None = None) -> bool:
+    """Нажать Enter в поле диктовки: этим заканчивается автоперевод духа."""
+    try:
+        restore_foreground_window(target_hwnd)
+        time.sleep(0.05)
+        _send_enter()
+    except Exception:
+        return False
+    return True
+
+
 def paste_text(
     text: str,
     append_space: bool = True,
     auto_enter: bool = False,
     target_hwnd: int | None = None,
+    only_if_foreground: bool = False,
 ) -> tuple[bool, bool]:
-    """Paste text via clipboard. Returns (paste_ok, enter_sent)."""
+    """Paste text via clipboard. Returns (paste_ok, enter_sent).
+
+    `only_if_foreground` не отнимает фокус у другого окна: если поле
+    диктовки ушло на второй план, вставка не делается вовсе. Нужно
+    вставке по ходу речи: иначе вместе с фокусом текст уезжал бы не в
+    то окно.
+    """
     if not text:
         return False, False
     if append_space:
@@ -71,6 +121,8 @@ def paste_text(
     except Exception:
         return False, False
     try:
+        if only_if_foreground and target_hwnd and user32.GetForegroundWindow() != target_hwnd:
+            return False, False
         restore_foreground_window(target_hwnd)
         time.sleep(0.05)
         _send_ctrl_v()

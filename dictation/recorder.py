@@ -684,6 +684,11 @@ class Recorder:
         # Куда сообщать громкость: панель показывает, что её слышно. Звать
         # необязательно, а без него запись работает как прежде.
         self.on_level: Callable[[float], None] | None = None
+        # Куда отдавать прозвучавший звук сразу, куском. Нужен потоковому
+        # распознаванию: оно слушает по ходу, а не ждёт конца записи.
+        # Зовётся из звуковой нити, поэтому получатель обязан возвращаться
+        # тут же — всю тяжёлую работу он делает у себя.
+        self.on_audio_chunk: Callable[[np.ndarray], None] | None = None
 
     def _callback(self, indata: np.ndarray, _frames: int, _time, status) -> None:
         if status:
@@ -701,6 +706,14 @@ class Recorder:
             recording = self._recording
             if recording:
                 self._chunks.append(chunk)
+                # Потоковое распознавание получает кусок под тем же замком,
+                # что и очередь: иначе часть звука осталась бы в записи, но
+                # не дошла до модели.
+                if self.on_audio_chunk is not None and len(chunk):
+                    try:
+                        self.on_audio_chunk(chunk)
+                    except Exception:
+                        self.on_audio_chunk = None
             elif self._preroll:
                 self._ring.append(chunk)
                 self._ring_count += len(chunk)
@@ -997,6 +1010,11 @@ class Recorder:
             # микрофонов этот шум разной громкости.
             noise = np.concatenate(list(self._ring)) if self._ring else None
         noise = noise[-PREROLL_SAMPLES:] if noise is not None else None
+        # Порог — по тому, что человек сказал, а не по громким кускам.
+        # Обрезка краёв выбрасывает тишину, и на завершающем синтетическом
+        # входе (в нём есть только речь из колонок, между фразами полная
+        # тишина) после неё оставалось меньше порога: десятисекундная запись
+        # с четырьмя секундами речи объявлялась пустой.
         if len(recorded) < int(self._min_duration_s * SAMPLE_RATE):
             return None
         # Провалы в ноль — до обрезки краёв: обрезка ищет громкие места по

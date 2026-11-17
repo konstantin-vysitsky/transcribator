@@ -22,6 +22,13 @@ from dictation.tray_icon import make_icon
 ActivityState = Literal["idle", "recording", "transcribing", "processing"]
 _HISTORY_SIZE = 3
 _PREVIEW_LEN = 48
+# Выбор модели распознавания. Подпись -> значение в config.json. Потоковые
+# модели пишут текст по ходу речи, GigaAM — после остановки записи.
+_STREAM_LABELS = {
+    "GigaAM (после остановки)": "gigaam",
+    "T-one, по ходу речи": "t-one",
+    "Zipformer-small, по ходу речи": "zipformer-small",
+}
 # Расширенный вид окна и признак «служебное окно»: такое окно Windows не
 # показывает на панели задач отдельной кнопкой.
 _GWL_EXSTYLE = -20
@@ -163,6 +170,7 @@ class TrayApp:
         # равно должен показывать выбор человека: он вступит в силу, когда
         # микрофон вставят обратно.
         self._microphone = str(cfg.get("microphone", "") or "").strip()
+        self._stream_model = str(cfg.get("recognition", "gigaam") or "gigaam")
         self._panel_style = panel_style.normalize_style(cfg.get("panel_style"))
         self._panel_theme = panel_style.normalize_theme(cfg.get("panel_theme"))
         if self._panel_style not in PAGE_STYLES:
@@ -270,6 +278,13 @@ class TrayApp:
         self._runtime_info = info.strip()
         self._refresh_menu()
 
+    def set_stream_label(self, label: str) -> None:
+        """Как назвать потоковую модель в меню выбора."""
+        if label not in _STREAM_LABELS:
+            return
+        self._stream_model = label
+        self._refresh_menu()
+
     def set_tooltip(self, text: str) -> None:
         self._idle_tooltip = text
         if self._activity == "idle" and self._icon is not None:
@@ -278,6 +293,12 @@ class TrayApp:
     def set_microphone_level(self, level: float) -> None:
         """Громкость микрофона на панель: панель показывает, что слышно."""
         self._status_panel.set_level(level)
+
+    def set_live_text(self, text: str, active: bool = True) -> None:
+        """Текст по ходу речи на панель (потоковое распознавание)."""
+        panel = getattr(self._status_panel, "set_live_text", None)
+        if panel is not None:
+            panel(text, active)
 
     def flush(self) -> None:
         """Вывести панель на экран сразу, не оставляя очередь на потом."""
@@ -430,6 +451,20 @@ class TrayApp:
                 ),
             ),
             pystray.MenuItem(
+                "Распознавание",
+                pystray.Menu(
+                    *[
+                        pystray.MenuItem(
+                            label,
+                            self._select_recognition(value),
+                            checked=lambda _item, value=value: self._stream_model == value,
+                            radio=True,
+                        )
+                        for label, value in _STREAM_LABELS.items()
+                    ]
+                ),
+            ),
+            pystray.MenuItem(
                 "Потоки CPU (перезагрузка)",
                 pystray.Menu(*cpu_items),
             ),
@@ -530,6 +565,20 @@ class TrayApp:
             config.save_config(cfg)
             if self._on_hotkey_mode_change is not None:
                 self._on_hotkey_mode_change(mode)
+            self._refresh_menu()
+
+        return _handler
+
+    def _select_recognition(self, value: str) -> Callable[[pystray.Icon, pystray.MenuItem], None]:
+        """Выбрать модель распознавания: GigaAM после остановки или потоковую."""
+
+        def _handler(_icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+            if self._stream_model == value:
+                return
+            self._stream_model = value
+            cfg = config.load_config()
+            cfg["recognition"] = value
+            config.save_config(cfg)
             self._refresh_menu()
 
         return _handler

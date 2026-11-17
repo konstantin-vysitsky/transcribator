@@ -106,12 +106,15 @@ _SENTENCE_ENDS = (
 )
 
 
-def format_text(text: str) -> str:
+def format_text(text: str, final: bool = True) -> str:
     """Собрать распознанное в предложения.
 
     Модель GigaAM возвращает строчные буквы без знаков. Собранный текст с
     точкой и большой буквой читается как обычная диктовка, и доводить
     его руками после вставки больше не нужно.
+
+    `final=False` — для потокового распознавания: текст ещё будет расти,
+    и точка на конце врала бы, что фраза кончилась.
     """
     words = text.strip().split()
     if not words:
@@ -126,6 +129,6 @@ def format_text(text: str) -> str:
         finished.append(word)
     result = " ".join(finished)
     result = result[0].upper() + result[1:]
-    if result[-1] not in ".!?":
+    if final and result[-1] not in ".!?":
         result += "."
     return result
