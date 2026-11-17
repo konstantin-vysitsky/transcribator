@@ -139,6 +139,9 @@ def main() -> None:
         return
 
     cfg = config.load_config()
+    # Номер потоковой диктовки: по нему поток дописывания в поле отличает
+    # свою диктовку от уже отменённой.
+    typing_nonce = 0
     project_root = config.CONFIG_PATH.parent
     use_tray = args.tray
     busy = threading.Event()
@@ -171,8 +174,9 @@ def main() -> None:
     stream_live: list[object | None] = [None]
     # Вставка по ходу речи: очередь того, что печатать, и счёт последней
     # вставки. Очередь — на одну диктовку, `typing[1]` — её состояние.
-    typing: list = [queue.Queue(), {}]
-    typing_nonce = 0
+    # Очередь того, что дописать в поле, состояние вставки и приписка на
+    # конец диктовки: её считает _stop_stream_live после остановки.
+    typing: list = [queue.Queue(), {}, None]
     restart_requested = False
     tray_app = None
     hotkey: HotkeyListener | None = None
@@ -283,13 +287,12 @@ def main() -> None:
         # Громкость видна на панели только во время записи.
         recorder.on_level = tray_app.set_microphone_level if tray_app is not None else None
 
-    def _stream_on_text(_raw: str) -> None:
-        """Модель поняла новые слова — отдать их в поле по ходу речи.
+    def _stream_on_text(raw: str) -> None:
+        """Модель поняла новые слова — дописать готовое в поле.
 
-        Текст в поле не дописывается, а заменяется целиком: модель может
-        переписать уже показанное слово. Поэтому прошлая вставка стирается,
-        и печатается новая версия куска. Делает это отдельный поток: звук
-        его не ждёт.
+        В поле ничего не стирается и не пишется заново: дописываются только
+        слова, которые модель закончила. Незаконченное слово придерживается
+        до остановки. Вставку делает отдельный поток: звук её не ждёт.
         """
         live = stream_live[0]
         if live is None:
@@ -298,17 +301,8 @@ def main() -> None:
         if piece:
             typing[0].put(piece)
 
-    def _typed_len(text: str, pasted: bool) -> int:
-        """Сколько знаков стереть, чтобы убрать прошлую вставку.
-
-        Пробел в конце, который диктовка добавляет по настройке, тоже
-        считается: без него стёрлось бы одно слово меньше.
-        """
-        extra = 1 if pasted and cfg["paste_append_space"] and not text.endswith(" ") else 0
-        return len(text) + extra
-
     def _typing_worker(nonce: int) -> None:
-        """Печатать в поле по мере роста текста. Живёт до конца диктовки."""
+        """Дописывать в поле по ходу речи. Живёт до конца диктовки."""
         queue = typing[0]
         while True:
             item = queue.get()
@@ -320,20 +314,13 @@ def main() -> None:
                 continue
             piece = item
             try:
-                from dictation.paster import erase_pasted, foreground_is
+                from dictation.paster import foreground_is
 
                 target = record_target_hwnd
                 if face.get("ever") and not foreground_is(target):
                     # Человек ушёл в другое окно: по ходу речи туда не пишем,
-                    # панель и вставка в конце остаются.
+                    # окончательный текст допишется в конце.
                     continue
-                if face.get("printed"):
-                    erase_pasted(
-                        _typed_len(face["printed"], bool(face.get("pasted"))), target
-                    )
-                elif face.get("pasted"):
-                    # Промежуточная вставка при нарезке по паузам.
-                    erase_pasted(int(face.get("len", 0)), target)
                 pasted, _ = paste_text(
                     piece,
                     append_space=cfg["paste_append_space"],
@@ -341,13 +328,12 @@ def main() -> None:
                     target_hwnd=target,
                     only_if_foreground=face.get("ever", False),
                 )
-                face["ever"] = pasted
-                face["printed"] = piece
+                face["ever"] = face.get("ever") or pasted
                 face["pasted"] = pasted
-                face["len"] = _typed_len(piece, pasted)
+                face["len"] = len(piece) + (1 if cfg["paste_append_space"] and piece else 0)
             except Exception as exc:  # noqa: BLE001 — звук и панель важнее
                 _log_line(
-                    project_root, f"сбой вставки по ходу речи: {type(exc).__name__}: {exc}"
+                    project_root, f"сбой дописывания по ходу речи: {type(exc).__name__}: {exc}"
                 )
 
     def _start_stream_live() -> None:
@@ -363,7 +349,9 @@ def main() -> None:
             on_text=_stream_on_text,
             model_ref=stream_model,
         )
-        live.set_typing(True, live._on_replace)
+        # Дописывание в поле: модель зовёт приписку слова из своего потока,
+        # `on_append=None` — значит поле ведёт `_stream_on_text` через очередь.
+        live.set_typing(True, None)
         # Новая вставка на новую диктовку: прошлые счётчики не годятся.
         while not typing[0].empty():
             typing[0].get_nowait()
@@ -406,7 +394,11 @@ def main() -> None:
             return None
         if tail is not None and len(tail):
             live.feed(tail)
-        return live.finish()
+        text = live.finish()
+        # В поле уже стоит всё, кроме последнего слова и точки: их считаем
+        # здесь, пока модель дочитала хвост записи.
+        typing[2] = live.final_append()
+        return text
 
     def _deliver_text(text: str, raw_text: str, use_ai: bool) -> bool:
         """Вставить готовый текст в окно и записать это в историю панели.
@@ -505,26 +497,14 @@ def main() -> None:
         store.save_text(saved_path, text)
         store.keep(saved_path)
         face = typing[1]
-        typed = face.get("printed") or ""
-        if face.get("ever") and typed == text:
-            # По ходу речи в поле уже стоит ровно этот текст: вставлять
-            # его второй раз нельзя. Только переводим дух, если настроено.
-            pasted = True
-            if cfg.get("paste_auto_enter", False) and (
-                tray_app is None or not tray_app.should_skip_auto_enter()
-            ):
-                try:
-                    from dictation.paster import press_enter
-
-                    press_enter(record_target_hwnd)
-                except Exception:  # noqa: BLE001 — текст уже на месте
-                    pass
-            _log_line(project_root, "потоковая диктовка уже в поле по ходу речи")
-        else:
-            # Текст чаще всего уже стоит в поле, но собранный заново: знаки,
-            # заглавные и чистка могли его изменить. Стираем вставленное и
-            # ставим окончательное — человек видит безупречный текст, а не
-            # черновик, который модель печатала по ходу.
+        auto_enter = cfg.get("paste_auto_enter", False)
+        if tray_app is not None and tray_app.should_skip_auto_enter():
+            auto_enter = False
+        tail = typing[2]
+        if use_ai and tail is not None:
+            # Обработка через ИИ переписывает слово в уже напечатанном:
+            # дописать нечем, ставим её ответ целиком вместо черновика.
+            # Это единственный случай, когда вставленное заменяется.
             if face.get("pasted"):
                 try:
                     from dictation.paster import erase_pasted
@@ -532,8 +512,49 @@ def main() -> None:
                     erase_pasted(int(face.get("len", 0) or 0), record_target_hwnd)
                 except Exception:  # noqa: BLE001 — окончательная вставка важнее
                     pass
-            pasted = _deliver_text(text, raw_text, use_ai)
+            typed_ok = _deliver_text(text, raw_text, use_ai)
+        elif use_ai:
+            # ИИ упал: в поле уже стоит сказанное, вставлять второй раз нечего.
+            typed_ok = True
+        elif tail is not None:
+            # Ничего не стираем: дописываем только то, чего в поле ещё нет —
+            # незаконченное слово и точку. Ошибки модели в уже напечатанных
+            # словах остаются как есть: черновик, который стирался и
+            # переписывался, человеку мешал больше, чем помогал.
+            pasted, enter_sent = paste_text(
+                tail,
+                append_space=cfg["paste_append_space"],
+                auto_enter=auto_enter,
+                target_hwnd=record_target_hwnd,
+                only_if_foreground=bool(face.get("ever")),
+            )
+            typed_ok = pasted
+            if pasted:
+                _log_line(
+                    project_root,
+                    f"в поле дописано {len(tail)} знаков" + (" + Enter" if enter_sent else ""),
+                )
+            else:
+                # Пока говорили, человек ушёл в другое окно — туда по ходу
+                # речи не писали. Вставляем в то окно, что на экране сейчас.
+                pasted, enter_sent = paste_text(
+                    text,
+                    append_space=cfg["paste_append_space"],
+                    auto_enter=auto_enter,
+                    target_hwnd=record_target_hwnd,
+                )
+                typed_ok = pasted
+                if tray_app is not None:
+                    tray_app.add_transcription(text)
+                if pasted:
+                    _log_line(project_root, f"окно сменилось: вставлено целиком ({len(text)} знаков)")
+        else:
+            # По ходу речи ничего не вставлялось: обычная вставка целиком.
+            typed_ok = _deliver_text(text, raw_text, use_ai)
+        pasted = typed_ok
         if tray_app is not None:
+            tray_app.set_live_text(text, active=False)
+            tray_app.mark_transcribed()
             if ai_error is not None:
                 tray_app.report_ai_error(ai_error)
             elif use_ai:
@@ -548,7 +569,12 @@ def main() -> None:
         _log_line(
             project_root,
             f"потоковая диктовка: {len(audio) / SAMPLE_RATE:.1f} с речи, "
-            f"{time.monotonic() - started_at:.1f} с на всё (включая вставку)",
+            f"{time.monotonic() - started_at:.1f} с на всё (включая вставку)"
+            + (
+                f", модель поправила уже написанное {live.revisions} раз"
+                if live is not None and live.revisions
+                else ""
+            ),
         )
 
     def on_record_start() -> bool:

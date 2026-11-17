@@ -1,11 +1,12 @@
-"""Проверка вставки по ходу речи без аудио и без чужих окон.
+"""Проверка: в поле только дописывается, ничего не стирается.
 
 Запуск: `.venv\\Scripts\\python.exe tests\\check_stream_typing.py`
 
-Что проверяется: модель T-one на настоящей записи и то, что её растущий
-текст действительно уходит в поле кусками — с ровной заменой прошлой
-вставки на новую. Поле подменено: вместо клавиатуры считается, что стоит
-в «поле», и что было бы, если стереть прежнюю вставку.
+Модель T-one на настоящей записи, а поле подменено: считается, что в нём
+оказалось после дописывания. Нужны две вещи — что поле только растёт и
+что в конце диктовки дописывается последнее слово и точка. Стирание и
+переписывание человек видел как «всё стирает и пишет заново», и это
+мешало больше, чем редкая опечатка.
 """
 
 from __future__ import annotations
@@ -38,29 +39,11 @@ def read_wav(path: Path) -> np.ndarray:
 
 
 def pick_recording() -> Path:
-    files = sorted(
-        (ROOT / "записи").glob("*.wav"),
-        key=lambda p: p.stat().st_size,
-        reverse=True,
-    )
+    files = sorted((ROOT / "записи").glob("*.wav"), key=lambda p: p.stat().st_size, reverse=True)
     for path in files:
         if 6 < (path.stat().st_size - 44) / 2 / 16000 < 20:
             return path
     raise SystemExit("нет короткой записи в «записи»")
-
-
-class FakeField:
-    """Поле ввода: что в нём стоит и что человек видит."""
-
-    def __init__(self) -> None:
-        self.text = ""
-        self.builds = 0
-
-    def paste(self, text: str) -> None:
-        self.text += text
-
-    def erase(self, count: int) -> None:
-        self.text = self.text[: max(0, len(self.text) - count)]
 
 
 def main() -> int:
@@ -68,56 +51,38 @@ def main() -> int:
     audio = read_wav(path)
     print(f"запись: {path.name}, {len(audio)/16000:.1f} с")
 
-    field = FakeField()
-    pasted_pieces: list[str] = []
-
-    def replace(piece: str) -> None:
-        # Так же, как в приложении: стираем прошлую вставку, печатаем новую.
-        if pasted_pieces:
-            field.erase(len(pasted_pieces[-1]) + 1)
-        field.paste(piece + " ")
-        pasted_pieces.append(piece)
-
+    parts: list[str] = []
     live = StreamingTranscriber(model="t-one", on_text=lambda _t: None)
-    live.set_typing(True, replace)
+    live.set_typing(True, parts.append)
     live.start()
     for i in range(0, len(audio), 160):
         live.feed(audio[i : i + 160])
         time.sleep(0.01)
     final = live.finish()
+    tail = live.final_append()
+    field = "".join(parts) + (tail or "")
 
-    check("текст уходил в поле по ходу речи", len(pasted_pieces) >= 3, len(pasted_pieces))
-    check(
-        "поле росло по ходу (первый кусок короткий)",
-        len(pasted_pieces[0]) < len(pasted_pieces[-1]) if pasted_pieces else False,
-        len(pasted_pieces[0]) if pasted_pieces else "-",
-    )
-    typed = " ".join(pasted_pieces).strip()
-    check("в поле стоит сказанное", bool(typed), typed[:80])
-    check(
-        "в поле нет мусора от стирания",
-        "\ufffd" not in field.text,
-    )
-    final_text = " ".join(final.split())
-    common = len(set(final_text.split()) & set(typed.split()))
-    check("поле совпадает с итогом по словам", common >= max(1, len(final_text.split()) // 2), common)
+    check("в поле дописывалось по частям", len(parts) >= 3, parts[:4])
+    check("ни одна приписка не пустая", all(part.strip() for part in parts), parts[:4])
+    check("нет двойных пробелов", "  " not in field.strip(), field[:80])
+    check("на конец дописано последнее слово и точка", bool(tail) and field.rstrip().endswith("."), tail)
+    # «вот» в диктовке повторяется по-настоящему, и слова «и», «там», «то»
+    # соседствуют законно. Повтором считается только слово из трёх букв и
+    # больше, поставленное два раза подряд.
+    words = field.split()
+    repeats = [a for a, b in zip(words, words[1:]) if a == b and len(a.strip(".,")) > 2]
+    check("в поле нет повторов подряд", not repeats, repeats[:6])
+    model_words = set(final.split())
+    stray = [w for w in field.split() if w.strip(".,") not in model_words]
+    check("в поле нет слов, которых перепутала модель", not stray, stray[:6])
+    print(f"       приписок: {len(parts)}")
+    print(f"       поле: {field[:180]}")
+    print(f"       итог модели: {' '.join(final.split())[:180]}")
 
-    # Когда говорить перестали, последний кусок в поле — весь текст.
-    live2 = StreamingTranscriber(model="t-one", on_text=lambda _t: None)
-    live2.set_typing(True, lambda _p: None)
-    live2.start()
-    for i in range(0, len(audio), 160 * 5):
-        live2.feed(audio[i : i + 160 * 5])
-    live2.finish()
-    tail = live2.emit_pending()
-    check("остатки текста после остановки запрашиваются отдельно", tail is None or bool(tail.strip()))
-
-    print()
-    print(f"  пример поля: {field.text[:120]}")
     if FAILURES:
-        print(f"ПРОВАЛЕНО: {len(FAILURES)}: {FAILURES}")
+        print(f"\nПРОВАЛЕНО: {len(FAILURES)}: {FAILURES}")
         return 1
-    print("Всё прошло: текст идёт в поле по ходу речи.")
+    print("\nВсё прошло: поле только дописывается.")
     return 0
 
 

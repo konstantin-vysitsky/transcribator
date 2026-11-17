@@ -34,6 +34,10 @@ from dictation.recorder import SAMPLE_RATE
 # паузам: по нему считается, какой хвост модель ещё может переписать.
 _SECONDS_PER_WORD = 0.4
 
+# Знаки, которые модель приставляет к слову. При сверке снимаются: иначе
+# запятая посреди диктовки выглядела как другое слово и поле замирало.
+_EDGE_PUNCT = ".,!?;:—–-«»\"'()…"
+
 # Модели на диске, рядом с проектом. Ставятся из готовых сборок sherpa-onnx:
 # https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
@@ -143,13 +147,19 @@ class StreamingTranscriber:
         self._done = False
         # Есть ли новый звук, который модель ещё не считала.
         self._fresh = threading.Event()
-        # Вставка в поле по ходу речи. `_printed` — то, что уже стоит в
-        # поле для текущего куска, `_handover` — сколько знаков закрыто
-        # прошлыми кусками.
+        # Дописывание в поле по ходу речи: только в то окно, где стоял
+        # курсор. На панели управления текст не показывается.
         self._typing = False
-        self._on_replace: Callable[[str], None] | None = None
-        self._printed = ""
-        self._handover = 0
+        self._on_append: Callable[[str], None] | None = None
+        # Что уже отдано в поле: слова в нижнем виде и без знаков — так
+        # сверка не зависит от запятых и заглавных, которые модель ставит
+        # `_field_line` — ровно то, что в поле написано.
+        self._printed_normal = ""
+        self._printed_count = 0
+        self._field_line = ""
+        # Сколько раз модель поменяла уже записанное: по этому числу в
+        # журнале видно, много ли правок и не пора ли их убирать.
+        self.revisions = 0
         self._remove_fillers = True
         try:
             self._fillers = load_fillers()
@@ -162,21 +172,15 @@ class StreamingTranscriber:
     def runtime_label(self) -> str:
         return f"stream/{self.model_name}, cpu"
 
-    def set_typing(self, enabled: bool, on_replace: Callable[[str], None] | None = None) -> None:
-        """Вставлять текст в поле по ходу речи.
+    def set_typing(self, enabled: bool, on_append: Callable[[str], None] | None = None) -> None:
+        """Дописывать в поле по ходу речи. `on_append` получает только новое.
 
-        Потоковая модель может переписать уже показанное слово, поэтому
-        текст в поле не дописывается кусками, а заменяется целиком. Место
-        замены знает тот, кто уже вставил прошлый текст: он стирает
-        прошлую вставку и печатает новую.
-
-        Новый текст отдаётся, только когда он вырос на `_MIN_GROWTH` знаков
-        или закончилась точка. Иначе каждая буква — отдельная вставка, а
-        на каждую вставку уходит закладка и отпускание клавиш: поле осталось
-        бы без букв.
+        В поле ничего не стирается и не пишется заново: каждое слово, которое
+        модель закончила, дописывается один раз. Незаконченное слово
+        придерживается — оно ещё может поменяться.
         """
         self._typing = enabled
-        self._on_replace = on_replace
+        self._on_append = on_append
 
     def feed(self, chunk: np.ndarray) -> None:
         """Принять прозвучавший кусок (16 кГц, дробные значения).
@@ -191,13 +195,18 @@ class StreamingTranscriber:
         self._fresh.set()
 
     def _typing_piece(self, text: str) -> str:
-        """Что вставить в поле: собранный текст без точки на конце."""
+        """Что уже готово в поле: собранный текст без точки на конце."""
         if self._remove_fillers:
             text = remove_fillers(text, self._fillers)
         return format_text(text, final=False)
 
     def _work(self) -> None:
-        """Считать то, что пришло, и сообщать текст по мере роста."""
+        """Считать пришедший звук и дописывать в поле законченные слова.
+
+        Поле не перерисовывается: в нём только дописывается то, что модель
+        уже закончила. Иначе на каждую букву приходилась бы вставка с
+        затиранием — это и выглядело как «всё стирает и пишет заново».
+        """
         while not self._stop_worker.is_set():
             # Ждём нового звука. Таймаут 20 мс: за это время с микрофона
             # приходит два куска, и модель не дёргается на каждый.
@@ -210,83 +219,101 @@ class StreamingTranscriber:
                     self._model.decode_stream(stream)
                 text = self._model.get_result(stream).strip()
             if text and text != self._partial:
+                previous = self._partial
                 self._partial = text
                 if self._on_text is not None:
                     try:
                         self._on_text(text)
                     except Exception:
                         self._on_text = None
-                if self._typing and self._on_replace is not None:
-                    piece = self._typing_piece(text)
-                    if self._should_print(piece):
-                        try:
-                            self._on_replace(piece)
-                        except Exception:
-                            self._on_replace = None
+                if self._typing and self._on_append is not None:
+                    self._print_ready(text, previous)
 
-    def _should_print(self, piece: str) -> bool:
-        """Пора ли править поле.
+    @staticmethod
+    def _normal_words(text: str) -> list[str]:
+        """Слова для сверки: нижним регистром, без знаков вокруг слова.
 
-        Здоровая модель только дописывает, и тогда поле правится на каждый
-        новый знак — получается печать по буквам. Если модель уже написанное
-        исправила, не трогаем поле до конца предложения: иначе каждое
-        исправление слова — две вставки на одно слово, и поле мигает.
+        Знаки модель ставит и снимает по ходу («а потом запятая»), и сверка
+        по тексту с ними останавливала поле. Буква «ё» считается за «е»:
+        модель пишет то так, то так.
         """
-        if not piece or piece == self._printed:
-            return False
-        if not piece.startswith(self._printed):
-            return piece.endswith((".", "!", "?"))
-        return True
+        words = []
+        for word in text.split():
+            bare = word.strip(_EDGE_PUNCT).lower().replace("ё", "е")
+            if bare:
+                words.append(bare)
+        return words
 
-    def emit_pending(self) -> str | None:
-        """Текст, который модель уже поняла, а в поле ещё не ушёл."""
-        if not self._typing:
-            return None
-        piece = self._typing_piece(self._partial)
-        if not piece or piece == self._printed:
-            return None
-        self._printed = piece
-        return piece
+    @staticmethod
+    def _place(line: list[str], field: list[str]) -> int | None:
+        """Где в чтении начинается то, чего в поле нет.
 
-    def mark_handed_over(self) -> None:
-        """Закрыть кусок: дальше в поле пойдёт только новый текст.
-
-        Кусок закрывается на конце предложения. Раньше закрывать нельзя:
-        модель ещё исправит слово внутри, и в поле осталась бы ошибка.
+        Сверяется хвост того, что стоит в поле: сдвиг в пару слов туда-сюда
+        допускается. None — сверить не удалось, ждём следующего чтения.
+        Врать наугад нельзя: ошибка здесь приписывает в поле кусок заново.
         """
-        self._handover = len(self._partial)
-        self._printed = ""
+        if not field:
+            return 0
+        tail = min(3, len(field))
+        for shift in (0, -1, 1, -2, 2):
+            spot = len(field) + shift
+            if 0 <= spot <= len(line) and line[spot - tail:spot] == field[-tail:]:
+                return spot
+        return None
 
-    def append_audio(self, audio: np.ndarray) -> None:
-        """Досчитать ещё не принятый звук, не останавливая поток.
+    def _print_ready(self, text: str, previous: str = "") -> None:
+        """Дописать в поле слова, которых в нём ещё нет.
 
-        Нужно для нарезки по паузам: где резать, ищется по громкости уже
-        прозвучавшего, а модель этот звук ещё ждёт. Отдаём только ту часть,
-        от которой модель не изменит окончание закрытого куска.
+        В поле только дописывается: стирание и повтор съедали всю скорость.
+        Готовым считается слово, после которого модель уже начала следующее.
+        `_field_line` — строка ровно того, что стоит в поле: по ней видно,
+        где дописывать, даже если модель по ходу поправила прошлое.
         """
-        if self._on_replace is None or not len(audio):
+        piece = self._typing_piece(text)
+        model_words = self._normal_words(piece)
+        complete = len(model_words)
+        if piece and not piece.endswith(" "):
+            complete -= 1
+        line = model_words[:complete]
+        field = self._field_line.split()
+        start = self._place(line, field)
+        if start is None:
             return
-        piece = self._typing_piece(self._partial)
-        if not piece:
-            return
-        words = piece.split()
-        fallback = int(0.9 * max(1, len(words)) * _SECONDS_PER_WORD * SAMPLE_RATE)
-        # Хвост меньше одного слова модель ещё может исправить: его оставляем
-        # следующему куску, остальное уже окончательное.
-        cut = len(audio) - fallback
-        if cut <= 0:
+        if line[:start] != field[:start]:
+            self.revisions += 1
+        chunk = " ".join(line[start:])
+        if not chunk:
             return
         try:
-            self._on_replace(piece)
+            self._on_append(chunk + " ")
         except Exception:
-            self._on_replace = None
+            self._on_append = None
             return
-        with self._lock:
-            self._stream = self._model.create_stream()
-        self._handover = 0
-        self._printed = ""
-        self._partial = ""
-        self.feed(audio[cut:])
+        self._field_line = " ".join(line[:start] + chunk.split())
+
+    def final_append(self) -> str | None:
+        """Приписка в конец диктовки: остаток текста.
+
+        Вызывается после остановки, когда модель дочитала хвост: последнее
+        слово и точка. Дописывается только то, чего в поле ещё нет —
+        старое не стирается и не повторяется.
+        """
+        if not self._typing or not self._partial.strip():
+            return None
+        piece = format_text(self._partial)
+        words = piece.split()
+        model_words = self._normal_words(piece)
+        field_words = self._field_line.split()
+        start = self._place(model_words, field_words)
+        if start is None:
+            start = len(field_words)
+        new_words = words[min(start, len(words)):]
+        self._printed_normal = " ".join(model_words)
+        self._printed_count = len(model_words)
+        self._field_line = " ".join(model_words)
+        if not new_words:
+            return None
+        return " ".join(new_words)
 
     def finish(self) -> str:
         """Остановить поток и отдать окончательный текст.

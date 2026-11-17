@@ -265,11 +265,6 @@ _COLOR_STEPS = 8
 _COLOR_MS = 20
 _ICON_ABORT = "\ue711"
 _ICON_FALLBACK = "\u2715"
-# Строка «текст по ходу речи»: сколько знаков её хвоста показано и сколько
-# строк под неё отведено. Две строки — обычная ширина панели и шрифт small.
-_LIVE_TAIL = 96
-_LIVE_LINES_H = 38
-_LIVE_TOP_GAP = 8
 
 _FONT_BODY = ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/segoeui.ttf")
 _FONT_SMALL = ("C:/Windows/Fonts/segoeuisb.ttf", "C:/Windows/Fonts/segoeui.ttf")
@@ -282,19 +277,6 @@ def _seconds_note(seconds: float) -> str:
     """Сколько длилась обработка: «ИИ · 3,2 с»."""
     return f"· {seconds:.1f} с".replace(".", ",")
 
-
-def _tail(text: str, max_chars: int = _LIVE_TAIL) -> str:
-    """Хвост растущего текста: на панели видно, что сказано сейчас.
-
-    Потоковый текст длинный, а места на панели две строки. Смотрится
-    не весь текст, а конец: по нему видно, что модель успевает за речью.
-    """
-    clean = " ".join(text.split())
-    if len(clean) <= max_chars:
-        return clean
-    cut = clean[-max_chars:]
-    space = cut.find(" ")
-    return "…" + cut[space + 1 :] if space > 0 else "…" + cut
 
 
 # --- цвета -------------------------------------------------------------------
@@ -766,11 +748,6 @@ class _TkStatusPanel:
 
         self._state: ActivityState = "idle"
         self._detail = ""
-        # Текст, который пишется по ходу речи (потоковое распознавание).
-        # Показывается под ползунками при записи и остаётся после неё,
-        # пока его не заменят окончательным.
-        self._live_text = ""
-        self._live_active = False
         # Четыре доли хода. `_progress` — то, что сказал вызывающий код,
         # `_shown` — то, что видно: оно подходит к цели плавно.
         self._progress = 0.0
@@ -1019,16 +996,10 @@ class _TkStatusPanel:
             out["switch_top"] = divider_y + self._spec(_DIVIDER_GAP_BOTTOM)
             out["switch_h"] = self._spec(_SWITCH_H)
             bottom = out["switch_top"] + out["switch_h"]
-            # Потоковое распознавание пишет текст по ходу речи: под
-            # ползунками ему отводятся две строки. Панель без потока их
-            # не держит и остаётся прежней высоты.
-            if self._live_text or self._live_active:
-                out["live_top"] = bottom + self._spec(_LIVE_TOP_GAP)
-                out["live_lines"] = 2
-                bottom = out["live_top"] + self._spec(_LIVE_LINES_H)
-            else:
-                out["live_top"] = bottom
-                out["live_lines"] = 0
+            # Строки под текст на панели больше нет: панель — только
+            # управление, а диктовка пишется в окно, где стоит курсор.
+            out["live_top"] = bottom
+            out["live_lines"] = 0
             out["bottom"] = bottom + pad_y
         else:
             # Под чертой в этих состояниях пусто, поэтому и черты нет: без
@@ -1048,15 +1019,9 @@ class _TkStatusPanel:
             out["detail_top"] = lowest + bar_h + self._spec(10)
             out["detail_h"] = self._spec(16) if self._detail else 0
             bottom = out["detail_top"] + out["detail_h"]
-            # Окончательный текст потоковой диктовки остаётся на панели и
-            # после остановки: человек видит, что именно вставилось.
-            if self._live_text:
-                out["live_top"] = bottom + self._spec(_LIVE_TOP_GAP)
-                out["live_lines"] = 2
-                bottom = out["live_top"] + self._spec(_LIVE_LINES_H)
-            else:
-                out["live_top"] = bottom
-                out["live_lines"] = 0
+            # Текста на панели нет и в этом состоянии: только управление.
+            out["live_top"] = bottom
+            out["live_lines"] = 0
             out["bottom"] = bottom + pad_y
         return out
 
@@ -1218,15 +1183,6 @@ class _TkStatusPanel:
             if self._detail:
                 self._text(d, px * s, lay["detail_top"] * s, self._detail, fonts.small,
                            mix(str(pal["title"]), bg, 0.45), "la",
-                           max_width=(lay["content_w"] - self._spec(4)) * s)
-
-        # Текст по ходу речи: нижняя строка панели. Пока говорят, он
-        # светлый и растущий; после остановки остаётся окончательным.
-        if self._live_text:
-            line = self._live_line(lay["live_lines"])
-            if line:
-                self._text(d, px * s, lay["live_top"] * s, line, fonts.small,
-                           str(pal["title"]), "la",
                            max_width=(lay["content_w"] - self._spec(4)) * s)
 
         small = img.resize((w, h), Image.LANCZOS)
@@ -1755,14 +1711,30 @@ class _TkStatusPanel:
     # --- мышь ---------------------------------------------------------------
 
     def _hit(self, x: int, y: int) -> str | None:
+        # Координата мыши — экранная, а границы кнопок записаны в точках
+        # панели: окно без рамки и со стеклом может быть смещено, и промах
+        # на полшага весит кнопкой «Готово». Поэтому проверяем и мышь, и
+        # ту же точку внутри окна: попал любым способом — значит, в кнопку.
+        candidates = [(int(x), int(y))]
+        window = self._window
+        if window is not None:
+            try:
+                candidates.append(
+                    (int(window.winfo_rootx()) + int(x), int(window.winfo_rooty()) + int(y))
+                )
+            except Exception:  # noqa: BLE001 — окно нужно только для промаха
+                pass
         for name, box in (
             ("stop", self._hit_stop),
             ("abort", self._hit_abort),
             ("auto", self._hit_auto),
             ("ai", self._hit_ai),
         ):
-            if box is not None and box[0] <= x < box[2] and box[1] <= y < box[3]:
-                return name
+            if box is None:
+                continue
+            for cx, cy in candidates:
+                if box[0] <= cx < box[2] and box[1] <= cy < box[3]:
+                    return name
         return None
 
     def _on_mouse_down(self, event: tk.Event) -> None:
@@ -2201,25 +2173,12 @@ class _TkStatusPanel:
         self._ai_started = time.monotonic()
 
     def set_live_text(self, text: str, active: bool = True) -> None:
-        """Показать текст, который пишется по ходу речи.
+        """Текста на панели нет: панель — только управление.
 
-        Панель держит только хвост текста: рассказать надо то, ради чего
-        потоковое распознавание и брали, — видно, что речь превращается
-        в текст прямо сейчас, а не через полминуты после остановки.
+        Оставлено пустым нарочно: диктовка пишется в окно, где стоит курсор,
+        а на панели, висящей поверх экрана, текст только мешал и обрезался.
         """
-
-        def _apply() -> None:
-            self._live_text = text.strip()
-            self._live_active = active and bool(self._live_text)
-            self._render()
-
-        self._after(0, _apply)
-
-    def _live_line(self, lines: int) -> str:
-        """Что видно в строке текста: хвост, а без места — ничего."""
-        if lines <= 0 and self._state == "recording":
-            return ""
-        return _tail(self._live_text)
+        return
 
     def set_ai_finished(self, recovered: bool = True) -> None:
         """Обработка закончилась. С `recovered` — вторая ступень вышла.
