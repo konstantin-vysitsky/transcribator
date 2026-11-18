@@ -28,6 +28,8 @@ _STREAM_LABELS = {
     "GigaAM (после остановки)": "gigaam",
     "T-one, по ходу речи": "t-one",
     "Zipformer-small, по ходу речи": "zipformer-small",
+    "Whisper-small, по ходу речи": "whisper-small",
+    "Whisper-medium, по ходу речи": "whisper-medium",
 }
 # Расширенный вид окна и признак «служебное окно»: такое окно Windows не
 # показывает на панели задач отдельной кнопкой.

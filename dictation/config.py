@@ -43,7 +43,14 @@ DEFAULTS: dict[str, Any] = {
 
 # Допустимые модели распознавания. Всё остальное из файла превращается в
 # GigaAM: опечатка не должна отнимать у человека рабочую диктовку.
-_RECOGNITION = ("gigaam", "t-one", "zipformer-small", "zipformer-small-int8")
+_RECOGNITION = (
+    "gigaam",
+    "t-one",
+    "zipformer-small",
+    "zipformer-small-int8",
+    "whisper-small",
+    "whisper-medium",
+)
 
 # Поля, которые читаются ещё и из config.local.json и там главнее.
 _LOCAL_OVERRIDES = ("ai_api_key",)

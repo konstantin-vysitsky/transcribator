@@ -153,7 +153,7 @@ def main() -> int:
     import subprocess
 
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(ROOT / "tests" / "_app_child.py"), str(recording)],
+        [sys.executable, "-u", str(ROOT / "tests" / "_app_child.py"), str(recording), "--no-paste"],
         cwd=str(ROOT),
     )
     print("ждём загрузки модели…")
@@ -190,7 +190,11 @@ def main() -> int:
         if "приписка" in line and "вставлено=да" in line
     ]
     deferred = [line for line in lines.splitlines() if "отложена" in line]
-    final = [line for line in lines.splitlines() if "в поле дописано" in line]
+    final = [
+        line
+        for line in lines.splitlines()
+        if "в поле дописано" in line or "в поле уже всё" in line
+    ]
 
     print(f"приписок в поле: {len(appended)}")
     for line in appended[:5]:

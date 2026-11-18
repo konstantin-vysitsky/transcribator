@@ -41,6 +41,8 @@ _STREAM_TRAY_LABELS = {
     "t-one": "T-one, по ходу речи",
     "zipformer-small": "Zipformer-small, по ходу речи",
     "zipformer-small-int8": "Zipformer-small, по ходу речи",
+    "whisper-small": "Whisper-small, по ходу речи",
+    "whisper-medium": "Whisper-medium, по ходу речи",
 }
 
 
@@ -57,6 +59,10 @@ def load_stream_model(recognition: str, cpu_threads: int):
     if recognition == "gigaam":
         return None
     try:
+        if recognition.startswith("whisper"):
+            from dictation.whisper_stream import load_model
+
+            return load_model(recognition, max(1, cpu_threads))
         from dictation.streaming import _recognizer
 
         return _recognizer(recognition, max(1, cpu_threads))
@@ -331,15 +337,28 @@ def main() -> None:
         # Модель загружена одна; счёт создаётся заново, и прошлый текст в
         # новую диктовку не попадает.
         stream_cancel.clear()
-        live = StreamingTranscriber(
-            model=recognition,
-            cpu_threads=cfg["cpu_threads"],
-            on_text=None,
-            model_ref=stream_model,
-            # Журнал модели: по нему видно, доходят ли слова и с какой
-            # секунды от нажатия F7. Пишется из потока модели.
-            log=lambda message: _log_line(project_root, message),
-        )
+        # Модель выбирает своё считывание: у Whisper это пачка фраз, у
+        # потоковой sherpa — непрерывный счёт. Публичная часть у них одна.
+        if recognition.startswith("whisper"):
+            from dictation.whisper_stream import WhisperStreaming
+
+            live = WhisperStreaming(
+                model=recognition,
+                cpu_threads=cfg["cpu_threads"],
+                on_text=None,
+                model_ref=stream_model,
+                log=lambda message: _log_line(project_root, message),
+            )
+        else:
+            live = StreamingTranscriber(
+                model=recognition,
+                cpu_threads=cfg["cpu_threads"],
+                on_text=None,
+                model_ref=stream_model,
+                # Журнал модели: по нему видно, доходят ли слова и с какой
+                # секунды от нажатия F7. Пишется из потока модели.
+                log=lambda message: _log_line(project_root, message),
+            )
         # Дописывание в поле: модель зовёт эту функцию на каждое законченное
         # слово, а в поле его ставит отдельный поток. Раньше здесь стоял
         # `None`, и приписки не было вовсе — текст появлялся только в конце.
@@ -386,7 +405,12 @@ def main() -> None:
         if stream_cancel.is_set():
             live.cancel()
             return None
-        if tail is not None and len(tail):
+        # Звук в модель уже шёл по ходу записи. Повторно отдавать ту же
+        # запись нельзя: модель получала её дважды, и в журнале выходило
+        # «в модели 36 секунд звука» при восемнадцати сказанных. Второй
+        # раз отдаём только если в модель не попало вообще ничего.
+        already = float(getattr(live, "_audio_seconds", 0.0))
+        if tail is not None and len(tail) and already <= 0.0:
             live.feed(tail)
         text = live.finish()
         # В поле уже стоит всё, кроме последнего слова и точки: их считаем
@@ -558,7 +582,14 @@ def main() -> None:
                     _log_line(project_root, f"окно сменилось: вставлено целиком ({len(text)} знаков)")
         else:
             # По ходу речи ничего не вставлялось: обычная вставка целиком.
-            typed_ok = _deliver_text(text, raw_text, use_ai)
+            # А если по ходу речи всё уже было в поле, второй раз вставлять
+            # нельзя — текст задвоится. У Whisper хвоста часто нет: он
+            # отдаёт слова по ходу, и последнее тоже уже стоит.
+            if face.get("ever"):
+                typed_ok = True
+                _log_line(project_root, "в поле уже всё сказанное, дописывать нечего")
+            else:
+                typed_ok = _deliver_text(text, raw_text, use_ai)
         pasted = typed_ok
         if tray_app is not None:
             tray_app.set_live_text(text, active=False)
