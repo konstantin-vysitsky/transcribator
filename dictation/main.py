@@ -15,7 +15,7 @@ from dictation import ai, autostart, config
 from dictation.hotkey import HotkeyListener, format_hotkey_label
 from dictation.single_instance import wait_single_instance
 from dictation.remote_trigger import UdpToggleServer
-from dictation.paster import capture_foreground_window, paste_text
+from dictation.paster import capture_foreground_window, paste_text, window_info
 from dictation.prompt import load_prompt
 from dictation.prompt_editor import set_logger as set_editor_logger
 from dictation.recorder import SAMPLE_RATE, Recorder, peak_percent
@@ -30,6 +30,10 @@ from dictation.timing import (
 from dictation.transcriber import Transcriber
 
 LOG_NAME = "dictation.log"
+
+# Журнал пишут несколько потоков: микрофон, модель, вставка. Одна строка
+# должна лечь целиком, а не перемешаться с соседней.
+_LOG_LOCK = threading.Lock()
 
 # Подписи моделей распознавания такие же, как в меню трея: по ним в меню
 # видно, какая модель работает сейчас.
@@ -73,12 +77,21 @@ def _log_line(project_root: Path, message: str) -> None:
         # многострочные сообщения (traceback) пишутся с отступом под временем,
         # иначе строки теряют привязку к событию и журнал читается как разные
         lines = str(message).splitlines() or [""]
-        with (project_root / LOG_NAME).open("a", encoding="utf-8") as handle:
-            handle.write(f"{stamp}  {lines[0]}\n")
-            for extra in lines[1:]:
-                handle.write(f"{' ' * 21}{extra}\n")
-    except OSError:
+        with _LOG_LOCK:
+            with (project_root / LOG_NAME).open("a", encoding="utf-8") as handle:
+                handle.write(f"{stamp}  {lines[0]}\n")
+                for extra in lines[1:]:
+                    handle.write(f"{' ' * 21}{extra}\n")
+    except Exception:  # noqa: BLE001 — журнал не должен ронять диктовку
         pass
+
+
+def _short(text: str, limit: int = 120) -> str:
+    """Кусок текста для журнала: длинное режем, чтобы журнал не пух."""
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1] + "…"
 
 
 def _install_crash_logging(project_root: Path) -> None:
@@ -287,55 +300,30 @@ def main() -> None:
         # Громкость видна на панели только во время записи.
         recorder.on_level = tray_app.set_microphone_level if tray_app is not None else None
 
-    def _stream_on_text(raw: str) -> None:
-        """Модель поняла новые слова — дописать готовое в поле.
+    def _on_stream_piece(piece: str) -> None:
+        """Модель закончила слово — отдать его потоку вставки.
 
-        В поле ничего не стирается и не пишется заново: дописываются только
-        слова, которые модель закончила. Незаконченное слово придерживается
-        до остановки. Вставку делает отдельный поток: звук её не ждёт.
+        Зовётся из потока модели, поэтому здесь только очередь: вставка
+        занимает время, и в потоке модели она тормозила бы распознавание.
         """
-        live = stream_live[0]
-        if live is None:
-            return
-        piece = live.emit_pending()
-        if piece:
-            typing[0].put(piece)
+        typing[0].put(piece)
 
     def _typing_worker(nonce: int) -> None:
         """Дописывать в поле по ходу речи. Живёт до конца диктовки."""
-        queue = typing[0]
-        while True:
-            item = queue.get()
-            if item is None:
-                return
-            face = typing[1]
-            if face.get("nonce") != nonce:
-                # Диктовку отменили: остаток очереди выбрасываем.
-                continue
-            piece = item
-            try:
-                from dictation.paster import foreground_is
+        from dictation.live_typing import type_live
+        from dictation.paster import foreground_is, paste_text
 
-                target = record_target_hwnd
-                if face.get("ever") and not foreground_is(target):
-                    # Человек ушёл в другое окно: по ходу речи туда не пишем,
-                    # окончательный текст допишется в конце.
-                    continue
-                pasted, _ = paste_text(
-                    piece,
-                    append_space=cfg["paste_append_space"],
-                    auto_enter=False,
-                    target_hwnd=target,
-                    only_if_foreground=face.get("ever", False),
-                )
-                face["ever"] = face.get("ever") or pasted
-                face["pasted"] = pasted
-                face["len"] = len(piece) + (1 if cfg["paste_append_space"] and piece else 0)
-            except Exception as exc:  # noqa: BLE001 — звук и панель важнее
-                _log_line(
-                    project_root, f"сбой дописывания по ходу речи: {type(exc).__name__}: {exc}"
-                )
-
+        type_live(
+            typing[0],
+            typing[1],
+            nonce,
+            paste=paste_text,
+            foreground=foreground_is,
+            target_window=lambda: record_target_hwnd,
+            append_space=bool(cfg["paste_append_space"]),
+            log=lambda message: _log_line(project_root, message),
+            name=threading.current_thread().name,
+        )
     def _start_stream_live() -> None:
         """Начать потоковую диктовку: новый счёт для новой фразы."""
         from dictation.streaming import StreamingTranscriber
@@ -346,12 +334,16 @@ def main() -> None:
         live = StreamingTranscriber(
             model=recognition,
             cpu_threads=cfg["cpu_threads"],
-            on_text=_stream_on_text,
+            on_text=None,
             model_ref=stream_model,
+            # Журнал модели: по нему видно, доходят ли слова и с какой
+            # секунды от нажатия F7. Пишется из потока модели.
+            log=lambda message: _log_line(project_root, message),
         )
-        # Дописывание в поле: модель зовёт приписку слова из своего потока,
-        # `on_append=None` — значит поле ведёт `_stream_on_text` через очередь.
-        live.set_typing(True, None)
+        # Дописывание в поле: модель зовёт эту функцию на каждое законченное
+        # слово, а в поле его ставит отдельный поток. Раньше здесь стоял
+        # `None`, и приписки не было вовсе — текст появлялся только в конце.
+        live.set_typing(True, _on_stream_piece)
         # Новая вставка на новую диктовку: прошлые счётчики не годятся.
         while not typing[0].empty():
             typing[0].get_nowait()
@@ -365,6 +357,8 @@ def main() -> None:
             "len": 0,
             "ever": False,
             "final": False,
+            # Отсчёт для журнала: секунды приписки считаются от нажатия F7.
+            "started": time.monotonic(),
         }
         stream_live[0] = live
         live.start()
@@ -400,6 +394,14 @@ def main() -> None:
         typing[2] = live.final_append()
         return text
 
+    def _log_foreground(where: str) -> None:
+        """Что на переднем плане перед вставкой: для журнала цепочки."""
+        fg_hwnd, fg_title, fg_class = window_info(capture_foreground_window())
+        _log_line(
+            project_root,
+            f"{where}: на переднем плане hwnd={fg_hwnd}, «{fg_title}», класс={fg_class}",
+        )
+
     def _deliver_text(text: str, raw_text: str, use_ai: bool) -> bool:
         """Вставить готовый текст в окно и записать это в историю панели.
 
@@ -409,6 +411,7 @@ def main() -> None:
         auto_enter = cfg.get("paste_auto_enter", False)
         if tray_app is not None and tray_app.should_skip_auto_enter():
             auto_enter = False
+        _log_foreground("вставка готового текста")
         pasted, enter_sent = paste_text(
             text,
             append_space=cfg["paste_append_space"],
@@ -492,6 +495,9 @@ def main() -> None:
                 return
         if stream_cancel.is_set():
             return
+        # Счёт этой диктовки: по нему в конце видно, сколько раз модель
+        # поправила уже записанное.
+        live = stream_live[0]
         # Файл с текстом остаётся только в папке записей; саму запись
         # убирает `store.trim`, она же чистит старые.
         store.save_text(saved_path, text)
@@ -521,6 +527,7 @@ def main() -> None:
             # незаконченное слово и точку. Ошибки модели в уже напечатанных
             # словах остаются как есть: черновик, который стирался и
             # переписывался, человеку мешал больше, чем помогал.
+            _log_foreground("дописывание хвоста")
             pasted, enter_sent = paste_text(
                 tail,
                 append_space=cfg["paste_append_space"],
@@ -537,6 +544,7 @@ def main() -> None:
             else:
                 # Пока говорили, человек ушёл в другое окно — туда по ходу
                 # речи не писали. Вставляем в то окно, что на экране сейчас.
+                _log_foreground("вставка целиком после смены окна")
                 pasted, enter_sent = paste_text(
                     text,
                     append_space=cfg["paste_append_space"],
@@ -615,6 +623,16 @@ def main() -> None:
         # С загрузки прошли часы, и старое значение врало бы дальше.
         cfg = config.load_config()
         record_target_hwnd = capture_foreground_window()
+        # Куда писать: номер, заголовок и класс окна. По этой строке видно,
+        # то ли окно запомнили, и с чем потом сравнивается передний план.
+        target_hwnd, target_title, target_class = window_info(record_target_hwnd)
+        _log_line(
+            project_root,
+            (
+                f"целевое окно: hwnd={target_hwnd}, «{target_title}», "
+                f"класс={target_class}"
+            ),
+        )
         busy.set()
         transcribe_cancel.clear()
         try:

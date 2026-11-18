@@ -22,6 +22,31 @@ def capture_foreground_window() -> int | None:
     return hwnd if hwnd else None
 
 
+def window_info(hwnd: int | None) -> tuple[int | None, str, str]:
+    """hwnd окна, его заголовок и класс — одной строкой для журнала.
+
+    Нужно измерениям приписки по ходу речи: по номеру окна видно, то ли
+    окно на переднем плане, куда печатать. Никогда не падает: без названия
+    окна диктовка работать обязана.
+    """
+    if not hwnd:
+        return None, "", ""
+    try:
+        hwnd = int(hwnd)
+        if not user32.IsWindow(hwnd):
+            return hwnd, "окно уже закрыто", ""
+        title = ctypes.create_unicode_buffer(512)
+        user32.GetWindowTextW(hwnd, title, 512)
+        klass = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, klass, 256)
+        return hwnd, title.value, klass.value
+    except Exception:  # noqa: BLE001 — подпись окна не должна мешать вставке
+        try:
+            return int(hwnd), "?", "?"
+        except Exception:
+            return None, "?", "?"
+
+
 def restore_foreground_window(hwnd: int | None) -> bool:
     """Return focus to the window that was active when recording started."""
     if not hwnd or not user32.IsWindow(hwnd):

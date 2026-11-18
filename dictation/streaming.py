@@ -45,6 +45,14 @@ MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 KNOWN_MODELS = ("t-one", "zipformer-small", "zipformer-small-int8")
 
 
+def _clip(text: str, limit: int = 120) -> str:
+    """Текст для журнала: одна строка и не длиннее `limit` знаков."""
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1] + "…"
+
+
 def model_available(name: str) -> bool:
     """Стоит ли модель на диске. Нет — подсказываем, где её взять."""
     return (MODELS_DIR / name).is_dir()
@@ -126,9 +134,20 @@ class StreamingTranscriber:
         on_text: Callable[[str], None] | None = None,
         recognizer: object | None = None,
         model_ref: object | None = None,
+        log: Callable[[str], None] | None = None,
     ) -> None:
         self.model_name = model
         self._lock = threading.Lock()
+        # Куда писать строки измерений: приложение передаёт свой журнал.
+        # Без него (проверки, пробы) строки просто не пишутся.
+        self._log = log
+        # Отсчёт «секунд от начала записи»: от создания счёта, то есть от
+        # нажатия F7. По часам, а не по длине звука: так видно отставание.
+        self.started_at = time.monotonic()
+        # Сколько звука уже отдано в модель. В журнале сравнивается с
+        # часами: по этой паре видно, успевает ли модель за речью.
+        self._audio_seconds = 0.0
+        self._audio_logged = False
         # Модель, загруженная один раз на всё приложение (`model_ref`), или
         # своя, если передали готовый `recognizer`. Грузить её заново на
         # каждой диктовке незачем: загрузка дороже самой речи.
@@ -169,6 +188,15 @@ class StreamingTranscriber:
     def start(self) -> None:
         self._worker.start()
 
+    def _log_safe(self, message: str) -> None:
+        """Записать строку измерений, не давая журналу уронить диктовку."""
+        if self._log is None:
+            return
+        try:
+            self._log(message)
+        except Exception:  # noqa: BLE001 — журнал не важнее звука
+            pass
+
     def runtime_label(self) -> str:
         return f"stream/{self.model_name}, cpu"
 
@@ -190,6 +218,14 @@ class StreamingTranscriber:
         """
         if not len(chunk) or self._done:
             return
+        self._audio_seconds += len(chunk) / SAMPLE_RATE
+        if not self._audio_logged:
+            # Первый звук: по этой строке видно, что микрофон действительно
+            # доносит куски до модели, а не обрывается раньше.
+            self._audio_logged = True
+            self._log_safe(
+                f"поток: первый звук в модели, {len(chunk) / SAMPLE_RATE:.2f} с кусок"
+            )
         with self._lock:
             self._stream.accept_waveform(SAMPLE_RATE, chunk.astype(np.float32))
         self._fresh.set()
@@ -221,10 +257,24 @@ class StreamingTranscriber:
             if text and text != self._partial:
                 previous = self._partial
                 self._partial = text
+                # Каждое новое чтение модели: секунды от нажатия F7, сколько
+                # звука уже отдано и сам текст. Коротко, первые 120 знаков.
+                self._log_safe(
+                    (
+                        f"текст модели: {time.monotonic() - self.started_at:.1f} с "
+                        f"от F7, звука {self._audio_seconds:.1f} с, "
+                        f"«{_clip(text)}»"
+                    )
+                )
                 if self._on_text is not None:
                     try:
                         self._on_text(text)
-                    except Exception:
+                    except Exception as exc:  # noqa: BLE001 — модель важнее приписки
+                        # Раньше сбой здесь молча выключал приписку, и в
+                        # журнале не оставалось ни строки о причине.
+                        self._log_safe(
+                            f"сбой обработчика текста модели: {type(exc).__name__}: {exc}"
+                        )
                         self._on_text = None
                 if self._typing and self._on_append is not None:
                     self._print_ready(text, previous)
@@ -286,7 +336,8 @@ class StreamingTranscriber:
             return
         try:
             self._on_append(chunk + " ")
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — поле важнее, но причину в журнал
+            self._log_safe(f"сбой дописывания в поле: {type(exc).__name__}: {exc}")
             self._on_append = None
             return
         self._field_line = " ".join(line[:start] + chunk.split())
@@ -326,6 +377,11 @@ class StreamingTranscriber:
         self._done = True
         self._stop_worker.set()
         self._worker.join(timeout=2.0)
+        # Конец счёта: сколько звука модель прожевала за диктовку. Пара к
+        # «запись сохранена (N с)» показывает, не потерялся ли хвост.
+        self._log_safe(
+            f"поток: запись закрыта, в модели {self._audio_seconds:.1f} с звука"
+        )
         with self._lock:
             stream = self._stream
             stream.accept_waveform(

@@ -38,12 +38,22 @@ def read_wav(path: Path) -> np.ndarray:
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
 
 
+def has_speech(path: Path) -> bool:
+    """Есть ли в записи звук: пустая запись проверять нечего.
+
+    Сквозной прогон вставляет запись в отдельное окно, и в папке остаются
+    пустые файлы. Брать самую большую запись подряд поэтому нельзя.
+    """
+    data = read_wav(path)
+    return float(np.abs(data).max()) > 0.005
+
+
 def pick_recording() -> Path:
     files = sorted((ROOT / "записи").glob("*.wav"), key=lambda p: p.stat().st_size, reverse=True)
     for path in files:
-        if 6 < (path.stat().st_size - 44) / 2 / 16000 < 20:
+        if 6 < (path.stat().st_size - 44) / 2 / 16000 < 20 and has_speech(path):
             return path
-    raise SystemExit("нет короткой записи в «записи»")
+    raise SystemExit("нет короткой записи со звуком в «записи»")
 
 
 def main() -> int:
@@ -52,17 +62,39 @@ def main() -> int:
     print(f"запись: {path.name}, {len(audio)/16000:.1f} с")
 
     parts: list[str] = []
+    stamps: list[float] = []
+    began = time.monotonic()
+
+    def on_append(piece: str) -> None:
+        parts.append(piece)
+        stamps.append(time.monotonic() - began)
+
     live = StreamingTranscriber(model="t-one", on_text=lambda _t: None)
-    live.set_typing(True, parts.append)
+    live.set_typing(True, on_append)
     live.start()
     for i in range(0, len(audio), 160):
         live.feed(audio[i : i + 160])
         time.sleep(0.01)
+    fed_for = time.monotonic() - began
     final = live.finish()
     tail = live.final_append()
     field = "".join(parts) + (tail or "")
 
     check("в поле дописывалось по частям", len(parts) >= 3, parts[:4])
+    # Главное: слова должны появляться, ПОКА человек говорит. Если первая
+    # приписка приходит только к концу записи, потоковой диктовки нет.
+    check(
+        "первое слово появилось задолго до конца речи",
+        bool(stamps) and stamps[0] < fed_for * 0.6,
+        (round(stamps[0], 1) if stamps else None, round(fed_for, 1)),
+    )
+    check(
+        "приписки идут по ходу, а не одной пачкой в конце",
+        len({round(s, 1) for s in stamps}) >= 4,
+        [round(s, 1) for s in stamps[:8]],
+    )
+    if stamps:
+        print(f"       первая приписка: {stamps[0]:.1f} с из {fed_for:.1f} с речи")
     check("ни одна приписка не пустая", all(part.strip() for part in parts), parts[:4])
     check("нет двойных пробелов", "  " not in field.strip(), field[:80])
     check("на конец дописано последнее слово и точка", bool(tail) and field.rstrip().endswith("."), tail)
