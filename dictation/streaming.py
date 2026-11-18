@@ -34,6 +34,12 @@ from dictation.recorder import SAMPLE_RATE
 # паузам: по нему считается, какой хвост модель ещё может переписать.
 _SECONDS_PER_WORD = 0.4
 
+# Тишина, после которой последнее слово отдаётся в поле. Меньше — слово
+# уходило бы недописанным, больше — конец фразы висел бы заметно долго.
+# Уровень считается по самому звуку: 0.006 — заметно тише обычной речи.
+_QUIET_LEVEL = 0.006
+_PAUSE_SECONDS = 0.5
+
 # Знаки, которые модель приставляет к слову. При сверке снимаются: иначе
 # запятая посреди диктовки выглядела как другое слово и поле замирало.
 _EDGE_PUNCT = ".,!?;:—–-«»\"'()…"
@@ -170,15 +176,22 @@ class StreamingTranscriber:
         # курсор. На панели управления текст не показывается.
         self._typing = False
         self._on_append: Callable[[str], None] | None = None
-        # Что уже отдано в поле: слова в нижнем виде и без знаков — так
-        # сверка не зависит от запятых и заглавных, которые модель ставит
-        # `_field_line` — ровно то, что в поле написано.
-        self._printed_normal = ""
-        self._printed_count = 0
-        self._field_line = ""
-        # Сколько раз модель поменяла уже записанное: по этому числу в
-        # журнале видно, много ли правок и не пора ли их убирать.
+        # Что уже отдано в поле. Слова хранятся в нижнем виде и без знаков —
+        # так сверка не зависит от запятых и заглавных, которые модель
+        # ставит по ходу. Список, а не строка: по индексу слова сразу
+        # находится его написание со знаками, и в поле уходит именно оно.
+        self._field_words: list[str] = []
+        # Сколько раз модель поменяла уже записанное: по числу в журнале
+        # видно, много ли правок и не пора ли их убирать.
         self.revisions = 0
+        # Когда модель в последний раз сказала что-то новое. По этому
+        # времени видна пауза: на паузе последнее слово пора отдавать в
+        # поле, иначе оно висит до следующей фразы.
+        self._last_text_at = 0.0
+        # Сколько подряд тихого звука пришло и была ли уже пауза, которую
+        # пора отдать в поле.
+        self._quiet_seconds = 0.0
+        self._pause_ready = threading.Event()
         self._remove_fillers = True
         try:
             self._fillers = load_fillers()
@@ -219,6 +232,17 @@ class StreamingTranscriber:
         if not len(chunk) or self._done:
             return
         self._audio_seconds += len(chunk) / SAMPLE_RATE
+        # Пауза в речи определяется по самому звуку, а не по часам: счёт
+        # может отставать, и тогда «тишиной» выглядела бы его задержка.
+        # На такой мнимой паузе в поле уходило недописанное «др» вместо
+        # «другом» — и оставалось там навсегда, потому что не стирается.
+        level = float(np.sqrt(np.mean(np.square(chunk, dtype=np.float64))))
+        if level < _QUIET_LEVEL:
+            self._quiet_seconds += len(chunk) / SAMPLE_RATE
+            if self._quiet_seconds >= _PAUSE_SECONDS:
+                self._pause_ready.set()
+        else:
+            self._quiet_seconds = 0.0
         if not self._audio_logged:
             # Первый звук: по этой строке видно, что микрофон действительно
             # доносит куски до модели, а не обрывается раньше.
@@ -237,7 +261,7 @@ class StreamingTranscriber:
         return format_text(text, final=False)
 
     def _work(self) -> None:
-        """Считать пришедший звук и дописывать в поле законченные слова.
+        """Считать пришедший звук и дописывать в поле готовые слова.
 
         Поле не перерисовывается: в нём только дописывается то, что модель
         уже закончила. Иначе на каждую букву приходилась бы вставка с
@@ -247,6 +271,10 @@ class StreamingTranscriber:
             # Ждём нового звука. Таймаут 20 мс: за это время с микрофона
             # приходит два куска, и модель не дёргается на каждый.
             if not self._fresh.wait(timeout=0.02):
+                # Звука нет — значит пауза. На паузе последнее слово пора
+                # отдавать: иначе оно висело в модели до следующей фразы,
+                # и конец сказанного выглядел обрубленным.
+                self._flush_idle()
                 continue
             self._fresh.clear()
             with self._lock:
@@ -255,8 +283,8 @@ class StreamingTranscriber:
                     self._model.decode_stream(stream)
                 text = self._model.get_result(stream).strip()
             if text and text != self._partial:
-                previous = self._partial
                 self._partial = text
+                self._last_text_at = time.monotonic()
                 # Каждое новое чтение модели: секунды от нажатия F7, сколько
                 # звука уже отдано и сам текст. Коротко, первые 120 знаков.
                 self._log_safe(
@@ -277,7 +305,37 @@ class StreamingTranscriber:
                         )
                         self._on_text = None
                 if self._typing and self._on_append is not None:
-                    self._print_ready(text, previous)
+                    self._print_ready(text)
+
+    def _flush_idle(self) -> None:
+        """Пауза в речи: отдать последнее слово, которое модель придерживала.
+
+        Слово держится, пока модель не начала следующее: новое слово может
+        поменяться. Но если человек замолчал, ждать нечего — иначе конец
+        фразы появлялся только со следующей фразой.
+        """
+        if not self._typing or self._on_append is None or not self._partial:
+            return
+        # Отдаём слово только тогда, когда микрофон сам услышал тишину:
+        # заминка счёта за паузу не считается.
+        if not self._pause_ready.is_set():
+            return
+        # Перед отдачей модель должна дочитать всё, что уже прозвучало.
+        # Иначе отдавался огрызок: на паузе модель ещё отставала, и в поле
+        # уходило «др» вместо «другом» — навсегда, потому что написанное
+        # не стирается.
+        with self._lock:
+            stream = self._stream
+            while self._model.is_ready(stream):
+                self._model.decode_stream(stream)
+            text = self._model.get_result(stream).strip()
+        if text and text != self._partial:
+            self._partial = text
+            self._last_text_at = time.monotonic()
+            self._print_ready(text)
+            return
+        self._pause_ready.clear()
+        self._print_ready(self._partial, release_last=True)
 
     @staticmethod
     def _normal_words(text: str) -> list[str]:
@@ -285,14 +343,11 @@ class StreamingTranscriber:
 
         Знаки модель ставит и снимает по ходу («а потом запятая»), и сверка
         по тексту с ними останавливала поле. Буква «ё» считается за «е»:
-        модель пишет то так, то так.
+        модель пишет то так, то так. Пустые места не выбрасываются: список
+        идёт слово в слово с настоящим текстом, и по его номеру находится
+        написание со знаками.
         """
-        words = []
-        for word in text.split():
-            bare = word.strip(_EDGE_PUNCT).lower().replace("ё", "е")
-            if bare:
-                words.append(bare)
-        return words
+        return [word.strip(_EDGE_PUNCT).lower().replace("ё", "е") for word in text.split()]
 
     @staticmethod
     def _place(line: list[str], field: list[str]) -> int | None:
@@ -311,36 +366,44 @@ class StreamingTranscriber:
                 return spot
         return None
 
-    def _print_ready(self, text: str, previous: str = "") -> None:
+    def _print_ready(self, text: str, release_last: bool = False) -> None:
         """Дописать в поле слова, которых в нём ещё нет.
 
-        В поле только дописывается: стирание и повтор съедали всю скорость.
-        Готовым считается слово, после которого модель уже начала следующее.
-        `_field_line` — строка ровно того, что стоит в поле: по ней видно,
-        где дописывать, даже если модель по ходу поправила прошлое.
+        В поле идёт настоящее написание слова — с запятыми, точками и
+        большой буквой, как их поставила модель. Для сверки рядом считается
+        то же слово без знаков: иначе запятая выглядела бы новым словом.
+
+        `release_last` — пауза в речи: последнее слово тоже отдаётся, хотя
+        модель ещё может его поменять. Иначе конец фразы висел до
+        следующей фразы.
         """
         piece = self._typing_piece(text)
-        model_words = self._normal_words(piece)
-        complete = len(model_words)
-        if piece and not piece.endswith(" "):
-            complete -= 1
-        line = model_words[:complete]
-        field = self._field_line.split()
-        start = self._place(line, field)
+        raw = piece.split()
+        if not raw:
+            return
+        norms = self._normal_words(piece)
+        # Готовы все слова, кроме последнего: после него модель ещё не
+        # начала следующее, и оно может поменяться.
+        count = len(raw)
+        if not release_last and not piece.endswith(" "):
+            count -= 1
+        if count <= 0:
+            return
+        start = self._place(norms[:count], self._field_words)
         if start is None:
             return
-        if line[:start] != field[:start]:
+        if norms[:start] != self._field_words[:start]:
             self.revisions += 1
-        chunk = " ".join(line[start:])
+        chunk = raw[start:count]
         if not chunk:
             return
         try:
-            self._on_append(chunk + " ")
+            self._on_append(" ".join(chunk) + " ")
         except Exception as exc:  # noqa: BLE001 — поле важнее, но причину в журнал
             self._log_safe(f"сбой дописывания в поле: {type(exc).__name__}: {exc}")
             self._on_append = None
             return
-        self._field_line = " ".join(line[:start] + chunk.split())
+        self._field_words = norms[:count]
 
     def final_append(self) -> str | None:
         """Приписка в конец диктовки: остаток текста.
@@ -352,16 +415,13 @@ class StreamingTranscriber:
         if not self._typing or not self._partial.strip():
             return None
         piece = format_text(self._partial)
-        words = piece.split()
-        model_words = self._normal_words(piece)
-        field_words = self._field_line.split()
-        start = self._place(model_words, field_words)
+        raw = piece.split()
+        norms = self._normal_words(piece)
+        start = self._place(norms, self._field_words)
         if start is None:
-            start = len(field_words)
-        new_words = words[min(start, len(words)):]
-        self._printed_normal = " ".join(model_words)
-        self._printed_count = len(model_words)
-        self._field_line = " ".join(model_words)
+            start = len(self._field_words)
+        new_words = raw[min(start, len(raw)):]
+        self._field_words = norms
         if not new_words:
             return None
         return " ".join(new_words)

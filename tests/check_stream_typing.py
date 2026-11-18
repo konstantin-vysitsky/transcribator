@@ -69,13 +69,25 @@ def main() -> int:
         parts.append(piece)
         stamps.append(time.monotonic() - began)
 
-    live = StreamingTranscriber(model="t-one", on_text=lambda _t: None)
+    # Всё, что модель говорила за диктовку: по этому набору видно, есть ли
+    # в поле слово, которого она не произносила.
+    model_seen: set[str] = set()
+
+    def on_text(text: str) -> None:
+        model_seen.update(w.strip(".,!?").lower() for w in text.split())
+
+    live = StreamingTranscriber(model="t-one", on_text=on_text)
     live.set_typing(True, on_append)
     live.start()
     for i in range(0, len(audio), 160):
         live.feed(audio[i : i + 160])
         time.sleep(0.01)
     fed_for = time.monotonic() - began
+    # Пауза: человек замолчал. Последнее слово должно появиться само, не
+    # дожидаясь следующей фразы.
+    time.sleep(1.3)
+    field_at_pause = "".join(parts)
+    held = (live._partial.split() or [""])[-1].strip(".,!?")
     final = live.finish()
     tail = live.final_append()
     field = "".join(parts) + (tail or "")
@@ -104,8 +116,14 @@ def main() -> int:
     words = field.split()
     repeats = [a for a, b in zip(words, words[1:]) if a == b and len(a.strip(".,")) > 2]
     check("в поле нет повторов подряд", not repeats, repeats[:6])
-    model_words = set(final.split())
-    stray = [w for w in field.split() if w.strip(".,") not in model_words]
+    check(
+        "на паузе последнее слово появилось само",
+        bool(held) and held.lower() in field_at_pause.lower(),
+        (held, field_at_pause[-60:]),
+    )
+    check("в поле есть знаки препинания", any(ch in field for ch in ".,!?"), field[:60])
+    # Заглавные буквы и знаки ставит сама модель, поэтому сравниваем без них.
+    stray = [w for w in field.split() if w.strip(".,!?").lower() not in model_seen]
     check("в поле нет слов, которых перепутала модель", not stray, stray[:6])
     print(f"       приписок: {len(parts)}")
     print(f"       поле: {field[:180]}")
